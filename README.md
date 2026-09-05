@@ -5,24 +5,24 @@
 catflap is an **ephemeral capability gateway**: it lends the capabilities of a
 real machine to an AI agent, per task, with a TTL — then destroys both the
 network reachability and the permission at once. No long-lived SSH keys, no
-open ports, no reachable network left behind.
+open ports, no reachable network left behind, and no capability blob to
+copy-paste.
 
 ```text
-Claude Code / Codex / Cursor
-          │  MCP stdio
-          ▼
-┌──────────────────────────────┐
-│ catflap mcp --cap-file t.cap │  agent-side adapter (ephemeral client key)
-└──────────────┬───────────────┘
-               │ Tailcat / WireGuard (no account, no root, userspace only)
-               ▼
-┌──────────────────────────────┐
-│ task A: own Tailcat server   │  server key A + PSK A + address A
-│  policy snapshot: lab-gpu   │  remote_exec / remote_read / remote_stat
-│  expires +15m → server.Close │
-└──────────────┬───────────────┘
-               │  localhost/LAN
-               ▼  GPU / DB / Robot
+operator                                            agent side
+--------                                             ----------
+catflap share --policy p.yaml                        catflap setup claude
+  → mints task, seals capability                       (registers unpaired MCP server)
+  → prints one-time code: CAT-XXXX-XXXX               claude
+                                                        → MCP `pair` tool + code
+        rendezvous server (sealed envelope only,          → fetches + unseals capability
+         no plaintext, no task traffic)                   → tools/list_changed: remote_* appear
+                    │
+                    └──────────── Tailcat/WireGuard (userspace, no account, no root) ─────┐
+                                                                                            ▼
+                                                                                    task's own server
+                                                                                    policy snapshot
+                                                                                    expires → Close
 ```
 
 One task = one ephemeral network identity + one policy snapshot + one audit
@@ -38,59 +38,69 @@ together**, and both vanish on expiry:
 
 ```text
 CREATE (task id, ephemeral server+client keys, frozen policy, own address)
-  → ACTIVE (MCP calls, each allow/deny audited)
+  → ACTIVE (MCP calls, each allow/deny audited, some gated by human approval)
     → EXPIRE / REVOKE / SHUTDOWN (server.Close: identity, PSK, address, and auth die together)
 ```
 
 Tasks move CREATING → ACTIVE → STOPPING → STOPPED; only ACTIVE tasks
 accept operations, and every termination path funnels through one ordered
 teardown (stop-accepting → cancel with cause → bounded drain → terminal
-`task.stop` audit event → server close → audit close).
+`task.stop` audit event → server close → audit close). Task death also kills
+any approval prompt still pending for that task.
 
-## Status: v0.1.2 (security semantics)
-
-- [x] 1 task = 1 Tailcat server (per-task key, PSK, address; expiry = Close)
-- [x] Endpoint↔task binding: a secret stolen from task B is useless at A's endpoint
-- [x] Expiry cancels in-flight execs, killing whole process trees (unix pgid,
-  SIGKILL lands at cancel time via `Cmd.Cancel` — no reap window);
-  ordered teardown: stop-accepting → cancel(cause) → bounded drain →
-  terminal `task.stop` audit event → server close → audit close.
-  Kill reasons propagate (`expired`/`revoked`/`shutdown`), ready for
-  structured error codes.
-- [x] Structured argv exec — no shell anywhere (`;`, `&&`, `$()` are inert)
-- [x] Symlink/root-escape rejection on file tools
-- [x] Ephemeral capabilities (`agc1_…`), TTL, `serve` / `grant` / `mcp`
-- [x] `--cap-file` / `--out` flows: no symlinks, no silent overwrite
-  (`--force`), atomic 0600 writes — tokens avoid argv and shell history
-- [x] Hash-chained JSONL audit incl. terminal lifecycle events
-- [x] CI: golangci-lint (incl. Tailcat quarantine via depguard) +
-  `go test -race` + `go build` + govulncheck + adversarial E2E job
-- [ ] Human approval, network restrictions, specialized adapters (roadmap)
-
-## Quickstart
+## Golden path
 
 ```bash
 go build -o bin/catflap ./cmd/catflap
-
-# 1. target: each task gets its OWN Tailcat address
-./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m \
-  --out ./task.cap
-# Task: agt_…
-# Capability: (written to ./task.cap)
-
-# 2. (optional) mint more tasks while serve runs — each a new address
-./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml \
-  --ttl 15m --out ./task2.cap
-
-# 2b. (optional) revoke a task early: same teardown as expiry —
-# in-flight ops cancelled, endpoint closed, secrets deleted (idempotent)
-./bin/catflap revoke --state <state-file> agt_…
-
-# 3. agent side: register as an MCP server (file, not argv)
-./bin/catflap mcp --cap-file ./task.cap
 ```
 
-Claude Code (`claude mcp add`):
+Operator (the machine being lent out):
+
+```bash
+./bin/catflap share --policy ./examples/policies/readonly-debug.yaml --ttl 15m
+# Task: agt_…
+# Pairing code (share once, expires in 5m): CAT-XXXX-XXXX-XXXX
+```
+
+Agent side (Claude Code, once — registers the *unpaired* server at user scope):
+
+```bash
+./bin/catflap setup claude
+claude
+```
+
+Inside the `claude` session, call the MCP `pair` tool with the printed code.
+Nothing is copy-pasted by hand except the short pairing code: the code is a
+one-time, short-lived locator plus a local wrap key — the rendezvous server
+only ever stores and relays a sealed envelope, never the capability itself,
+and never any task traffic. Once paired, the SDK advertises the granted
+`remote_*` tools via `tools/list_changed` — no reconnect needed. Pairing
+codes are single-use (a replay is a 404) and default to a public rendezvous
+at `pair.catflap.dev`; run your own with `catflap rendezvous` and point both
+sides at it with `--rendezvous` / `CATFLAP_RENDEZVOUS`.
+
+```bash
+./bin/catflap tasks                    # list live tasks on the running share/serve
+./bin/catflap revoke <task|name>        # destroy a task early: same teardown as expiry
+```
+
+The agent sees at most four tools: `remote_exec` (command + argv, no
+shell), `remote_read`, `remote_stat`, and — only with an explicit
+`file.write` grant — `remote_write`. After the TTL, the task's server is
+closed: calls fail with `capability expired` (or `task revoked` / `task
+shutdown` when killed that way).
+
+### Advanced / legacy: manual capability file
+
+Before pairing, catflap issued a capability blob directly. This path still
+works — for scripting, tests, or when there is no rendezvous reachable —
+but is no longer the default:
+
+```bash
+./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m --out ./task.cap
+./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml --ttl 15m --out ./task2.cap
+./bin/catflap mcp --cap-file ./task.cap
+```
 
 ```json
 {
@@ -103,12 +113,6 @@ Claude Code (`claude mcp add`):
 }
 ```
 
-After the TTL, the task's server is closed: handshakes fail and calls fail
-with `capability expired` (or `task revoked` / `task shutdown` when killed
-that way). The agent sees at most four tools: `remote_exec` (command +
-argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
-`file.write` grant — `remote_write`.
-
 `--transport local` runs the same stack over loopback (tests, LAN demos).
 
 ## MCP protocol
@@ -116,11 +120,13 @@ argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
 The agent adapter is built on the official MCP Go SDK (pinned in
 `go.mod`), speaking spec `2026-07-28` by default (`server/discover`,
 stateless requests) while negotiating older spec versions with older
-clients — no handwritten protocol parsing remains. The adapter waits up
-to the task's max exec duration (carried in the capability) plus margin,
+clients — no handwritten protocol parsing remains. Unpaired, the server
+exposes only `pair` / `status`; after pairing it advertises the
+policy-granted `remote_*` tools via `tools/list_changed`. The adapter waits
+up to the task's max exec duration (carried in the capability) plus margin,
 so long permitted operations are never cut off early; cancellation of
-in-flight remote operations from the MCP side is future work (expiry and
-revoke kill server-side meanwhile).
+in-flight remote operations from the MCP side is future work (expiry,
+revoke, and approval denial kill server-side meanwhile).
 
 Gateway RPC frames are bounded at 2MiB, enforced incrementally on receipt
 and checked before send. All policy-controlled content limits are capped
@@ -148,6 +154,7 @@ tools:
         args: ["-u", { any: true }, "-n", { integer: { max: 1000 } }]
       - command: docker
         args: [ps]
+        approval: once
   file:
     read:
       roots:
@@ -160,6 +167,32 @@ for commands that cannot reach files — never for `cat`-likes). Arity is
 exact otherwise. Commands resolve via `PATH` at call time (operator's PATH,
 never the agent's) or as absolute paths. The v0.1 shell-string allowlist
 (`exec.commands`) is rejected at load: it cannot be made shell-safe.
+
+### Human approval
+
+Approval is an **additional** restriction, never an authorization source: a
+policy deny can never be overridden by approval, and approval only ever
+narrows what an already-allowed rule may do. Each `exec` rule and the
+`file.write` grant carry an `approval` mode:
+
+```yaml
+approval: never    # default — the policy decision is final, no prompt
+approval: once      # first exact normalized operation this task prompts;
+                     # cached for the rest of the task only, never inherited
+                     # by another task; any change to argv/path/content is a
+                     # different operation and prompts again
+approval: always   # every call prompts, no caching
+```
+
+The approved hash binds exactly to what executes (resolved path, argv, or
+write content) — mutating any of it after approval requires re-approval.
+Approval is checked against a terminal-attached `Approver`: `share` and
+`serve` attach one automatically when stdin is an interactive terminal
+(control bytes in prompts are escaped, concurrent prompts are serialized,
+each prompt carries a unique reply token). Without an interactive terminal,
+any operation requiring approval fails closed — never blocks forever, never
+auto-approves. A task's death (expiry, revoke, shutdown) immediately kills
+any approval prompt still pending for it.
 
 Resource bounds live in `limits:` and always apply — omitted fields take
 hard built-in defaults, never zero. Content ceilings honor the transport
@@ -174,8 +207,8 @@ limits:
   max_read_bytes: 262144    # max 256KiB
 ```
 
-`serve` additionally caps live tasks (`--max-tasks`, default 16): further
-grants fail instead of allocating unboundedly.
+`share`/`serve` additionally cap live tasks (`--max-tasks`, default 16):
+further grants fail instead of allocating unboundedly.
 
 `tools/list` exposes only the tools the task's policy can authorize
 (`remote_exec` iff exec rules exist, `remote_read`/`remote_stat` iff read
@@ -201,7 +234,8 @@ open starts from a directory fd for the root and walks components with
       max_file_size: 262144
       create: true      # allow new files (parent must exist)
       overwrite: false  # allow replacing existing files
-      atomic: true      # temp + fsync + rename (link for create-only); preserves mode on replace
+      atomic: true       # temp + fsync + rename (link for create-only); preserves mode on replace
+      approval: once
 ```
 
 Reads and writes are independent grants; without `file.write` the write
@@ -223,7 +257,10 @@ schema v1 (`"v": 1` covered by the chain hash):
 Every chain opens with `task.create` (binding the canonical policy hash)
 and closes with `task.stop`; the terminal record seals the logger, so the
 runtime itself cannot append after it. `prev` links entries and
-args/results are stored as hashes only. Verify offline:
+args/results are stored as hashes only. Approval decisions are logged
+through the same fail-closed audit path as every other call — an audit
+write failure denies the operation rather than silently proceeding. Verify
+offline:
 
 ```bash
 catflap audit verify <task>.jsonl [--expect-head sha256:…]
@@ -246,12 +283,12 @@ So catflap draws the responsibility line explicitly:
 
 ```text
 Tailcat = encrypted reachability transport
-catflap = identity lifecycle + capability policy + TTL
+catflap = identity lifecycle + capability policy + TTL + human approval
           + process containment + resource restrictions + audit
 ```
 
-Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
-`serve` is trusted**, and enforces:
+Concretely, catflap assumes the **agent is untrusted but the operator
+running `share`/`serve` is trusted**, and enforces:
 
 ```text
                  Catflap capability
@@ -261,7 +298,7 @@ Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
        network identity          application policy
        Tailcat node key          structured argv tools
        PSK                       filesystem roots
-       unique address            TTL
+       unique address            TTL + approval mode
             │                         │
             └────────────┬────────────┘
                          │
@@ -288,35 +325,44 @@ Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
   then closes the server and audit: no process outlives its TTL. On unix
   the child runs in its own process group, so grandchildren die too —
   lifecycle containment, not a hostile-code sandbox.
-- Every decision (allow/deny/expired/error) is hash-chained to JSONL.
-- Bearer tokens travel via files (`--out` / `--cap-file`), not argv.
+- Approval is layered strictly on top of policy: it can only add friction to
+  an already-allowed operation, never grant one a deny would otherwise
+  block, and it binds to the exact resolved argv/path/content that executes.
+- Every decision (allow/deny/expired/approved/denied/error) is
+  hash-chained to JSONL.
+- Pairing codes are one-time, short-lived, brute-force resistant, and
+  typo-safe (CRC-16 checked locally before any network round trip); the
+  rendezvous server sees only a sealed envelope, never a capability or task
+  traffic. Bearer tokens in the legacy manual flow travel via files
+  (`--out` / `--cap-file`), not argv.
 - The admin API binds loopback only; the state file (admin bearer token)
   gets the same secure-file semantics as capabilities.
 
-Known gaps: no human approval yet, no network egress policy yet, SafeFS is
-dirfd-walk (not full `openat2`-only) with a residual rename race against
-concurrent local writers (which the agent is not), audit chain has no
-external anchor yet.
+Known gaps: no network egress policy yet, SafeFS is dirfd-walk (not full
+`openat2`-only on non-Linux) with a residual rename race against concurrent
+local writers (which the agent is not), audit chain has an internal hash
+chain and an external anchor command but no automated anchoring service yet.
 
 ## Layout (Tailcat is quarantined)
 
 ```text
-cmd/catflap/            CLI: serve | grant | mcp
+cmd/catflap/            CLI entry point
 internal/
   transport/            seam: Server/Client interfaces (no Tailcat types leak out)
     transport.go
     tailcat/            ONLY package that imports github.com/tailscale/tailcat
     local/              loopback transport (tests/demos)
   capability/           agc1_… bearer tokens (task, endpoint, client key, secret, expiry)
-  policy/               structured argv policy + file grants (schema v1)
+  pair/                 pairing codes + sealed-envelope rendezvous protocol
+  policy/               structured argv policy + file grants + approval modes (schema v1)
   safefs/               dedicated filesystem layer (dirfd walk, openat2)
-  gateway/              per-task auth, TTL, enforcement (no shell), Stop/GC
+  gateway/              per-task auth, TTL, approval engine, enforcement (no shell), Stop/GC
   rpc/                  JSONL request/response frames (2MiB bound, enforced incrementally)
   audit/                hash-chained JSONL logger (v1 records, verify, anchors)
   mcp/                  MCP adapter on the official Go SDK (spec 2026-07-28 baseline, older clients negotiated)
-  cli/                  serve (per-task servers+admin API) / grant / mcp wiring
+  cli/                  share/serve (per-task servers+admin API) / grant / mcp / setup / rendezvous / audit / tasks / revoke wiring
 examples/policies/      readonly-debug, lab-gpu
-testdata/               e2e drivers (local + live-Tailcat probes) + adversarial tests
+testdata/               e2e drivers (local + live-Tailcat probes) + adversarial + pairing + approval tests
 ```
 
 ## Roadmap
@@ -331,7 +377,10 @@ v0.2-C SafeFS (dirfd walk, Linux openat2) ✓
 v0.2-D remote_write on SafeFS (read/write split, default deny) ✓
 v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tools/list ✓
 v0.2-F adversarial E2E (25 checks green), 0.2.0 ✓
-v0.3   human approval, audit verify + external anchor, specialized adapters
+v0.3-A pairing: rendezvous server, sealed envelopes, `share`/`setup claude`/pair MCP flow ✓
+v0.3-B human approval engine: never/once/always, hash-bound, fail-closed, terminal UX ✓
+v0.3   release hardening: cross-platform CI, signed releases, README/golden-path parity
+v0.4   network egress policy, specialized adapters
 ```
 
 ## License
