@@ -12,6 +12,7 @@ Exits non-zero on any failure. All artifacts stay under ./testdata/e2e/.
 import glob
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -37,6 +38,14 @@ class Mcp:
     """One `catflap mcp` process (unpaired by default), speaking stdio
     JSON-RPC. rendezvous_url overrides CATFLAP_RENDEZVOUS so the pair
     tool talks to our throwaway rendezvous instead of the public one.
+
+    A dedicated reader thread demuxes stdout by JSON-RPC id, so that:
+      - a notification (no "id" — e.g. notifications/tools/list_changed,
+        fired by AddTool/RemoveTools as a side effect of the very call
+        being awaited) is never mistaken for a request's response, and
+      - two calls' requests can genuinely both be in flight on the wire
+        at once (each blocks only on ITS OWN id's response, not on
+        holding a lock across the whole write+read).
     """
 
     def __init__(self, rendezvous_url=RENDEZVOUS_URL, extra_env=None):
@@ -50,51 +59,71 @@ class Mcp:
             text=True, bufsize=1, env=env,
         )
         self.rid = 0
-        self.lock = threading.Lock()
-        self._raw({"jsonrpc": "2.0", "id": "init", "method": "initialize",
-                   "params": {"protocolVersion": "2025-06-18",
-                              "capabilities": {},
-                              "clientInfo": {"name": "pairing-e2e", "version": "0"}}})
-        self._raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending = {}
+        self.notifications = []
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
 
-    def _raw(self, obj):
-        self.p.stdin.write(json.dumps(obj) + "\n")
-        self.p.stdin.flush()
-        if "id" in obj:
-            while True:
-                line = self.p.stdout.readline()
-                if not line:
-                    return {"error": "eof"}
+        self._request({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18",
+                                   "capabilities": {},
+                                   "clientInfo": {"name": "pairing-e2e", "version": "0"}}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _read_loop(self):
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                return
+            try:
                 r = json.loads(line)
-                if r.get("id") == obj["id"]:
-                    return r
-        return None
+            except ValueError:
+                continue
+            rid = r.get("id")
+            if rid is None:
+                with self.pending_lock:
+                    self.notifications.append(r)
+                continue
+            with self.pending_lock:
+                q = self.pending.get(rid)
+            if q is not None:
+                q.put(r)
+
+    def _send(self, obj):
+        with self.write_lock:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+
+    def _request(self, obj, timeout=20):
+        rid = obj["id"]
+        q = queue.Queue()
+        with self.pending_lock:
+            self.pending[rid] = q
+        try:
+            self._send(obj)
+            try:
+                return q.get(timeout=timeout)
+            except queue.Empty:
+                return {"error": "timeout"}
+        finally:
+            with self.pending_lock:
+                self.pending.pop(rid, None)
 
     def _next_id(self):
-        with self.lock:
+        with self.write_lock:
             self.rid += 1
             return self.rid
 
     def call(self, name, args):
         rid = self._next_id()
-        with self.lock:
-            self.p.stdin.write(json.dumps(
-                {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
-                 "params": {"name": name, "arguments": args}}) + "\n")
-            self.p.stdin.flush()
-            line = self.p.stdout.readline()
-        if not line:
-            return {"error": "eof"}
-        return json.loads(line)
+        return self._request({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                               "params": {"name": name, "arguments": args}})
 
     def tools_list(self):
         rid = self._next_id()
-        with self.lock:
-            self.p.stdin.write(json.dumps(
-                {"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}}) + "\n")
-            self.p.stdin.flush()
-            line = self.p.stdout.readline()
-        return json.loads(line) if line else {"error": "eof"}
+        return self._request({"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}})
 
     def close(self):
         try:
