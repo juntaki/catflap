@@ -83,3 +83,4 @@ jobs:
       - run: go build -o ./bin/catflap ./cmd/catflap
       - run: python3 ./testdata/e2e/adversarial.py
       - run: python3 ./testdata/e2e/pairing.py
+      - run: python3 ./testdata/e2e/approval.py
