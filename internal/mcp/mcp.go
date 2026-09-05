@@ -3,14 +3,18 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/juntaki/catflap/internal/capability"
+	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/rpc"
 	"github.com/juntaki/catflap/internal/transport"
 	"github.com/juntaki/catflap/internal/transport/local"
@@ -25,15 +29,33 @@ import (
 // pinned to a spec-compatible release in go.mod. Catflap only declares its
 // tools and translates calls to the task gateway. See README for the
 // protocol baseline.
+//
+// A Server starts in one of two states: paired-from-start (Serve, given a
+// capability up front — the legacy --cap/--cap-file flow) or UNPAIRED
+// (ServeUnpaired, no capability yet). UNPAIRED exposes only pair/status;
+// once pair succeeds, cap/client commit and the capability's granted
+// remote_* tools are added, with the SDK sending tools/list_changed on its
+// own (AddTool always notifies). cap/client are read and written from
+// multiple goroutines (concurrent tool calls) once Run has started, so
+// every access goes through mu — never read the fields directly outside
+// this file.
 type Server struct {
 	sdk     *mcpsdk.Server
-	cap     *capability.Capability
-	client  transport.Client
 	verbose bool
 	id      int64
+
+	mu      sync.Mutex
+	cap     *capability.Capability // nil until paired
+	client  transport.Client       // nil until paired
+	pairing bool                   // claimed by one in-flight pair call
+
+	// rendezvousURL is where the pair tool fetches envelopes from.
+	// Unused once paired (only pair itself needs it).
+	rendezvousURL string
 }
 
-// Serve runs the MCP stdio loop until stdin closes.
+// Serve runs the MCP stdio loop, already paired with capStr, until stdin
+// closes. This is the legacy --cap/--cap-file entry point.
 func Serve(capStr string, verbose bool) error {
 	cap, err := capability.Decode(capStr)
 	if err != nil {
@@ -42,29 +64,77 @@ func Serve(capStr string, verbose bool) error {
 	if cap.Expired(time.Now()) {
 		return fmt.Errorf("capability expired (task %s expired at %s)", cap.TaskID, cap.ExpiresAt.Format(time.RFC3339))
 	}
-	var client transport.Client
-	switch cap.Transport {
-	case "local":
-		client = local.Dialer(cap.Endpoint)
-	default:
-		client, err = tct.Dialer(cap.Endpoint, cap.ClientPriv, verbose)
-		if err != nil {
-			return err
-		}
+	client, err := dialerFor(cap, verbose)
+	if err != nil {
+		return err
 	}
-	defer func() { _ = client.Close() }()
 	// Fail fast: one dial to prove reachability before advertising tools.
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	conn, err := client.Dial(ctx)
 	cancel()
 	if err != nil {
+		_ = client.Close()
 		return fmt.Errorf("dial gateway: %w", err)
 	}
 	_ = conn.Close()
 
-	s := &Server{cap: cap, client: client, verbose: verbose}
-	s.sdk = mcpsdk.NewServer(
-		&mcpsdk.Implementation{Name: "catflap", Version: "0.2.0"}, nil)
+	s := newServer(verbose)
+	s.commitPaired(cap, client)
+	return s.run()
+}
+
+// ServeUnpaired runs the MCP stdio loop with no capability yet: only
+// pair/status are exposed until the pair tool succeeds, at which point
+// the capability's granted remote_* tools are added and advertised via
+// tools/list_changed — no reconnect needed on the client side.
+func ServeUnpaired(rendezvousURL string, verbose bool) error {
+	s := newServer(verbose)
+	s.rendezvousURL = rendezvousURL
+	return s.run()
+}
+
+func newServer(verbose bool) *Server {
+	s := &Server{verbose: verbose}
+	s.sdk = mcpsdk.NewServer(&mcpsdk.Implementation{Name: "catflap", Version: "0.2.0"}, nil)
+	s.sdk.AddTool(&mcpsdk.Tool{
+		Name:        "pair",
+		Description: "Pair with a Catflap task using a pairing code (looks like \"CAT-XXXX-...\"). Fetches and verifies the task's capability, then confirms the task is actually reachable before this tool exposes any of its granted tools.",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"code": map[string]any{"type": "string", "description": "The pairing code, e.g. CAT-XXXX-XXXX-..."}},
+			"required":   []string{"code"},
+		},
+	}, s.handlePair)
+	s.sdk.AddTool(&mcpsdk.Tool{
+		Name:        "status",
+		Description: "Report whether this MCP server is paired with a Catflap task, and if so, which one (name, policy, expiry) — never the task secret.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+	}, s.handleStatus)
+	return s
+}
+
+func (s *Server) run() error {
+	return s.sdk.Run(context.Background(), &mcpsdk.StdioTransport{})
+}
+
+// snapshot returns the current capability and client together, so a
+// handler never observes one updated and the other stale from a
+// concurrent pair.
+func (s *Server) snapshot() (*capability.Capability, transport.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cap, s.client
+}
+
+// commitPaired records a successfully verified capability/client pair and
+// adds its granted remote_* tools. Called only after handlePair has
+// already proven reachability (dial + ping) — never speculatively.
+func (s *Server) commitPaired(cap *capability.Capability, client transport.Client) {
+	s.mu.Lock()
+	s.cap = cap
+	s.client = client
+	s.pairing = false
+	s.mu.Unlock()
 	for _, def := range toolDefs() {
 		name, _ := def["name"].(string)
 		if !s.exposed(name) {
@@ -78,7 +148,160 @@ func Serve(capStr string, verbose bool) error {
 			InputSchema: schema,
 		}, s.handleTool(name))
 	}
-	return s.sdk.Run(context.Background(), &mcpsdk.StdioTransport{})
+}
+
+// pairArgs is the pair tool's input.
+type pairArgs struct {
+	Code string `json:"code"`
+}
+
+// handlePair implements the pair tool: ParseCode (local checksum, so a
+// typo can never burn the real envelope) -> Fetch (one-time; burns it
+// regardless of what follows) -> Open (AEAD; wrong key/tampered envelope
+// fail here) -> decode the capability -> dial -> ping. Only once ping
+// actually succeeds does this commit pair state and expose the
+// capability's tools — Fetch+Open alone only prove the envelope was
+// valid, not that its target task is still alive and reachable right
+// now.
+func (s *Server) handlePair(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+	if !s.tryClaimPairing() {
+		return toolError("already paired, or a pair attempt is already in flight"), nil
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			s.mu.Lock()
+			s.pairing = false
+			s.mu.Unlock()
+		}
+	}()
+
+	var args pairArgs
+	if err := unmarshalArgs(req, &args); err != nil {
+		return toolError(fmt.Sprintf("bad arguments: %v", err)), nil
+	}
+	id, key, err := pair.ParseCode(args.Code)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	env, err := pair.Fetch(ctx, s.rendezvousURL, id)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	pt, err := pair.Open(env, key)
+	if err != nil {
+		return toolError(fmt.Sprintf("could not open envelope: %v", err)), nil
+	}
+	// The envelope's plaintext is exactly the bytes capability.Decode
+	// expects after base64-decoding its "agc1_" form, so re-wrap and
+	// reuse Decode's existing v1 strict validation rather than
+	// duplicating it.
+	cp, err := capability.Decode(capability.Prefix + base64.RawURLEncoding.EncodeToString(pt))
+	if err != nil {
+		return toolError(fmt.Sprintf("bad capability: %v", err)), nil
+	}
+	if cp.Expired(time.Now()) {
+		return toolError("capability already expired"), nil
+	}
+	client, err := dialerFor(cp, s.verbose)
+	if err != nil {
+		return toolError(err.Error()), nil
+	}
+	if perr := pingGateway(ctx, client, cp); perr != nil {
+		_ = client.Close()
+		return toolError(fmt.Sprintf("paired capability is unreachable: %v", perr)), nil
+	}
+	s.commitPaired(cp, client)
+	committed = true
+	return textResult(map[string]any{
+		"paired":     true,
+		"name":       cp.Name,
+		"policy":     cp.Policy,
+		"expires_at": cp.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// tryClaimPairing admits at most one in-flight pair attempt, and refuses
+// once already paired.
+func (s *Server) tryClaimPairing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cap != nil || s.pairing {
+		return false
+	}
+	s.pairing = true
+	return true
+}
+
+// handleStatus reports pairing state. Never includes TaskSecret or
+// ClientPriv — status is a diagnostic surface, not a credential one.
+func (s *Server) handleStatus(_ context.Context, _ *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+	cp, _ := s.snapshot()
+	if cp == nil {
+		return textResult(map[string]any{"paired": false})
+	}
+	return textResult(map[string]any{
+		"paired":     true,
+		"name":       cp.Name,
+		"policy":     cp.Policy,
+		"transport":  cp.Transport,
+		"expires_at": cp.ExpiresAt.Format(time.RFC3339),
+	})
+}
+
+// dialerFor builds the transport client for cap's transport.
+func dialerFor(cap *capability.Capability, verbose bool) (transport.Client, error) {
+	switch cap.Transport {
+	case "local":
+		return local.Dialer(cap.Endpoint), nil
+	default:
+		return tct.Dialer(cap.Endpoint, cap.ClientPriv, verbose)
+	}
+}
+
+// pingGateway proves cap's task is alive and reachable right now, over
+// its own short-lived connection. Used only by handlePair, before pair
+// state ever commits.
+func pingGateway(ctx context.Context, client transport.Client, cap *capability.Capability) error {
+	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, err := client.Dial(dctx)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if werr := rpc.WriteRequest(conn, rpc.Request{Task: cap.TaskID, Secret: cap.TaskSecret, ID: 1, Tool: rpc.ToolPing}); werr != nil {
+		return fmt.Errorf("send: %w", werr)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	res, err := rpc.ReadResponse(bufio.NewReader(conn))
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if !res.OK {
+		return errors.New(res.Error)
+	}
+	return nil
+}
+
+// unmarshalArgs decodes a tool call's raw wire arguments into v.
+func unmarshalArgs(req *mcpsdk.CallToolRequest, v any) error {
+	if len(req.Params.Arguments) == 0 {
+		return fmt.Errorf("missing arguments")
+	}
+	return json.Unmarshal(req.Params.Arguments, v)
+}
+
+// textResult marshals v as pretty JSON text content, matching handleTool's
+// result shape.
+func textResult(v any) (*mcpsdk.CallToolResult, error) {
+	pretty, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return toolError(fmt.Sprintf("result encoding failed: %v", err)), nil
+	}
+	return &mcpsdk.CallToolResult{
+		Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: string(pretty)}},
+	}, nil
 }
 
 // handleTool returns the SDK handler for one gateway RPC tool. Tool-level
@@ -86,6 +309,10 @@ func Serve(capStr string, verbose bool) error {
 // agent can read and self-correct, matching prior behavior.
 func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 	return func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		cap, client := s.snapshot()
+		if cap == nil || client == nil {
+			return toolError("not paired yet — call pair first"), nil
+		}
 		// Normalized exposure: tools outside the task's grant fail here, and
 		// the gateway would deny them anyway (defense in depth).
 		if !s.exposed(name) {
@@ -105,17 +332,17 @@ func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 		// gateway is still legitimately working. Cancellation still does
 		// NOT propagate to the remote operation (future: request-scoped
 		// RPC cancel); expiry/revoke kills it server-side meanwhile.
-		wait := time.Duration(s.cap.MaxExecMs) * time.Millisecond
+		wait := time.Duration(cap.MaxExecMs) * time.Millisecond
 		if wait <= 0 {
 			wait = 2 * time.Minute // legacy capabilities: built-in default max
 		}
 		wait += 30 * time.Second
 		ctx, cancel := context.WithTimeout(ctx, wait)
 		defer cancel()
-		conn, err := s.client.Dial(ctx)
+		conn, err := client.Dial(ctx)
 		if err != nil {
 			// Tailcat not yet up vs capability dead: surface expiry distinctly.
-			if s.cap.Expired(time.Now()) {
+			if cap.Expired(time.Now()) {
 				return toolError("capability expired"), nil
 			}
 			return toolError(fmt.Sprintf("dial gateway: %v", err)), nil
@@ -129,7 +356,7 @@ func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 		stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 		defer stop()
 		if werr := rpc.WriteRequest(conn, rpc.Request{
-			Task: s.cap.TaskID, Secret: s.cap.TaskSecret,
+			Task: cap.TaskID, Secret: cap.TaskSecret,
 			ID: callID, Tool: name, Args: args,
 		}); werr != nil {
 			return toolError(fmt.Sprintf("send: %v", werr)), nil
@@ -169,7 +396,11 @@ var legacyTools = []string{rpc.ToolExec, rpc.ToolRead, rpc.ToolStat}
 
 // exposed reports whether name is in the task's normalized tool set.
 func (s *Server) exposed(name string) bool {
-	granted := s.cap.Tools
+	cap, _ := s.snapshot()
+	if cap == nil {
+		return false
+	}
+	granted := cap.Tools
 	if granted == nil {
 		granted = legacyTools
 	}

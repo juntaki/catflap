@@ -33,6 +33,12 @@ func run(args []string) int {
 		return cli.Audit(args[1:])
 	case "mcp":
 		return cli.MCP(args[1:])
+	case "setup":
+		return cli.Setup(args[1:])
+	case "tasks":
+		return cli.Tasks(args[1:])
+	case "rendezvous":
+		return cli.Rendezvous(args[1:])
 	case "version", "--version", "-V":
 		fmt.Printf("catflap %s\n", version)
 		return 0
@@ -50,10 +56,15 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `catflap %s — ephemeral capability gateway for AI agents
 
 Usage:
+  catflap setup claude          register the (unpaired) Catflap MCP server with Claude Code
+  catflap tasks                 list live tasks on the running serve/share
+  catflap revoke <task|name>    destroy a task
+  catflap rendezvous            run a pairing rendezvous (the default is a public one)
+
+Advanced:
   catflap serve [--policy p.yaml] [--ttl 15m] [--transport tailcat|local]
   catflap grant [--policy p.yaml] [--ttl 15m]
-  catflap revoke <task>
-  catflap mcp --cap-file <cap>
+  catflap mcp [--cap-file <cap>]   (no --cap: starts unpaired; pair with a pairing code)
 
 Give an AI agent access to a machine, not a credential.
 The access dies with the task.

@@ -11,7 +11,11 @@ import (
 
 // MCP runs the agent-side stdio adapter. The capability is a bearer secret:
 // prefer --cap-file (0600) over argv, which leaks into shell history, MCP
-// config files, and process listings.
+// config files, and process listings. A capability is now optional: with
+// none, the adapter starts UNPAIRED (only the pair/status tools exposed)
+// and pairs at runtime via the `pair` tool and a pairing code — this is
+// the path `catflap setup claude` wires up, since it registers the MCP
+// server once, with no capability, before any task exists.
 //
 // (--cap-stdin was removed with the MCP SDK migration: stdin is the MCP
 // channel and cannot also carry the token. Use --cap-file.)
@@ -19,6 +23,7 @@ func MCP(args []string) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	capFlag := fs.String("cap", "", "capability token (discouraged: visible in argv/history)")
 	capFile := fs.String("cap-file", "", "read the capability token from this file")
+	rendezvous := fs.String("rendezvous", "", "rendezvous URL for the pair tool (default: resolved chain)")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -49,8 +54,16 @@ func MCP(args []string) int {
 		capStr = strings.TrimSpace(os.Getenv("AGENTGATE_CAP"))
 	}
 	if capStr == "" {
-		fmt.Fprintf(os.Stderr, "usage: catflap mcp --cap-file <cap>  (or --cap <token>)\n")
-		return 2
+		rdv, rerr := ResolveRendezvous(*rendezvous)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "mcp: rendezvous: %v\n", rerr)
+			return 1
+		}
+		if err := mcp.ServeUnpaired(rdv, *verbose); err != nil {
+			fmt.Fprintf(os.Stderr, "catflap mcp: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if err := mcp.Serve(capStr, *verbose); err != nil {
 		fmt.Fprintf(os.Stderr, "catflap mcp: %v\n", err)
