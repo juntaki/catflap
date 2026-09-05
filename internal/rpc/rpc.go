@@ -10,10 +10,12 @@ import (
 
 // Tools exposed over the gateway transport.
 const (
-	ToolExec  = "remote_exec"
-	ToolRead  = "remote_read"
-	ToolStat  = "remote_stat"
-	ToolWrite = "remote_write"
+	ToolExec       = "remote_exec"
+	ToolRead       = "remote_read"
+	ToolStat       = "remote_stat"
+	ToolWrite      = "remote_write"
+	ToolPing       = "ping"
+	ToolRevokeSelf = "revoke_self"
 )
 
 // MaxLine caps a single JSONL frame (1 MiB + headroom). It is the
@@ -125,6 +127,14 @@ type WriteArgs struct {
 type WriteResult struct {
 	Size    int64 `json:"size"`
 	Created bool  `json:"created"`
+}
+
+type PingResult struct {
+	Task string `json:"task"`
+}
+
+type RevokeSelfResult struct {
+	Revoked bool `json:"revoked"`
 }
 
 // writeFrame marshals v as one JSONL frame, refusing to emit anything

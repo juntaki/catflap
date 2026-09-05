@@ -65,6 +65,7 @@ const (
 // "The access dies with the task" includes already-started processes.
 type Task struct {
 	ID        string
+	Name      string // human-readable task name, unique per serve process
 	Secret    string
 	Policy    *policy.Policy
 	ExpiresAt time.Time
@@ -93,6 +94,20 @@ type Task struct {
 
 // StateOf returns the current lifecycle state.
 func (t *Task) StateOf() State { return State(t.state.Load()) }
+
+// StateName reports the lifecycle state for operator displays.
+func (t *Task) StateName() string {
+	switch t.StateOf() {
+	case StateCreating:
+		return "creating"
+	case StateActive:
+		return "active"
+	case StateStopping:
+		return "stopping"
+	default:
+		return "stopped"
+	}
+}
 
 // TryActivate moves a created task to ACTIVE, but only from CREATING.
 // Compare-and-swap: a task that already left Creating (stopping, stopped)
@@ -251,6 +266,10 @@ func (t *Task) auditLog(tool string, args []byte, decision string, result []byte
 type Store struct {
 	mu    sync.RWMutex
 	tasks map[string]*Task
+	// OnRevoked, when set, runs after a task self-revokes (revoke_self):
+	// the serve loop uses it to drop its timer and live-server entry.
+	// It runs after Stop, before Delete.
+	OnRevoked func(taskID string)
 }
 
 // Add registers a task.
@@ -292,8 +311,10 @@ func (t *Task) OnStopFunc(f func()) { t.onStop = f }
 // TaskInfo is a lock-free snapshot for the admin API.
 type TaskInfo struct {
 	ID        string
+	Name      string
 	Policy    string
 	ExpiresAt time.Time
+	State     string
 	AgentKey  string
 }
 
@@ -312,7 +333,7 @@ func (s *Store) List() []TaskInfo {
 		if t.Policy != nil {
 			name = t.Policy.Name
 		}
-		out = append(out, TaskInfo{ID: t.ID, Policy: name, ExpiresAt: t.ExpiresAt, AgentKey: t.AgentKey})
+		out = append(out, TaskInfo{ID: t.ID, Name: t.Name, Policy: name, ExpiresAt: t.ExpiresAt, State: t.StateName(), AgentKey: t.AgentKey})
 	}
 	return out
 }
@@ -365,6 +386,23 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 	if t.Expired(time.Now()) {
 		t.auditLog(req.Tool, req.Args, "expired", nil, 0)
 		return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
+	}
+	// Lifecycle tools bypass policy tools and the concurrency semaphore:
+	// ping proves reachability/identity (and audits the pair), revoke_self
+	// lets the task's own agent destroy it (agent-side disconnect).
+	switch req.Tool {
+	case rpc.ToolPing:
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "allow", rpc.MustRaw(map[string]string{"task": t.ID}), 0)
+		}
+		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.PingResult{Task: t.ID})}
+	case rpc.ToolRevokeSelf:
+		t.Stop("revoked")
+		s.Delete(t.ID)
+		if s.OnRevoked != nil {
+			s.OnRevoked(t.ID)
+		}
+		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.RevokeSelfResult{Revoked: true})}
 	}
 	if reason := t.beginOp(); reason != "" {
 		t.auditLog(req.Tool, req.Args, "deny", nil, 0)

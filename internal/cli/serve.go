@@ -55,6 +55,26 @@ type server struct {
 	pending int
 }
 
+// GatewayOptions configures one gateway process (serve or share).
+type GatewayOptions struct {
+	Transport  string
+	AuditDir   string
+	StatePath  string
+	AdminAddr  string
+	Verbose    bool
+	MaxTasks   int
+	TaskName   string // preferred human name for the initial task ("" = mint)
+	Policy     *policy.Policy
+}
+
+// Announce carries the first live task to the caller's printer.
+type Announce struct {
+	State     StateFile
+	Cap       *capability.Capability
+	Task      *gateway.Task
+	Transport string
+}
+
 // Serve runs the target gateway. Each task (the initial one and every
 // `grant`) gets its own ephemeral network server. The process lives until
 // SIGINT/SIGTERM; per-task expiry tears down that task's server alone.
@@ -101,14 +121,52 @@ func Serve(args []string) int {
 		return 1
 	}
 
+	announce := func(a Announce) error {
+		if *outPath != "" {
+			if err := writeCapFile(*outPath, a.Cap.Encode(), *outForce); err != nil {
+				return err
+			}
+			fmt.Printf("Task: %s (%s)\nCapability: (written to %s)\nExpires: %s\nPolicy: %s\nTransport: %s\n",
+				a.Task.ID, a.Task.Name, *outPath, a.Task.ExpiresAt.Format(time.RFC3339), pol.Name, a.Transport)
+			return nil
+		}
+		fmt.Printf("Task: %s (%s)\nCapability:\n%s\nExpires: %s\nPolicy: %s\nTransport: %s\n",
+			a.Task.ID, a.Task.Name, a.Cap.Encode(), a.Task.ExpiresAt.Format(time.RFC3339), pol.Name, a.Transport)
+		return nil
+	}
+	return RunGateway(GatewayOptions{
+		Transport: *transportFlag, AuditDir: *auditDir, StatePath: *statePath,
+		AdminAddr: *adminAddr, Verbose: *verbose, MaxTasks: *maxTasks, Policy: pol,
+	}, announce)
+}
+
+// RunGateway runs one gateway process around opts.Policy: first task,
+// loopback admin API (/grant, /revoke, /tasks), state file, then serve
+// until SIGINT/SIGTERM. announce prints the first live task; its error
+// tears everything down.
+func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
+
 	s := &server{
-		transport: *transportFlag, verbose: *verbose,
-		auditDir: *auditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
-		maxTasks: *maxTasks,
+		transport: opts.Transport, verbose: opts.Verbose,
+		auditDir: opts.AuditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
+		maxTasks: opts.MaxTasks,
 	}
 	if s.maxTasks < 1 {
 		fmt.Fprintf(os.Stderr, "invalid --max-tasks %d\n", s.maxTasks)
 		return 1
+	}
+	// Agent-side self-revoke (disconnect) drops the serve-side timer and
+	// live entry too; the gateway already Stopped and Deleted the task.
+	s.store.OnRevoked = func(taskID string) {
+		s.mu.Lock()
+		lt, ok := s.live[taskID]
+		if ok {
+			delete(s.live, taskID)
+		}
+		s.mu.Unlock()
+		if ok {
+			lt.timer.Stop()
+		}
 	}
 
 	// Root context for the process: every task context derives from it, so
@@ -116,7 +174,7 @@ func Serve(args []string) int {
 	ctx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSig()
 
-	firstCap, firstTask, err := s.mkTask(ctx, pol)
+	firstCap, firstTask, err := s.mkTask(ctx, opts.Policy, opts.TaskName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mint task: %v\n", err)
 		return 1
@@ -124,7 +182,7 @@ func Serve(args []string) int {
 
 	// Admin API for `grant`.
 	adminToken := randomToken()
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *adminAddr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", opts.AdminAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "admin listen: %v\n", err)
 		s.shutdown()
@@ -145,7 +203,7 @@ func Serve(args []string) int {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		p := pol // default: same policy snapshot family
+		p := opts.Policy // default: same policy snapshot family
 		if greq.PolicyYAML != "" {
 			pp, err := policy.Parse([]byte(greq.PolicyYAML))
 			if err != nil {
@@ -163,7 +221,7 @@ func Serve(args []string) int {
 			}
 			p = &cp
 		}
-		cap, _, err := s.mkTask(ctx, p)
+		cap, _, err := s.mkTask(ctx, p, "")
 		if err != nil {
 			if errors.Is(err, errTooManyTasks) {
 				http.Error(w, err.Error(), http.StatusTooManyRequests)
@@ -212,12 +270,14 @@ func Serve(args []string) int {
 		}
 		type item struct {
 			Task    string `json:"task"`
+			Name    string `json:"name"`
 			Policy  string `json:"policy"`
 			Expires string `json:"expires_at"`
+			State   string `json:"state"`
 		}
 		var out []item
 		for _, t := range s.store.List() {
-			out = append(out, item{Task: t.ID, Policy: t.Policy, Expires: t.ExpiresAt.Format(time.RFC3339)})
+			out = append(out, item{Task: t.ID, Name: t.Name, Policy: t.Policy, Expires: t.ExpiresAt.Format(time.RFC3339), State: t.State})
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	})
@@ -231,33 +291,26 @@ func Serve(args []string) int {
 	}
 	go func() { _ = adminSrv.Serve(ln) }()
 
-	st := StateFile{Transport: *transportFlag, AdminAddr: ln.Addr().String(), AdminToken: adminToken}
-	if err := writeState(*statePath, st); err != nil {
+	st := StateFile{Transport: opts.Transport, AdminAddr: ln.Addr().String(), AdminToken: adminToken}
+	if err := writeState(opts.StatePath, st); err != nil {
 		fmt.Fprintf(os.Stderr, "write state: %v\n", err)
 		s.shutdown()
 		return 1
 	}
 
-	if *outPath != "" {
-		if err := writeCapFile(*outPath, firstCap.Encode(), *outForce); err != nil {
-			fmt.Fprintf(os.Stderr, "write --out: %v\n", err)
-			removeOwnState(*statePath, st)
-			s.shutdown()
-			return 1
-		}
-		fmt.Printf("Task: %s\nCapability: (written to %s)\nExpires: %s\nPolicy: %s\nTransport: %s\n",
-			firstTask.ID, *outPath, firstTask.ExpiresAt.Format(time.RFC3339), pol.Name, *transportFlag)
-	} else {
-		fmt.Printf("Task: %s\nCapability:\n%s\nExpires: %s\nPolicy: %s\nTransport: %s\n",
-			firstTask.ID, firstCap.Encode(), firstTask.ExpiresAt.Format(time.RFC3339), pol.Name, *transportFlag)
+	if err := announce(Announce{State: st, Cap: firstCap, Task: firstTask, Transport: opts.Transport}); err != nil {
+		fmt.Fprintf(os.Stderr, "announce: %v\n", err)
+		removeOwnState(opts.StatePath, st)
+		s.shutdown()
+		return 1
 	}
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s live for %s on its own address; Ctrl-C destroys all keys\n",
-		firstTask.ID, pol.TTL.Round(time.Second))
+		firstTask.ID, opts.Policy.TTL.Round(time.Second))
 
 	<-ctx.Done()
 	fmt.Fprintf(os.Stderr, "catflap serve: shutting down, destroying all task keys\n")
 	_ = adminSrv.Close()
-	removeOwnState(*statePath, st)
+	removeOwnState(opts.StatePath, st)
 	s.shutdown()
 	return 0
 }
@@ -300,7 +353,7 @@ func (s *server) release() {
 // always opens with task.create, so a shutdown racing commit can only
 // append task.stop after it — never seal an empty chain, and creation
 // failure yields task.create + task.stop failed.
-func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capability, *gateway.Task, error) {
+func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*capability.Capability, *gateway.Task, error) {
 	if err := s.reserve(); err != nil {
 		return nil, nil, err
 	}
@@ -323,6 +376,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 	}
 	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
 	t.InitContext(ctx) // in-flight execs die with the task (C7)
+	t.Name = s.taskName(name)
 	s.store.Add(t)
 	// Creation opens the chain and binds the canonical policy snapshot
 	// into the audit trail (args = canonical policy bytes). The sink is
@@ -369,7 +423,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 	}
 
 	cap := &capability.Capability{
-		Version: 1, TaskID: taskID,
+		Version: 1, TaskID: taskID, Name: t.Name,
 		Transport: s.transport, Endpoint: srv.Addr(),
 		ClientPriv: clientPriv, TaskSecret: secret,
 		ExpiresAt: expires, Policy: p.Name,
@@ -447,6 +501,42 @@ func toolsForPolicy(p *policy.Policy) []string {
 		}
 	}
 	return out
+}
+
+// taskName returns preferred when free, else a minted unique name.
+func (s *server) taskName(preferred string) string {
+	if NormalizeName(preferred) != "" {
+		s.mu.Lock()
+		used := false
+		for _, lt := range s.live {
+			if NormalizeName(lt.task.Name) == NormalizeName(preferred) {
+				used = true
+				break
+			}
+		}
+		s.mu.Unlock()
+		if !used {
+			return strings.TrimSpace(preferred)
+		}
+	}
+	return s.mintName()
+}
+
+// mintName returns a human-readable task name unique among live tasks.
+func (s *server) mintName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	used := map[string]bool{}
+	for _, lt := range s.live {
+		used[NormalizeName(lt.task.Name)] = true
+	}
+	for i := 0; i < 100; i++ {
+		name := MintName()
+		if !used[NormalizeName(name)] {
+			return name
+		}
+	}
+	return capability.NewTaskID() // absurd collision run; fall back to id
 }
 
 // takeLive removes a live task from the registry and returns it.

@@ -33,13 +33,13 @@ func TestAuditFailureDetachesTaskFromStore(t *testing.T) {
 	p := policy.Default()
 	p.TTL = time.Hour
 
-	cap, task, err := s.mkTask(context.Background(), p)
+	cap, task, err := s.mkTask(context.Background(), p, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// The single admission slot is now taken.
-	if _, _, err := s.mkTask(context.Background(), p); err == nil {
+	if _, _, err := s.mkTask(context.Background(), p, ""); err == nil {
 		t.Fatal("expected max-tasks to be exhausted")
 	}
 
@@ -80,7 +80,7 @@ func TestAuditFailureDetachesTaskFromStore(t *testing.T) {
 	}
 
 	// The freed slot must admit a new task.
-	if _, _, err := s.mkTask(context.Background(), p); err != nil {
+	if _, _, err := s.mkTask(context.Background(), p, ""); err != nil {
 		t.Errorf("admission slot must be free after detach: %v", err)
 	}
 }

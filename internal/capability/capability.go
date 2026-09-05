@@ -19,8 +19,12 @@ const Prefix = "agc1_"
 // and the task auth secret. The server is the source of truth for
 // expiry; the embedded ExpiresAt is a client-side hint for fast failure.
 type Capability struct {
-	Version    int       `json:"v"`
-	TaskID     string    `json:"task"`
+	Version int    `json:"v"`
+	TaskID  string `json:"task"`
+	// Name is the task's human-readable name (unique per serve process),
+	// mirroring gateway.Task.Name; empty on legacy capabilities minted
+	// before task naming existed.
+	Name       string    `json:"name,omitempty"`
 	Transport  string    `json:"transport"` // "tailcat" or "local"
 	Endpoint   string    `json:"endpoint"`  // tailcat addr, or host:port for local
 	ClientPriv string    `json:"client_priv,omitempty"`
