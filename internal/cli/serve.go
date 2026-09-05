@@ -43,8 +43,14 @@ type server struct {
 	verbose   bool
 	auditDir  string
 	store     *gateway.Store
-	mu        sync.Mutex
-	live      map[string]*liveTask
+	// approver is shared by every task minted by this process (they share
+	// one terminal): nil when stdin isn't an interactive terminal, so a
+	// policy rule requiring approval fails closed instead of blocking
+	// forever or auto-approving in a headless run (see mkTask, and
+	// gateway.Task.checkApproval's "no approver attached" path).
+	approver gateway.Approver
+	mu       sync.Mutex
+	live     map[string]*liveTask
 	// maxTasks bounds live tasks; exhaustion fails the grant, never an
 	// unbounded allocation (§18).
 	maxTasks int
@@ -174,10 +180,18 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		return 1
 	}
 
+	var approver gateway.Approver
+	if isInteractiveTerminal(os.Stdin) {
+		// Prompts go to stderr, matching every other operator-facing
+		// message in this file (e.g. the "task ... live for ..." line
+		// below) — stdout stays reserved for the capability/pairing
+		// output announce() prints.
+		approver = NewTerminalApprover(os.Stdin, os.Stderr)
+	}
 	s := &server{
 		transport: opts.Transport, verbose: opts.Verbose,
 		auditDir: opts.AuditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
-		maxTasks: opts.MaxTasks,
+		maxTasks: opts.MaxTasks, approver: approver,
 	}
 
 	// Root context for the process. Task contexts are NOT children of
@@ -407,6 +421,9 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
 	t := &gateway.Task{ID: taskID, Name: resolvedName, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
+	if s.approver != nil {
+		t.SetApprover(s.approver)
+	}
 	// WithoutCancel: a task's own context must be cancelled ONLY through
 	// TryRequestStop, with the correct cause (ErrTaskShutdown, in this
 	// case) — never implicitly, by being a child of the process's
