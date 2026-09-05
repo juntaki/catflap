@@ -210,7 +210,7 @@ func TestAuditFailureStopsTaskOnEarlyReturn(t *testing.T) {
 	s.Add(task)
 	task.TryActivate()
 
-	alog.BreakSinkForTest()
+	_ = alog.Close()
 
 	res := call(t, s, rpc.ToolExec, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
 	if res.OK || res.Error != "capability expired" {
@@ -223,6 +223,74 @@ func TestAuditFailureStopsTaskOnEarlyReturn(t *testing.T) {
 	}
 	if task.StateOf() != StateStopped {
 		t.Fatalf("audit sink failure on the early-return path must stop the task fail-closed, state=%v", task.StateOf())
+	}
+}
+
+// TestRequestStopSynchronousStateTransition covers the P1 fix: the state
+// flip to StateStopping (and thus beginOp refusing new ops) must happen
+// before RequestStop returns, not somewhere inside an async goroutine.
+// Before this fix, auditLog scheduled `go t.Stop(...)`, leaving a window
+// where a concurrent connection's beginOp could still observe ACTIVE
+// between "audit failure detected" and "task actually stopped".
+func TestRequestStopSynchronousStateTransition(t *testing.T) {
+	task := &Task{ID: "agt_test", Secret: "s3cret", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Minute)}
+	task.InitContext(context.Background())
+	task.TryActivate()
+
+	done := task.RequestStop("audit sink failed")
+	// No sleep, no polling: this must already be true the instant
+	// RequestStop returns, synchronously — that's the property under test.
+	if task.StateOf() == StateActive {
+		t.Fatal("state must leave ACTIVE synchronously within RequestStop, not asynchronously")
+	}
+	if reason := task.beginOp(); reason == "" {
+		t.Error("beginOp must refuse immediately after RequestStop returns")
+	}
+	<-done // async teardown must still complete
+	if task.StateOf() != StateStopped {
+		t.Errorf("state = %v, want StateStopped once RequestStop's channel closes", task.StateOf())
+	}
+}
+
+// TestMalformedArgsAudited covers the P2 fix: a decode failure on tool
+// args used to return before any audit write, so an authenticated client
+// sending malformed JSON left no trace in the audit chain — contrary to
+// "every decision (allow/deny/expired/error) is audited".
+func TestMalformedArgsAudited(t *testing.T) {
+	dir := t.TempDir()
+	alog, err := audit.Open(dir, "agt_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{ID: "agt_test", Secret: "s3cret", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Minute), Audit: alog}
+	task.InitContext(context.Background())
+	s := &Store{}
+	s.Add(task)
+	task.TryActivate()
+
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+	go s.HandlerFor("agt_test")(c2)
+	// Valid JSON (so the outer Request frame itself still marshals), but
+	// the wrong shape to unmarshal into rpc.ExecArgs.
+	if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: []byte(`123`)}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := rpc.ReadResponse(bufio.NewReader(c1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OK || res.Error != "bad exec args" {
+		t.Fatalf("malformed args must still be denied normally, got %+v", res)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "agt_test.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"tool":"remote_exec"`) || !strings.Contains(string(raw), `"decision":"error"`) {
+		t.Errorf("malformed args must produce an audited error entry, got:\n%s", raw)
 	}
 }
 

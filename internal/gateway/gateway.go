@@ -74,6 +74,9 @@ type Task struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 	stopOnce sync.Once
+	// stopDone closes when RequestStop's asynchronous teardown finishes.
+	// Lazily created (stopDoneCh) since Task has no constructor.
+	stopDone chan struct{}
 	// opMu + state + wg form the operation registry: Stop flips the state
 	// (new ops fail), cancels the context (running ops die), then drains
 	// in-flight ops boundedly before the terminal audit event and close.
@@ -120,15 +123,25 @@ func (t *Task) Context() context.Context {
 	return t.ctx
 }
 
-// Stop destroys the task with the given reason ("expired", "revoked",
-// "shutdown"). Ordering is fixed:
+// RequestStop begins destroying the task with the given reason ("expired",
+// "revoked", "shutdown", "audit sink failed") and returns immediately once
+// the task can no longer be found ACTIVE — new ops and beginOp's is-ACTIVE
+// check both key off the same state, set here synchronously before this
+// call returns. The rest of teardown (bounded drain of in-flight ops,
+// terminal audit event, onStop — server close + live/store/timer detach
+// for tasks committed via serve.go, see commit — then audit close) runs
+// asynchronously; the returned channel closes when it finishes.
 //
-//	stop accepting → cancel task context (kill trees) → bounded drain of
-//	in-flight ops → terminal audit event → release server → close audit.
+// A caller that must not race a beginOp admitted between "audit failure
+// observed" and "task actually stopped" needs this synchronous guarantee;
+// Stop is the synchronous convenience for callers that don't care and
+// just want to wait for the whole thing.
 //
-// It MUST be followed by Store.Delete, and every termination path (expiry,
-// revoke, shutdown) funnels through it (INV-3).
-func (t *Task) Stop(reason string) {
+// Concurrent RequestStop/Stop calls are safe and share one teardown
+// (stopOnce): every caller gets the same completion channel back,
+// regardless of who triggers the one real run.
+func (t *Task) RequestStop(reason string) <-chan struct{} {
+	done := t.stopDoneCh()
 	t.stopOnce.Do(func() {
 		if reason == "" {
 			reason = "shutdown"
@@ -139,23 +152,47 @@ func (t *Task) Stop(reason string) {
 		if t.cancel != nil {
 			t.cancel(causeForReason(reason)) // kill running trees with cause
 		}
-		drained := make(chan struct{})
-		go func() { t.wg.Wait(); close(drained) }()
-		select {
-		case <-drained:
-		case <-time.After(10 * time.Second):
-		}
-		if t.Audit != nil {
-			t.Audit.LogTerminal(reason)
-		}
-		if t.onStop != nil {
-			t.onStop()
-		}
-		if t.Audit != nil {
-			_ = t.Audit.Close()
-		}
-		t.state.Store(int32(StateStopped))
+		go func() {
+			drained := make(chan struct{})
+			go func() { t.wg.Wait(); close(drained) }()
+			select {
+			case <-drained:
+			case <-time.After(10 * time.Second):
+			}
+			if t.Audit != nil {
+				t.Audit.LogTerminal(reason)
+			}
+			if t.onStop != nil {
+				t.onStop()
+			}
+			if t.Audit != nil {
+				_ = t.Audit.Close()
+			}
+			t.state.Store(int32(StateStopped))
+			close(done)
+		}()
 	})
+	return done
+}
+
+// stopDoneCh lazily creates the shared stop-completion channel. Guarded by
+// opMu (already the lock used around state transitions) rather than a new
+// one, since Task has no constructor to pre-allocate it in.
+func (t *Task) stopDoneCh() chan struct{} {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
+	if t.stopDone == nil {
+		t.stopDone = make(chan struct{})
+	}
+	return t.stopDone
+}
+
+// Stop destroys the task and blocks until teardown fully completes. See
+// RequestStop for the synchronous-vs-asynchronous split; every
+// termination path (expiry, revoke, shutdown) funnels through one of the
+// two (INV-3).
+func (t *Task) Stop(reason string) {
+	<-t.RequestStop(reason)
 }
 
 // beginOp registers an in-flight operation, enforcing the ACTIVE state and
@@ -192,16 +229,21 @@ func (t *Task) endOp() {
 // never leave an ACTIVE task running with a degraded audit trail no
 // matter which code path happened to hit it first.
 //
-// Stop runs in a goroutine: called synchronously from inside an
-// in-flight op (between beginOp and its deferred endOp), it would
-// deadlock on Stop's wg.Wait against that very op.
+// RequestStop, not Stop: the state flip to STOPPING (and thus beginOp
+// refusing new ops) must happen before this returns, closing the window
+// where a concurrent connection's beginOp could still observe ACTIVE
+// between "audit failure detected" and "task actually stopped". The rest
+// of teardown finishes asynchronously — waiting for it here (as Stop
+// does) would deadlock on its wg.Wait against this very op, since we're
+// called from inside an in-flight op (between beginOp and its deferred
+// endOp).
 func (t *Task) auditLog(tool string, args []byte, decision string, result []byte, dur time.Duration) {
 	if t.Audit == nil {
 		return
 	}
 	t.Audit.Log(tool, args, decision, result, dur)
 	if t.Audit.Err() != nil {
-		go t.Stop("audit sink failed")
+		t.RequestStop("audit sink failed")
 	}
 }
 
@@ -354,6 +396,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	start := time.Now()
 	var args rpc.ExecArgs
 	if err := json.Unmarshal(req.Args, &args); err != nil {
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad exec args"}
 	}
 	exe, ok := t.Policy.MatchExec(args.Command, args.Args)
@@ -426,6 +469,7 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 	start := time.Now()
 	var args rpc.ReadArgs
 	if err := json.Unmarshal(req.Args, &args); err != nil {
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad read args"}
 	}
 	if args.Path == "" {
@@ -467,6 +511,7 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 	start := time.Now()
 	var args rpc.StatArgs
 	if err := json.Unmarshal(req.Args, &args); err != nil {
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad stat args"}
 	}
 	if args.Path == "" {
@@ -505,6 +550,7 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 	start := time.Now()
 	var args rpc.WriteArgs
 	if err := json.Unmarshal(req.Args, &args); err != nil {
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad write args"}
 	}
 	deny := func(msg string) rpc.Response {

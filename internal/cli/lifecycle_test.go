@@ -43,7 +43,7 @@ func TestAuditFailureDetachesTaskFromStore(t *testing.T) {
 		t.Fatal("expected max-tasks to be exhausted")
 	}
 
-	task.Audit.BreakSinkForTest()
+	_ = task.Audit.Close()
 
 	// Drive one RPC through the real transport handler, same as a live
 	// client would; any request path audits, so this trips fail-closed

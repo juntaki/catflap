@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,12 @@ type Logger struct {
 	// operator can be told the audit degraded instead of silently
 	// losing records.
 	writeErr error
+	// closed marks a file-backed Logger whose sink has been Close()d.
+	// appendLocked uses it to tell that apart from a Logger that never
+	// had a file at all (Open("", ...), the in-memory/no-audit-dir
+	// case): a closed sink writing is a sticky failure, a Logger with no
+	// sink by design is not.
+	closed bool
 }
 
 // Open creates (or appends to) dir/<task>.jsonl.
@@ -114,20 +121,10 @@ func (l *Logger) Err() error {
 	return l.writeErr
 }
 
-// BreakSinkForTest closes the underlying file descriptor while leaving the
-// Logger otherwise intact, so the next Log call hits a real write error —
-// exactly like a real disk failure would. Test-only: it exists so tests in
-// other packages (gateway, cli) can exercise fail-closed behavior without
-// reaching into Logger's private fields, which Close() cannot do for them
-// since Close() also nils l.f, and appendLocked treats a nil l.f as the
-// (deliberately non-failing) in-memory-logger case.
-func (l *Logger) BreakSinkForTest() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.f != nil {
-		_ = l.f.Close()
-	}
-}
+// errSinkClosed is the sticky writeErr recorded when something logs to a
+// file-backed Logger after Close() — deliberately treated as a failure,
+// not as the in-memory/no-audit-dir "no sink by design" case.
+var errSinkClosed = errors.New("audit sink closed")
 
 // appendLocked builds the next chain entry and, only once it is fully
 // durable on disk, commits it as the new seq/prev. A write that fails or
@@ -152,6 +149,12 @@ func (l *Logger) appendLocked(tool string, args []byte, decision string, result 
 	}
 	e.Hash = HashEntry(e)
 	if l.f == nil {
+		if l.closed {
+			if l.writeErr == nil {
+				l.writeErr = errSinkClosed
+			}
+			return e
+		}
 		l.seq = e.Seq
 		l.prev = e.Hash
 		return e
@@ -180,12 +183,17 @@ func (l *Logger) appendLocked(tool string, args []byte, decision string, result 
 	return e
 }
 
+// Close closes the sink. Logging to it afterward is a sticky failure
+// (errSinkClosed via appendLocked), not silently accepted: only a Logger
+// that never had a file to begin with (Open("", ...)) treats writes as a
+// no-op success.
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.f != nil {
 		f := l.f
 		l.f = nil
+		l.closed = true
 		return f.Close()
 	}
 	return nil
