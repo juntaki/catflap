@@ -696,7 +696,7 @@ func TestRemoteWrite(t *testing.T) {
 	root := absBase + "/root"
 	full := `
       roots: ["` + root + `"]
-      max_file_size: 1048576
+      max_file_size: 262144
       create: true
       overwrite: true
       atomic: true
@@ -733,7 +733,7 @@ func TestRemoteWrite(t *testing.T) {
 	t.Run("overwrite denied", func(t *testing.T) {
 		noOver := `
       roots: ["` + root + `"]
-      max_file_size: 1048576
+      max_file_size: 262144
       create: true
       overwrite: false
 `
@@ -747,7 +747,7 @@ func TestRemoteWrite(t *testing.T) {
 	t.Run("create denied", func(t *testing.T) {
 		noCreate := `
       roots: ["` + root + `"]
-      max_file_size: 1048576
+      max_file_size: 262144
       create: false
       overwrite: true
 `

@@ -116,9 +116,17 @@ argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
 The agent adapter is built on the official MCP Go SDK (pinned in
 `go.mod`), speaking spec `2026-07-28` by default (`server/discover`,
 stateless requests) while negotiating older spec versions with older
-clients — no handwritten protocol parsing remains. Gateway RPC frames are
-bounded at 2MiB enforced incrementally, and every policy size grant must
-fit inside one frame, so a valid policy is always executable.
+clients — no handwritten protocol parsing remains. The adapter waits up
+to the task's max exec duration (carried in the capability) plus margin,
+so long permitted operations are never cut off early; cancellation of
+in-flight remote operations from the MCP side is future work (expiry and
+revoke kill server-side meanwhile).
+
+Gateway RPC frames are bounded at 2MiB, enforced incrementally on receipt
+and checked before send. Every content-size grant (stdout/stderr/read/
+write) is capped so even fully-adversarial bytes (worst-case 6x JSON
+escaping) fit one frame — a valid policy is always executable. Larger
+payloads need chunked tools (future), not larger limits.
 
 ## Policy
 
@@ -154,15 +162,16 @@ never the agent's) or as absolute paths. The v0.1 shell-string allowlist
 (`exec.commands`) is rejected at load: it cannot be made shell-safe.
 
 Resource bounds live in `limits:` and always apply — omitted fields take
-hard built-in defaults, never zero:
+hard built-in defaults, never zero. Content ceilings honor the transport
+contract (worst-case JSON escaping still fits one 2MiB frame):
 
 ```yaml
 limits:
   max_concurrent_calls: 4   # per-task concurrent operations (fail fast)
   max_exec_duration: 60s    # clamps per-call timeouts
-  max_stdout_bytes: 262144
-  max_stderr_bytes: 65536
-  max_read_bytes: 1048576
+  max_stdout_bytes: 262144  # max 256KiB
+  max_stderr_bytes: 65536   # max 64KiB
+  max_read_bytes: 262144    # max 256KiB
 ```
 
 `serve` additionally caps live tasks (`--max-tasks`, default 16): further
@@ -189,28 +198,41 @@ open starts from a directory fd for the root and walks components with
     write:
       roots:
         - /workspace/work
-      max_file_size: 1048576
+      max_file_size: 262144
       create: true      # allow new files (parent must exist)
       overwrite: false  # allow replacing existing files
-      atomic: true      # temp + fsync + rename; preserves mode on replace
+      atomic: true      # temp + fsync + rename (link for create-only); preserves mode on replace
 ```
 
 Reads and writes are independent grants; without `file.write` the write
-tool denies everything (default deny). New files are `0600`.
+tool denies everything (default deny). New files are `0600`. Concurrent
+create-only writes to the same path resolve atomically: exactly one wins,
+the rest are denied (link-based publication, no rename race).
 
 ## Audit
 
-One hash-chained JSONL file per task (`~/.catflap/audit/<task>.jsonl`):
+One hash-chained JSONL file per task (`~/.catflap/audit/<task>.jsonl`),
+schema v1 (`"v": 1` covered by the chain hash):
 
 ```json
-{"task":"agt_…","seq":17,"time":"…","agent_key":"nodekey:abc…",
+{"v":1,"task":"agt_…","seq":17,"time":"…","agent_key":"nodekey:abc…",
  "tool":"remote_exec","args_hash":"sha256:…","decision":"allow",
  "result_hash":"sha256:…","duration_ms":83,"prev":"sha256:…","hash":"sha256:…"}
 ```
 
-`prev` links entries and args/results are stored as hashes only. This is a
-hash-chained log, not tamper-proof against whole-file rewrites — a
-`catflap audit verify` command plus an external head anchor is roadmap work.
+Every chain opens with `task.create` (binding the canonical policy hash)
+and closes with `task.stop`; the terminal record seals the logger, so the
+runtime itself cannot append after it. `prev` links entries and
+args/results are stored as hashes only. Verify offline:
+
+```bash
+catflap audit verify <task>.jsonl [--expect-head sha256:…]
+catflap audit anchor [--out anchor.log] <task>.jsonl
+```
+
+A valid chain alone is not proof against whole-file replacement — pair
+verification with an external head anchor. A degraded sink (write errors)
+is sticky and reported to the operator, never silent.
 
 ## Security model — read this
 

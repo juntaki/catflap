@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -139,8 +141,10 @@ func Serve(args []string) int {
 			return
 		}
 		var greq GrantRequest
-		body, _ := io_ReadAll(r.Body, 1<<20)
-		_ = json.Unmarshal(body, &greq)
+		if err := decodeAdminBody(w, r, &greq); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 		p := pol // default: same policy snapshot family
 		if greq.PolicyYAML != "" {
 			pp, err := policy.Parse([]byte(greq.PolicyYAML))
@@ -183,8 +187,10 @@ func Serve(args []string) int {
 			return
 		}
 		var rreq RevokeRequest
-		body, _ := io_ReadAll(r.Body, 1<<20)
-		_ = json.Unmarshal(body, &rreq)
+		if err := decodeAdminBody(w, r, &rreq); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 		if strings.TrimSpace(rreq.Task) == "" {
 			http.Error(w, "missing task", http.StatusBadRequest)
 			return
@@ -238,6 +244,7 @@ func Serve(args []string) int {
 	if *outPath != "" {
 		if err := writeCapFile(*outPath, firstCap.Encode(), *outForce); err != nil {
 			fmt.Fprintf(os.Stderr, "write --out: %v\n", err)
+			removeOwnState(*statePath, st)
 			s.shutdown()
 			return 1
 		}
@@ -253,7 +260,7 @@ func Serve(args []string) int {
 	<-ctx.Done()
 	fmt.Fprintf(os.Stderr, "catflap serve: shutting down, destroying all task keys\n")
 	_ = adminSrv.Close()
-	_ = os.Remove(*statePath)
+	removeOwnState(*statePath, st)
 	s.shutdown()
 	return 0
 }
@@ -291,11 +298,11 @@ func (s *server) release() {
 // mkTask creates one task with its own ephemeral network server and arms
 // its expiry: timer → server.Close + audit.Close + store.Delete.
 //
-// Admission is reserve → create → commit: the slot is held across the slow
-// transport startup, and commit (register + Activate + timer arm) is one
-// locked step that also refuses tasks racing shutdown. TTL starts when the
-// transport is ready, not when the request arrived. No capability is
-// emitted until commit succeeds.
+// Order: reserve → audit open → task.create (sink health confirmed) →
+// transport start → commit (register + Activate + timer arm). The chain
+// always opens with task.create, so a shutdown racing commit can only
+// append task.stop after it — never seal an empty chain, and creation
+// failure yields task.create + task.stop failed.
 func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capability, *gateway.Task, error) {
 	if err := s.reserve(); err != nil {
 		return nil, nil, err
@@ -320,6 +327,17 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
 	t.InitContext(ctx) // in-flight execs die with the task (C7)
 	s.store.Add(t)
+	// Creation opens the chain and binds the canonical policy snapshot
+	// into the audit trail (args = canonical policy bytes). The sink is
+	// confirmed healthy before anything else is built: a task whose audit
+	// cannot record must never become ACTIVE.
+	t.Audit.Log("task.create", p.Canonical(), "active", nil, 0)
+	if aerr := alog.Err(); aerr != nil {
+		t.Stop("failed")
+		s.store.Delete(taskID)
+		s.release()
+		return nil, nil, fmt.Errorf("audit sink failed: %w", aerr)
+	}
 
 	var srv transport.Server
 	switch s.transport {
@@ -352,9 +370,6 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		s.store.Delete(taskID)
 		return nil, nil, err
 	}
-	// Creation event first in the chain, binding the canonical policy
-	// snapshot hash into the audit trail (args = canonical policy bytes).
-	t.Audit.Log("task.create", p.Canonical(), "active", nil, 0)
 
 	cap := &capability.Capability{
 		Version: 1, TaskID: taskID,
@@ -365,6 +380,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		// authorization semantics, independent of YAML formatting.
 		PolicyHash: p.CanonicalHash()[:12],
 		Tools:      toolsForPolicy(p),
+		MaxExecMs:  p.EffectiveLimits().MaxExecDuration.Milliseconds(),
 	}
 	return cap, t, nil
 }
@@ -397,7 +413,9 @@ func (s *server) commit(taskID string, t *gateway.Task, srv transport.Server) er
 // exposes. A task MUST NOT expose a tool its policy cannot authorize;
 // the gateway re-enforces every call regardless (list is a hint).
 func toolsForPolicy(p *policy.Policy) []string {
-	var out []string
+	// Always non-nil: an empty grant encodes as "tools":[] so it can
+	// never be mistaken for a legacy (field-absent) capability.
+	out := []string{}
 	if p.Tools.Exec != nil && len(p.Tools.Exec.Allow) > 0 {
 		out = append(out, "remote_exec")
 	}
@@ -498,51 +516,58 @@ func loadPolicy(path string) (*policy.Policy, error) {
 	return p, nil
 }
 
+// decodeAdminBody strictly decodes one JSON value from an admin request:
+// bounded size (connection killed past the limit), no unknown fields, no
+// trailing data. Malformed input fails closed — never a zero-value grant.
+func decodeAdminBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	switch derr := dec.Decode(&extra); {
+	case derr == nil:
+		return fmt.Errorf("unexpected trailing data")
+	case errors.Is(derr, io.EOF):
+		return nil
+	default:
+		return derr
+	}
+}
+
 func writeState(path string, st StateFile) error {
 	raw, merr := json.MarshalIndent(st, "", "  ")
 	if merr != nil {
 		return merr
 	}
-	// The state file holds the admin bearer token: same secure private-file
-	// semantics as capability files (no symlinks, no silent overwrite,
-	// always 0600, atomic rename). Like --out, the state file refuses to
-	// clobber an existing live coordination file: a second serve on the
-	// same --state fails instead of hijacking the first one's admin API.
-	if fi, err := os.Lstat(path); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing symlink state file %q", path)
-		}
-		return fmt.Errorf("state file %q exists (another serve running? remove it first)", path)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dirOf(path), ".state-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	_ = tmp.Chmod(0o600)
-	_, werr := tmp.Write(raw)
-	serr := tmp.Sync()
-	cerr := tmp.Close()
-	if werr != nil || serr != nil || cerr != nil {
-		_ = os.Remove(tmpName)
-		if werr != nil {
-			return werr
-		}
-		if serr != nil {
-			return serr
-		}
-		return cerr
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
+	// The state file holds the admin bearer token: same atomic no-clobber
+	// semantics as capability files. A second serve on the same --state
+	// fails instead of hijacking the first one's admin API — even under
+	// concurrent startup, where Lstat-then-create would race.
+	if err := publishNewFile(path, raw); err != nil {
+		return fmt.Errorf("state file %q: %w (another serve running?)", path, err)
 	}
 	return nil
+}
+
+// removeOwnState deletes the state file only if it still holds our bytes:
+// a concurrent or later serve's coordination file must never be removed.
+func removeOwnState(path string, st StateFile) {
+	want, merr := json.MarshalIndent(st, "", "  ")
+	if merr != nil {
+		return
+	}
+	//nolint:gosec // reason: operator's own --state path, read back only to compare before deleting our own file.
+	cur, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(cur, want) {
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "catflap serve: state file changed, leaving it\n")
+		}
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func randomToken() string {

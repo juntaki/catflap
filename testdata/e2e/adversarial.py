@@ -202,6 +202,40 @@ def main():
         check("readback", body is not None and body.get("content") == "adv",
               json.dumps(r)[:160])
 
+        # --- modern protocol: server/discover + new-protocol calls ---
+        # Spec 2026-07-28 surface, no legacy handshake involved.
+        mp = subprocess.Popen(
+            [BIN, "mcp", "--cap-file", CAP],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1)
+        meta = {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}}}
+
+        def modern(i, method, params):
+            p = dict(params)
+            p.update(meta)
+            mp.stdin.write(json.dumps(
+                {"jsonrpc": "2.0", "id": i, "method": method,
+                 "params": p}) + "\n")
+            mp.stdin.flush()
+            return json.loads(mp.stdout.readline())
+
+        r = modern(101, "server/discover", {})
+        check("discover versions",
+              "2026-07-28" in json.dumps(r.get("result", {}).get("supportedVersions", [])),
+              json.dumps(r)[:160])
+        r = modern(102, "tools/list", {})
+        names = [t.get("name") for t in r.get("result", {}).get("tools", [])]
+        check("modern tools/list", "remote_exec" in names, str(names))
+        check("modern list includes granted write", "remote_write" in names)
+        r = modern(103, "tools/call",
+                   {"name": "remote_exec",
+                    "arguments": {"command": "echo", "args": ["modern-ok"]}})
+        check("modern call ok", "modern-ok" in json.dumps(r), json.dumps(r)[:160])
+        mp.stdin.close()
+        mp.wait(timeout=15)
+
         # --- concurrency exhaustion (max 2) ---
         # One MCP stdio adapter serves requests sequentially, so parallel
         # pressure needs one adapter process per caller (same capability).

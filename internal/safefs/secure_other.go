@@ -3,7 +3,9 @@
 package safefs
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +106,7 @@ func writeOpened(f *FS, rootIdx int, comps []string, display string, data []byte
 			return fmt.Errorf("path escapes allowed roots (symlink traversal denied)")
 		}
 		if opts.Atomic {
-			return writeAtomic(filepath.Dir(abs), abs, data, uint32(fi.Mode().Perm()))
+			return writeAtomic(filepath.Dir(abs), abs, data, uint32(fi.Mode().Perm()), false)
 		}
 		//nolint:gosec // reason: abs passed containment + symlink checks above.
 		fh, err := os.OpenFile(abs, os.O_WRONLY|os.O_TRUNC, 0)
@@ -129,7 +131,7 @@ func writeOpened(f *FS, rootIdx int, comps []string, display string, data []byte
 		return fmt.Errorf("path escapes allowed roots (symlink traversal denied)")
 	}
 	if opts.Atomic {
-		return writeAtomic(filepath.Dir(abs), abs, data, 0o600)
+		return writeAtomic(filepath.Dir(abs), abs, data, 0o600, true)
 	}
 	//nolint:gosec // reason: abs passed containment; parent verified above.
 	fh, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -159,8 +161,11 @@ func containedResolved(f *FS, path string) bool {
 	return false
 }
 
-// writeAtomic writes data to a temp file in dir and renames over dst.
-func writeAtomic(dir, dst string, data []byte, mode os.FileMode) error {
+// writeAtomic writes data to a temp file in dir and publishes it. When
+// exclusive is set (create-only grants), publication uses a hard link,
+// which fails atomically with EEXIST if the target appeared concurrently;
+// otherwise the temp file renames over the target.
+func writeAtomic(dir, dst string, data []byte, mode os.FileMode, exclusive bool) error {
 	if mode == 0 {
 		mode = 0o600
 	}
@@ -185,6 +190,17 @@ func writeAtomic(dir, dst string, data []byte, mode os.FileMode) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
+	}
+	if exclusive {
+		if err := os.Link(tmpName, dst); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("target already exists (concurrent create; overwrite not allowed)")
+			}
+			return fmt.Errorf("link: %w", err)
+		}
+		failed = false
+		_ = os.Remove(tmpName)
+		return nil
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("rename: %w", err)

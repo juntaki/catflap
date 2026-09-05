@@ -21,6 +21,8 @@ func writeLog(t *testing.T, tools ...string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Chains always open with the creation event (production mkTask order).
+	l.Log(CreateTool, []byte("policy"), "active", nil, 0)
 	for _, tool := range tools {
 		l.Log(tool, []byte("args"), "allow", []byte("result"), time.Millisecond)
 	}
@@ -61,11 +63,34 @@ func TestVerifyHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid chain rejected: %v", err)
 	}
-	if rep.Entries != 3 || rep.Task != "agt_verify" || rep.Head == "" {
+	if rep.Entries != 4 || rep.Task != "agt_verify" || rep.Head == "" {
 		t.Errorf("bad report: %+v", rep)
 	}
 	if rep.Terminal == "" {
 		t.Error("expected terminal event detected")
+	}
+	if !rep.HasCreate {
+		t.Error("expected create event detected")
+	}
+}
+
+func TestVerifyFirstMustBeCreate(t *testing.T) {
+	dir := "testdata/audit-nocreate"
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	l, err := Open(dir, "agt_nocreate", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Log("task.stop", nil, "expired", nil, 0)
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(filepath.Join(dir, "agt_nocreate.jsonl")); err == nil {
+		t.Error("lone task.stop without task.create must be rejected")
 	}
 }
 

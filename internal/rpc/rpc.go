@@ -91,15 +91,28 @@ type WriteResult struct {
 	Created bool  `json:"created"`
 }
 
+// writeFrame marshals v as one JSONL frame, refusing to emit anything
+// over MaxLine. The receiver enforces the same bound incrementally, so an
+// oversized payload fails cleanly here instead of killing the connection
+// mid-stream.
+func writeFrame(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw)+1 > MaxLine {
+		return nil, errFrameTooLarge
+	}
+	return append(raw, '\n'), nil
+}
+
 // WriteRequest writes one JSONL frame with a write deadline.
 func WriteRequest(c net.Conn, req Request) error {
 	_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	//nolint:gosec // reason: the secret travels here by design — it is the RPC half of the task credential, and the server (not the token) is authoritative for expiry/policy.
-	raw, err := json.Marshal(req)
+	raw, err := writeFrame(req)
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
 	_, err = c.Write(raw)
 	return err
 }
@@ -107,27 +120,26 @@ func WriteRequest(c net.Conn, req Request) error {
 // WriteResponse writes one JSONL frame.
 func WriteResponse(c net.Conn, res Response) error {
 	_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	raw, err := json.Marshal(res)
+	raw, err := writeFrame(res)
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
 	_, err = c.Write(raw)
 	return err
 }
 
 // readFrame reads one newline-terminated JSONL frame, enforcing MaxLine
-// incrementally: the connection is abandoned the instant the bound is
-// exceeded, so a peer can force at most MaxLine bytes of allocation per
-// frame — with or without sending a newline.
+// incrementally: the bound is checked before each append, so at most
+// MaxLine bytes are ever allocated for one frame, and the connection is
+// abandoned the instant the bound is exceeded — with or without a newline.
 func readFrame(r *bufio.Reader) ([]byte, error) {
 	var frame []byte
 	for {
 		chunk, err := r.ReadSlice('\n')
-		frame = append(frame, chunk...)
-		if len(frame) > MaxLine {
+		if len(frame)+len(chunk) > MaxLine {
 			return nil, errFrameTooLarge
 		}
+		frame = append(frame, chunk...)
 		if err == nil {
 			return frame, nil
 		}

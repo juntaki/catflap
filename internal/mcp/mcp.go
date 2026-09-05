@@ -100,7 +100,17 @@ func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 			args = raw
 		}
 		callID := atomic.AddInt64(&s.id, 1)
-		ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
+		// Wait ceiling: the longest permitted operation (from the task's
+		// capability) plus margin, so the adapter never gives up while the
+		// gateway is still legitimately working. Cancellation still does
+		// NOT propagate to the remote operation (future: request-scoped
+		// RPC cancel); expiry/revoke kills it server-side meanwhile.
+		wait := time.Duration(s.cap.MaxExecMs) * time.Millisecond
+		if wait <= 0 {
+			wait = 2 * time.Minute // legacy capabilities: built-in default max
+		}
+		wait += 30 * time.Second
+		ctx, cancel := context.WithTimeout(ctx, wait)
 		defer cancel()
 		conn, err := s.client.Dial(ctx)
 		if err != nil {
@@ -117,7 +127,7 @@ func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 		}); werr != nil {
 			return toolError(fmt.Sprintf("send: %v", werr)), nil
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(150 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		res, err := rpc.ReadResponse(bufio.NewReader(conn))
 		if err != nil {
 			return toolError(fmt.Sprintf("gateway read: %v", err)), nil

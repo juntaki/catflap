@@ -54,7 +54,7 @@ func writeOpened(f *FS, rootIdx int, comps []string, display string, data []byte
 
 func writeNewAt(f *FS, rootIdx int, comps []string, display string, data []byte, opts WriteOptions) error {
 	if opts.Atomic {
-		return atomicReplace(f, rootIdx, comps, data, 0o600)
+		return atomicReplace(f, rootIdx, comps, data, 0o600, true)
 	}
 	fd, err := openFinalAt(f, rootIdx, comps, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, 0o600)
 	if err != nil {
@@ -92,7 +92,7 @@ func writeExistingAt(f *FS, rootIdx int, comps []string, display string, data []
 		if mode == 0 {
 			mode = 0o600
 		}
-		return atomicReplace(f, rootIdx, comps, data, mode)
+		return atomicReplace(f, rootIdx, comps, data, mode, false)
 	}
 	fd, err := openFinalAt(f, rootIdx, comps, unix.O_WRONLY|unix.O_TRUNC, 0)
 	if err != nil {
@@ -121,8 +121,13 @@ func openFinalAt(f *FS, rootIdx int, comps []string, flags int, mode uint32) (in
 }
 
 // atomicReplace writes data to a temp file beside the target (O_EXCL) and
-// renames over it, all relative to the walked parent dirfd.
-func atomicReplace(f *FS, rootIdx int, comps []string, data []byte, mode uint32) error {
+// publishes it, all relative to the walked parent dirfd.
+//
+// When exclusive is set (create-only grants), publication uses linkat:
+// creating the hard link fails atomically with EEXIST if the target
+// appeared concurrently, so a second writer can never overwrite the first.
+// Otherwise the temp file renames over the target.
+func atomicReplace(f *FS, rootIdx int, comps []string, data []byte, mode uint32, exclusive bool) error {
 	dirFd, err := walkParent(f.roots[rootIdx], comps[:len(comps)-1])
 	if err != nil {
 		return fmt.Errorf("parent directory does not exist")
@@ -164,6 +169,21 @@ func atomicReplace(f *FS, rootIdx int, comps []string, data []byte, mode uint32)
 	}
 	if err := unix.Fsync(tmpFd); err != nil {
 		return fmt.Errorf("sync: %w", err)
+	}
+	if exclusive {
+		// Atomic no-overwrite publication: link fails EEXIST when the
+		// target exists, including when a concurrent create won first.
+		if err := unix.Linkat(dirFd, tmpName, dirFd, base, 0); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("target already exists (concurrent create; overwrite not allowed)")
+			}
+			return fmt.Errorf("link: %w", err)
+		}
+		if err := unlinkAt(dirFd, tmpName); err != nil {
+			return fmt.Errorf("temp cleanup: %w", err)
+		}
+		failed = false
+		return nil
 	}
 	if err := unix.Renameat(dirFd, tmpName, dirFd, base); err != nil {
 		return fmt.Errorf("rename: %w", err)

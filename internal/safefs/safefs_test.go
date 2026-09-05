@@ -1,9 +1,11 @@
 package safefs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -107,6 +109,46 @@ func TestWriteMatrix(t *testing.T) {
 		noCreate := WriteOptions{MaxSize: 1 << 20, Overwrite: true, Atomic: true}
 		if err := fs.WriteFile(root+"/sub/nonexistent.txt", []byte("x"), noCreate); err == nil {
 			t.Error("create without grant must be denied")
+		}
+	})
+
+	t.Run("concurrent create-only: exactly one wins", func(t *testing.T) {
+		fs := New([]string{root})
+		createOnly := WriteOptions{MaxSize: 1 << 20, Create: true, Atomic: true}
+		sawLinkRace := false
+		// Several rounds: losers may fail at the probe (overwrite gate)
+		// or at link time (already exists) depending on interleaving —
+		// both are correct denials, but exactly one create must win.
+		for round := 0; round < 10; round++ {
+			_ = os.Remove(root + "/sub/race.txt")
+			const racers = 16
+			start := make(chan struct{})
+			results := make(chan error, racers)
+			for i := 0; i < racers; i++ {
+				go func(i int) {
+					<-start
+					results <- fs.WriteFile(root+"/sub/race.txt",
+						[]byte(fmt.Sprintf("racer-%d", i)), createOnly)
+				}(i)
+			}
+			close(start)
+			wins := 0
+			for i := 0; i < racers; i++ {
+				err := <-results
+				if err == nil {
+					wins++
+				} else if strings.Contains(err.Error(), "already exists") {
+					sawLinkRace = true
+				} else if !strings.Contains(err.Error(), "overwrite is not allowed") {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+			if wins != 1 {
+				t.Fatalf("round %d: %d wins, want exactly 1", round, wins)
+			}
+		}
+		if !sawLinkRace {
+			t.Error("link-time EEXIST path never exercised (race too tame?)")
 		}
 	})
 

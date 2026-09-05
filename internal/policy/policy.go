@@ -255,7 +255,7 @@ func DefaultLimits() Limits {
 		MaxExecDuration:    2 * time.Minute,
 		MaxStdoutBytes:     256 << 10,
 		MaxStderrBytes:     64 << 10,
-		MaxReadBytes:       1 << 20,
+		MaxReadBytes:       256 << 10,
 	}
 }
 
@@ -315,11 +315,18 @@ func compileLimits(raw *rawLimits) (*Limits, error) {
 		if field.v == nil {
 			continue
 		}
-		// Transport ceiling: results travel in one MaxLine (2MiB) frame,
-		// so no grant may promise more than fits. Larger payloads need
-		// chunked tools (future), not larger limits.
-		if *field.v <= 0 || *field.v > 1<<20 {
-			return nil, fmt.Errorf("limits.%s must be within (0, 1MiB]", field.name)
+		// Transport contract: JSON string escaping expands worst-case 6x
+		// (control bytes → \uXXXX), and stdout+stderr share one result
+		// frame while read/write travel alone. 256KiB content + 64KiB
+		// stderr keeps every fully-adversarial payload inside the 2MiB
+		// frame with margin — so a valid policy is always executable.
+		// Larger payloads need chunked tools (future), not larger limits.
+		ceiling := int64(256 << 10)
+		if field.name == "max_stderr_bytes" {
+			ceiling = 64 << 10
+		}
+		if *field.v <= 0 || *field.v > ceiling {
+			return nil, fmt.Errorf("limits.%s must be within (0, %d]", field.name, ceiling)
 		}
 		*field.dst = *field.v
 	}
@@ -574,8 +581,8 @@ func (p *Policy) Validate() error {
 		if len(wc.Roots) == 0 {
 			return fmt.Errorf("file.write.roots is required when file.write is granted")
 		}
-		if wc.MaxFileSize < 0 || wc.MaxFileSize > 1<<20 {
-			return fmt.Errorf("file.write.max_file_size must be within [0, 1MiB] (transport frame ceiling)")
+		if wc.MaxFileSize < 0 || wc.MaxFileSize > 256<<10 {
+			return fmt.Errorf("file.write.max_file_size must be within [0, 256KiB] (transport frame contract)")
 		}
 	}
 	return nil

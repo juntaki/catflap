@@ -30,6 +30,8 @@ type Report struct {
 //
 //   - every line parses with required fields and schema version 1;
 //   - sequence runs 1..n without gaps;
+//   - the first record is task.create (the chain always opens with the
+//     policy-binding creation event; a lone task.stop is invalid);
 //   - every Prev links to the previous hash (first is "genesis");
 //   - every Hash recomputes;
 //   - all records name the same task;
@@ -86,6 +88,9 @@ func Verify(path string) (*Report, error) {
 		}
 		if e.Tool == CreateTool && seq == 1 {
 			rep.HasCreate = true
+		}
+		if seq == 1 && e.Tool != CreateTool {
+			return nil, fmt.Errorf("line 1: chain must open with %q, got %q", CreateTool, e.Tool)
 		}
 		if e.Tool == TerminalTool {
 			terminal = true

@@ -29,8 +29,14 @@ type Capability struct {
 	Policy     string    `json:"policy"`
 	PolicyHash string    `json:"policy_hash,omitempty"` // short prefix of the policy CanonicalHash
 	// Tools lists the MCP tools this task exposes (policy-normalized).
-	// Nil means a legacy capability: exec/read/stat, never write.
-	Tools []string `json:"tools,omitempty"`
+	// The field is always present on new capabilities (possibly empty);
+	// only absent (nil) on legacy capabilities, which imply
+	// exec/read/stat and never write.
+	Tools []string `json:"tools"`
+	// MaxExecMs carries the task's max exec duration so the agent adapter
+	// waits at least as long as the longest permitted operation (plus
+	// margin), instead of timing out early while the operation continues.
+	MaxExecMs int64 `json:"max_exec_ms,omitempty"`
 }
 
 // NewTaskID returns a task id like "agt_01K..." (random, unique).

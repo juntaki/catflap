@@ -249,7 +249,7 @@ tools:
 	}
 	// Write sizes obey the same transport ceiling.
 	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      max_file_size: 2097152\n")); err == nil {
-		t.Error("file.write above 1MiB must be rejected")
+		t.Error("file.write above 256KiB must be rejected")
 	}
 }
 
@@ -368,7 +368,7 @@ tools:
 		t.Errorf("omitted limits must equal defaults: %+v", bare.EffectiveLimits())
 	}
 	// Omitted vs explicit-defaults hash equal (same enforcement semantics).
-	explicit := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 4\n  max_exec_duration: 120s\n  max_stdout_bytes: 262144\n  max_stderr_bytes: 65536\n  max_read_bytes: 1048576\n")
+	explicit := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 4\n  max_exec_duration: 120s\n  max_stdout_bytes: 262144\n  max_stderr_bytes: 65536\n  max_read_bytes: 262144\n")
 	if bare.CanonicalHash() != explicit.CanonicalHash() {
 		t.Error("omitted limits must hash like explicit defaults")
 	}
@@ -388,19 +388,20 @@ tools:
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 0\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 99999999\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: big\n",
-		// Transport ceiling: results travel in one 2MiB frame, so no
-		// grant may promise more than fits (chunking is future work).
+		// Transport contract: worst-case JSON escaping (6x) of a full
+		// stdout+stderr pair must still fit one 2MiB frame.
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_stdout_bytes: 2097152\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 2097152\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_stderr_bytes: 131072\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  warp_drive: 9\n",
 	} {
 		if _, err := Parse([]byte(y)); err == nil {
 			t.Errorf("bad limits must be rejected: %q", y)
 		}
 	}
-	// 1MiB is the ceiling and parses.
-	m := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 1048576\n")
-	if m.EffectiveLimits().MaxReadBytes != 1048576 {
-		t.Error("1MiB must be accepted")
+	// 256KiB is the content ceiling and parses.
+	m := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 262144\n")
+	if m.EffectiveLimits().MaxReadBytes != 262144 {
+		t.Error("256KiB must be accepted")
 	}
 }

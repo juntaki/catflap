@@ -7,7 +7,7 @@ limits:
   max_exec_duration: 60s
   max_stdout_bytes: 262144
   max_stderr_bytes: 65536
-  max_read_bytes: 1048576
+  max_read_bytes: 262144
 
 tools:
   exec:
