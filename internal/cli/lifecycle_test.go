@@ -189,6 +189,132 @@ func TestStopDetachedOwnershipMatchesWinner(t *testing.T) {
 	}
 }
 
+// TestRevokeSelfVsExpiryOwnershipMatchesWinner covers Phase 0's
+// termination-ownership unification across package boundaries: an admin-
+// side TTL expiry (cli's stopDetached) racing the agent's own
+// revoke_self (a gateway-internal RPC path) must still agree on exactly
+// one winner, and stopDetached's reported outcome must match whichever
+// reason actually reached the task's cancellation cause — regardless of
+// which package initiated it.
+func TestRevokeSelfVsExpiryOwnershipMatchesWinner(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{
+		transport: "local",
+		auditDir:  dir,
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  1,
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
+	cap, task, err := s.mkTask(context.Background(), p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wonExpire bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		wonExpire = s.stopDetached(task.ID, "expired")
+	}()
+	go func() {
+		defer wg.Done()
+		c1, c2 := net.Pipe()
+		defer func() { _ = c1.Close() }()
+		defer func() { _ = c2.Close() }()
+		go s.store.HandlerFor(cap.TaskID)(c2)
+		if werr := rpc.WriteRequest(c1, rpc.Request{Task: cap.TaskID, Secret: cap.TaskSecret, ID: 1, Tool: rpc.ToolRevokeSelf}); werr != nil {
+			return
+		}
+		_, _ = rpc.ReadResponse(bufio.NewReader(c1))
+	}()
+	wg.Wait()
+
+	causeExpired := errors.Is(context.Cause(task.Context()), gateway.ErrTaskExpired)
+	causeRevoked := errors.Is(context.Cause(task.Context()), gateway.ErrTaskRevoked)
+	if causeExpired == causeRevoked {
+		t.Fatalf("exactly one cause must win, got expired=%v revoked=%v", causeExpired, causeRevoked)
+	}
+	if wonExpire != causeExpired {
+		t.Errorf("stopDetached(expired)'s won=%v must match the actual cause (expired=%v)", wonExpire, causeExpired)
+	}
+}
+
+// TestShutdownVsRevokeOwnershipMatchesWinner covers Phase 0: a process
+// shutdown (SIGINT/SIGTERM) racing an admin revoke of the same task must
+// still agree on exactly one winner and one reason.
+func TestShutdownVsRevokeOwnershipMatchesWinner(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{
+		transport: "local",
+		auditDir:  dir,
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  1,
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
+	_, task, err := s.mkTask(context.Background(), p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wonRevoke bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); wonRevoke = s.stopDetached(task.ID, "revoked") }()
+	go func() { defer wg.Done(); s.shutdown() }()
+	wg.Wait()
+
+	causeRevoked := errors.Is(context.Cause(task.Context()), gateway.ErrTaskRevoked)
+	causeShutdown := errors.Is(context.Cause(task.Context()), gateway.ErrTaskShutdown)
+	if causeRevoked == causeShutdown {
+		t.Fatalf("exactly one cause must win, got revoked=%v shutdown=%v", causeRevoked, causeShutdown)
+	}
+	if wonRevoke != causeRevoked {
+		t.Errorf("stopDetached(revoked)'s won=%v must match the actual cause (revoked=%v)", wonRevoke, causeRevoked)
+	}
+}
+
+// TestTaskContextDecoupledFromSignalContext covers Phase 0: a task's own
+// context must be cancelled ONLY through TryRequestStop, with the
+// correct cause, never implicitly by being a descendant of the process's
+// SIGINT/SIGTERM signal context. mkTask uses context.WithoutCancel for
+// exactly this reason; this test cancels the "signal" context directly
+// (standing in for the real signal.NotifyContext one RunGateway uses)
+// and asserts the task's own context is unaffected — only shutdown()'s
+// explicit TryRequestStop("shutdown") may cancel it, which is exercised
+// by TestShutdownVsRevokeOwnershipMatchesWinner.
+func TestTaskContextDecoupledFromSignalContext(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{
+		transport: "local",
+		auditDir:  dir,
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  1,
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
+
+	signalCtx, cancelSignal := context.WithCancel(context.Background())
+	_, task, err := s.mkTask(signalCtx, p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelSignal() // simulates SIGTERM firing
+
+	if task.Context().Err() != nil {
+		t.Errorf("task context must not be cancelled by the signal context alone, got %v", task.Context().Err())
+	}
+	if task.StateOf() != gateway.StateActive {
+		t.Errorf("task must remain ACTIVE, got state=%v", task.StateOf())
+	}
+}
+
 // TestConcurrentGrantsNeverDuplicateName covers the P1 fix: deciding a
 // task's name (against s.live) and committing it into s.live used to be
 // two separate critical sections, so two concurrent grants could both

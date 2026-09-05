@@ -36,10 +36,6 @@ type liveTask struct {
 	task  *gateway.Task
 	srv   transport.Server
 	timer *time.Timer
-	// stopping claims ownership of *why* this task is stopping. Set
-	// under s.mu by stopDetached before it calls RequestStop, so exactly
-	// one caller's reason ever reaches Task.Stop — see stopDetached.
-	stopping bool
 }
 
 type server struct {
@@ -408,7 +404,20 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
 	t := &gateway.Task{ID: taskID, Name: resolvedName, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
-	t.InitContext(ctx) // in-flight execs die with the task (C7)
+	// WithoutCancel: a task's own context must be cancelled ONLY through
+	// TryRequestStop, with the correct cause (ErrTaskShutdown, in this
+	// case) — never implicitly, by being a child of the process's
+	// SIGINT/SIGTERM signal context. If ctx's cancellation propagated
+	// down the tree directly, every task would cancel the instant the
+	// signal fires, with context.Canceled as its cause (signal.
+	// NotifyContext sets no cause of its own) — a window, however
+	// narrow, before shutdown()'s explicit per-task TryRequestStop(
+	// "shutdown") calls run, during which anything reading
+	// context.Cause(t.Context()) would see the wrong termination
+	// reason. RunGateway's shutdown() still tears every task down on
+	// signal — it's the sole path that does, deliberately, with the
+	// right cause — this only removes the implicit, racy second path.
+	t.InitContext(context.WithoutCancel(ctx)) // in-flight execs die with the task (C7)
 	s.store.Add(t)
 	// Creation opens the chain and binds the canonical policy snapshot
 	// into the audit trail (args = canonical policy bytes). The sink is
@@ -600,40 +609,40 @@ func sanitizeName(preferred string) (string, error) {
 }
 
 // stopDetached is the single termination entry point for expire and
-// revoke. It first claims termination ownership for taskID under s.mu
-// (lt.stopping): of two callers racing on the same task — TTL expiry
-// firing at the same moment as an admin revoke — only the one that wins
-// this claim calls RequestStop, so that caller's reason is the only one
-// that ever reaches Task.Stop, the terminal audit record, and the
-// context cancellation cause. The loser must report "did nothing", not
+// revoke. Ownership of *why* a task stopped lives entirely in
+// Task.TryRequestStop's stopOnce, not in any serve.go bookkeeping: of
+// two callers racing on the same task — TTL expiry firing at the same
+// moment as an admin revoke, or either racing revoke_self or an
+// audit-fail-closed stop originating in the gateway package — won is
+// true for exactly the caller whose reason actually took effect,
+// wherever it was called from. A loser must report "did nothing", not
 // silently succeed with the wrong reason or claim credit for a stop it
 // didn't perform.
 //
-// Only after RequestStop returns (leaving ACTIVE synchronously) does it
-// remove the live entry, freeing the task's name for reuse. The two must
-// not be reordered: if the name became free before the old task actually
-// left ACTIVE, a concurrent grant resolving names against s.live could
-// pick that name while the dying task could still, for a brief window,
-// answer as if it were a live ACTIVE task under it.
+// Only after TryRequestStop returns (leaving ACTIVE synchronously) does
+// a winner remove the live entry, freeing the task's name for reuse.
+// The two must not be reordered: if the name became free before the old
+// task actually left ACTIVE, a concurrent grant resolving names against
+// s.live could pick that name while the dying task could still, for a
+// brief window, answer as if it were a live ACTIVE task under it.
 func (s *server) stopDetached(taskID, reason string) bool {
 	s.mu.Lock()
 	lt, ok := s.live[taskID]
-	if !ok || lt.stopping {
-		s.mu.Unlock()
+	s.mu.Unlock()
+	if !ok {
 		return false
 	}
-	lt.stopping = true
-	s.mu.Unlock()
 
-	done := lt.task.RequestStop(reason)
-
-	s.mu.Lock()
-	if cur, ok := s.live[taskID]; ok && cur == lt {
-		delete(s.live, taskID)
+	done, won := lt.task.TryRequestStop(reason)
+	if won {
+		s.mu.Lock()
+		if cur, ok := s.live[taskID]; ok && cur == lt {
+			delete(s.live, taskID)
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 	<-done
-	return true
+	return won
 }
 
 // expire destroys one task: network identity dies here, not just RPC
@@ -657,7 +666,12 @@ func (s *server) shutdown() {
 	s.live = map[string]*liveTask{}
 	s.mu.Unlock()
 	for _, lt := range live {
-		lt.task.Stop("shutdown")
+		// TryRequestStop, not Stop, purely for consistency: every
+		// termination path funnels through the same primitive, so
+		// "shutdown" only wins here if nothing else (a concurrent
+		// revoke, say) already claimed this task first.
+		done, _ := lt.task.TryRequestStop("shutdown")
+		<-done
 	}
 }
 

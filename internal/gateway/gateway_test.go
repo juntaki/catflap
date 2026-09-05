@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -250,6 +252,52 @@ func TestPingFailsClosedOnAuditFailure(t *testing.T) {
 	}
 	if task.StateOf() == StateActive {
 		t.Errorf("task must have left ACTIVE, got state=%v", task.StateOf())
+	}
+}
+
+// TestRevokeVsAuditFailureOwnershipMatchesWinner covers Phase 0's
+// termination-ownership unification: TryRequestStop is the single
+// arbiter (Task.stopOnce) that every termination path funnels through —
+// an admin/agent revoke calling TryRequestStop directly, racing an
+// audit sink failure detected inside auditLog (also TryRequestStop) —
+// so exactly one reason ever takes effect, and it is always the one
+// whose caller is told won == true.
+func TestRevokeVsAuditFailureOwnershipMatchesWinner(t *testing.T) {
+	dir := t.TempDir()
+	alog, err := audit.Open(dir, "agt_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{ID: "agt_test", Secret: "s3cret", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Minute), Audit: alog}
+	task.InitContext(context.Background())
+	task.TryActivate()
+
+	_ = alog.Close() // any further audit write is now a sink failure
+
+	var wonRevoke bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, wonRevoke = task.TryRequestStop("revoked")
+	}()
+	go func() {
+		defer wg.Done()
+		task.auditLog(rpc.ToolPing, nil, "allow", nil, 0)
+	}()
+	wg.Wait()
+
+	// auditLog's own win is only observable indirectly (it discards
+	// TryRequestStop's won), so cross-check against the task's actual
+	// cancellation cause: exactly one of "revoked wins" / "cause is
+	// ErrTaskAuditFailed" can be true.
+	causeIsRevoked := errors.Is(context.Cause(task.Context()), ErrTaskRevoked)
+	causeIsAuditFailed := errors.Is(context.Cause(task.Context()), ErrTaskAuditFailed)
+	if causeIsRevoked == causeIsAuditFailed {
+		t.Fatalf("exactly one cause must win, got revoked=%v auditFailed=%v", causeIsRevoked, causeIsAuditFailed)
+	}
+	if wonRevoke != causeIsRevoked {
+		t.Errorf("TryRequestStop(%q)'s won=%v must match the actual cause (revoked=%v)", "revoked", wonRevoke, causeIsRevoked)
 	}
 }
 

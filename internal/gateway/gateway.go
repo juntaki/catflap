@@ -164,26 +164,34 @@ func (t *Task) Context() context.Context {
 	return t.ctx
 }
 
-// RequestStop begins destroying the task with the given reason ("expired",
-// "revoked", "shutdown", "audit sink failed") and returns immediately once
-// the task can no longer be found ACTIVE — new ops and beginOp's is-ACTIVE
-// check both key off the same state, set here synchronously before this
-// call returns. The rest of teardown (bounded drain of in-flight ops,
-// terminal audit event, onStop — server close + live/store/timer detach
-// for tasks committed via serve.go, see commit — then audit close) runs
-// asynchronously; the returned channel closes when it finishes.
+// TryRequestStop begins destroying the task with the given reason
+// ("expired", "revoked", "shutdown", "audit sink failed") and returns
+// immediately once the task can no longer be found ACTIVE — new ops and
+// beginOp's is-ACTIVE check both key off the same state, set here
+// synchronously before this call returns. The rest of teardown (bounded
+// drain of in-flight ops, terminal audit event, onStop — server close +
+// live/store/timer detach for tasks committed via serve.go, see commit —
+// then audit close) runs asynchronously; the returned channel closes
+// when it finishes.
+//
+// won reports whether THIS call is the one whose reason actually took
+// effect (Task.stopOnce guarantees at most one caller ever gets true,
+// across every termination path — expiry, admin revoke, agent
+// revoke_self, and audit-fail-closed all call this same method, so
+// "who caused the stop" and "who gets to report it" can never diverge).
+// A caller that gates some other visible effect on having caused the
+// stop (freeing a task's name for reuse, reporting a revoke's status)
+// MUST check won, not just infer it from returning without error —
+// every concurrent caller gets the same done channel regardless of won.
 //
 // A caller that must not race a beginOp admitted between "audit failure
-// observed" and "task actually stopped" needs this synchronous guarantee;
-// Stop is the synchronous convenience for callers that don't care and
-// just want to wait for the whole thing.
-//
-// Concurrent RequestStop/Stop calls are safe and share one teardown
-// (stopOnce): every caller gets the same completion channel back,
-// regardless of who triggers the one real run.
-func (t *Task) RequestStop(reason string) <-chan struct{} {
-	done := t.stopDoneCh()
+// observed" and "task actually stopped" needs this synchronous
+// guarantee; Stop is the synchronous convenience for callers that don't
+// care about won and just want to wait for the whole thing.
+func (t *Task) TryRequestStop(reason string) (done <-chan struct{}, won bool) {
+	d := t.stopDoneCh()
 	t.stopOnce.Do(func() {
+		won = true
 		if reason == "" {
 			reason = "shutdown"
 		}
@@ -210,9 +218,16 @@ func (t *Task) RequestStop(reason string) <-chan struct{} {
 				_ = t.Audit.Close()
 			}
 			t.state.Store(int32(StateStopped))
-			close(done)
+			close(d)
 		}()
 	})
+	return d, won
+}
+
+// RequestStop is TryRequestStop for callers that don't need to know
+// whether they caused the stop.
+func (t *Task) RequestStop(reason string) <-chan struct{} {
+	done, _ := t.TryRequestStop(reason)
 	return done
 }
 
