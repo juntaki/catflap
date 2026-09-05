@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/policy"
@@ -56,6 +57,7 @@ func TestEmptyToolsRoundTrip(t *testing.T) {
 	cap := &capability.Capability{
 		Version: 1, TaskID: "agt_x", Transport: "local",
 		Endpoint: "127.0.0.1:1", TaskSecret: "s", Tools: tools,
+		ExpiresAt: time.Now().Add(time.Minute),
 	}
 	back, err := capability.Decode(cap.Encode())
 	if err != nil {
@@ -63,6 +65,22 @@ func TestEmptyToolsRoundTrip(t *testing.T) {
 	}
 	if back.Tools == nil || len(back.Tools) != 0 {
 		t.Errorf("round trip must preserve empty non-nil tools, got %#v", back.Tools)
+	}
+}
+
+// TestToolsForPolicyExcludesUnusableWrite covers the P2 fix: a legacy
+// roots-only write grant parses successfully but denies every write, so
+// remote_write must not appear in tools/list for it — otherwise a tool
+// the policy can never authorize is still advertised.
+func TestToolsForPolicyExcludesUnusableWrite(t *testing.T) {
+	p, err := policy.Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write: [\"./work\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range toolsForPolicy(p) {
+		if tool == "remote_write" {
+			t.Error("legacy roots-only write must not expose remote_write")
+		}
 	}
 }
 

@@ -425,7 +425,7 @@ func toolsForPolicy(p *policy.Policy) []string {
 		if len(p.Tools.File.Read) > 0 {
 			out = append(out, "remote_read", "remote_stat")
 		}
-		if p.Tools.File.Write != nil && len(p.Tools.File.Write.Roots) > 0 {
+		if p.Tools.File.Write.Enabled() {
 			out = append(out, "remote_write")
 		}
 	}

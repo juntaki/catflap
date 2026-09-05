@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,16 @@ type WriteConfig struct {
 	Atomic      bool
 }
 
+// Enabled reports whether this grant can actually authorize any write.
+// The legacy roots-only YAML shape (`write: [./foo]`) parses into a
+// WriteConfig with Roots set but MaxFileSize/Create/Overwrite all zero,
+// which denies every write despite being "configured" — callers deciding
+// whether to expose remote_write must agree with WriteFS on this, or the
+// tool appears in tools/list yet can never succeed.
+func (c *WriteConfig) Enabled() bool {
+	return c != nil && len(c.Roots) > 0 && c.MaxFileSize > 0 && (c.Create || c.Overwrite)
+}
+
 // Options maps the grant to SafeFS write options.
 func (c *WriteConfig) Options() safefs.WriteOptions {
 	if c == nil {
@@ -156,6 +167,18 @@ func Parse(data []byte) (*Policy, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("parse policy: %w", err)
+	}
+	// Strict parsing must also reject a second YAML document (`---`
+	// separated): otherwise "unknown fields fail closed" is only true of
+	// the first document, and trailing content is silently ignored.
+	var extra any
+	switch derr := dec.Decode(&extra); {
+	case derr == nil:
+		return nil, fmt.Errorf("parse policy: unexpected second document")
+	case errors.Is(derr, io.EOF):
+		// only document present, as expected
+	default:
+		return nil, fmt.Errorf("parse policy: %w", derr)
 	}
 	if raw.Version == nil {
 		return nil, fmt.Errorf("policy version is required (expected `version: %d`)", SchemaVersion)
@@ -422,8 +445,8 @@ func compileMatcher(a any) (ArgMatcher, error) {
 				if !ok || s == "" {
 					return ArgMatcher{}, fmt.Errorf("match takes a non-empty glob string")
 				}
-				if _, err := filepath.Match(s, ""); err != nil && !errors.Is(err, filepath.ErrBadPattern) {
-					return ArgMatcher{}, fmt.Errorf("bad glob %q", s)
+				if _, err := filepath.Match(s, ""); err != nil {
+					return ArgMatcher{}, fmt.Errorf("bad glob %q: %w", s, err)
 				}
 				return ArgMatcher{Glob: s, HasGlob: true}, nil
 			default:
@@ -599,7 +622,7 @@ func (p *Policy) ReadFS() *safefs.FS {
 // WriteFS builds the SafeFS for file writes (nil when writes are not
 // granted — the default).
 func (p *Policy) WriteFS() *safefs.FS {
-	if p.Tools.File == nil || p.Tools.File.Write == nil || len(p.Tools.File.Write.Roots) == 0 {
+	if p.Tools.File == nil || !p.Tools.File.Write.Enabled() {
 		return nil
 	}
 	return safefs.New(p.Tools.File.Write.Roots)

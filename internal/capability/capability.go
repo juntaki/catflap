@@ -64,7 +64,13 @@ func (c *Capability) Encode() string {
 	return Prefix + base64.RawURLEncoding.EncodeToString(raw)
 }
 
-// Decode parses a bearer string back into a Capability.
+// Decode parses a bearer string back into a Capability. Every capability
+// this process mints is v1 (see server-side Encode callers); v0/unversioned
+// tokens are a legacy shape from before versioning existed and get only
+// the original, looser checks. Pairing turns Decode into a real protocol
+// boundary (untrusted encrypted envelope in, Capability out), so v1
+// tokens get strict field validation instead of just the three fields
+// that happened to matter for internally-generated tokens.
 func Decode(s string) (*Capability, error) {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, Prefix) {
@@ -81,10 +87,38 @@ func Decode(s string) (*Capability, error) {
 	if c.TaskID == "" || c.Endpoint == "" || c.TaskSecret == "" {
 		return nil, fmt.Errorf("capability missing required fields")
 	}
-	if c.Transport == "" {
-		c.Transport = "tailcat"
+	if c.Version == 0 {
+		if c.Transport == "" {
+			c.Transport = "tailcat"
+		}
+		return &c, nil
+	}
+	if err := c.validateV1(); err != nil {
+		return nil, err
 	}
 	return &c, nil
+}
+
+// validateV1 enforces the v1 shape strictly: unlike the legacy default-
+// filling above, an invalid v1 token is rejected rather than patched up.
+func (c *Capability) validateV1() error {
+	if c.Version != 1 {
+		return fmt.Errorf("unsupported capability version %d", c.Version)
+	}
+	switch c.Transport {
+	case "tailcat":
+		if c.ClientPriv == "" {
+			return fmt.Errorf("tailcat capability missing client_priv")
+		}
+	case "local":
+		// local dials a bare host:port; no client identity to embed.
+	default:
+		return fmt.Errorf("unknown capability transport %q", c.Transport)
+	}
+	if c.ExpiresAt.IsZero() {
+		return fmt.Errorf("v1 capability missing expires_at")
+	}
+	return nil
 }
 
 // Expired reports whether the capability hint says expired.

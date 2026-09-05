@@ -238,6 +238,15 @@ tools:
 	if opts := legacy.Tools.File.Write.Options(); opts.Create || opts.Overwrite || opts.MaxSize != 0 {
 		t.Errorf("legacy form must deny all ops: %+v", opts)
 	}
+	// P2 fix: a grant that can authorize no write must not report Enabled,
+	// so callers deciding tool visibility (toolsForPolicy) agree with the
+	// runtime path (WriteFS) instead of exposing a tool that always fails.
+	if legacy.Tools.File.Write.Enabled() {
+		t.Error("legacy roots-only write must not be Enabled")
+	}
+	if legacy.WriteFS() != nil {
+		t.Error("legacy roots-only write must yield no WriteFS")
+	}
 
 	// Unknown write keys fail closed.
 	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      teleport: true\n")); err == nil {
@@ -321,6 +330,28 @@ func TestUnknownFieldsRejected(t *testing.T) {
 		if _, err := Parse([]byte(y)); err == nil {
 			t.Errorf("case %d: unknown field must be rejected", i)
 		}
+	}
+}
+
+// TestBadGlobRejected covers the P2 fix: compileMatcher's
+// filepath.Match(s, "") probe used to accept any error as proof of a bad
+// pattern, but filepath.Match itself returns ErrBadPattern for one — so
+// the check silently accepted invalid globs that then never match at
+// runtime.
+func TestBadGlobRejected(t *testing.T) {
+	y := "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        args:\n          - match: \"[\"\n"
+	if _, err := Parse([]byte(y)); err == nil {
+		t.Error("invalid glob pattern must be rejected at parse time")
+	}
+}
+
+// TestTrailingYAMLDocumentRejected covers the P2 fix: strict parsing must
+// reject a second `---`-separated document, not just unknown fields
+// inside the first one.
+func TestTrailingYAMLDocumentRejected(t *testing.T) {
+	y := "version: 1\nname: x\nttl: 15m\n---\nwhatever: ignored\n"
+	if _, err := Parse([]byte(y)); err == nil {
+		t.Error("a second YAML document must be rejected")
 	}
 }
 
