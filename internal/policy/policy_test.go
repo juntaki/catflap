@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -432,6 +433,30 @@ func TestApprovalIsPartOfCanonicalIdentity(t *testing.T) {
 	writeOnce := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      create: true\n      approval: once\n")
 	if writeNever.CanonicalHash() == writeOnce.CanonicalHash() {
 		t.Error("write rules differing only in approval mode must still hash differently")
+	}
+}
+
+// TestApprovalNeverPreservesLegacyCanonicalBytes covers the P1 codex's
+// Phase A review caught: ApprovalNever's string value ("never") is
+// non-empty, so naively serializing it into canonicalRule/canonicalWrite
+// would defeat their `omitempty` tags — every pre-existing policy (which
+// never had this field at all) would suddenly hash differently the
+// instant approval was added, even though it never mentions approval.
+// canonicalApproval maps ApprovalNever to "" specifically so omitted and
+// explicit-never both produce byte-identical Canonical() output to a
+// policy from before this field existed — proven here by asserting the
+// word "approval" never appears in the canonical bytes at all when no
+// rule uses it, for both exec and write.
+func TestApprovalNeverPreservesLegacyCanonicalBytes(t *testing.T) {
+	p := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n  file:\n    write:\n      roots: [/.]\n      create: true\n")
+	if strings.Contains(string(p.Canonical()), "approval") {
+		t.Errorf("a policy using no approval feature must not mention it in canonical bytes at all, got:\n%s", p.Canonical())
+	}
+
+	// Explicit "never" must be indistinguishable from omitted.
+	explicit := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        approval: never\n  file:\n    write:\n      roots: [/.]\n      create: true\n      approval: never\n")
+	if p.CanonicalHash() != explicit.CanonicalHash() {
+		t.Error("explicit approval: never must hash identically to omitting the field")
 	}
 }
 

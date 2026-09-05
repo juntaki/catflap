@@ -98,6 +98,21 @@ func ParseApproval(s string) (ApprovalMode, error) {
 	}
 }
 
+// canonicalApproval maps ApprovalNever to "" for Canonical's purposes,
+// so that omitempty actually omits the field for every policy that
+// doesn't use approval at all — which is every policy that predates
+// this feature. Without this, ApprovalNever's non-empty string value
+// ("never") would serialize into canonicalRule/canonicalWrite's
+// omitempty field regardless, changing CanonicalHash for every
+// existing policy the instant this field was added. once/always still
+// serialize as themselves — they ARE a semantic difference.
+func canonicalApproval(mode ApprovalMode) string {
+	if mode == ApprovalNever {
+		return ""
+	}
+	return string(mode)
+}
+
 // ArgMatcher matches a single argv element.
 type ArgMatcher struct {
 	Literal *string
@@ -748,7 +763,7 @@ func (p *Policy) Canonical() []byte {
 	}
 	if p.Tools.Exec != nil {
 		for _, r := range p.Tools.Exec.Allow {
-			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest), Approval: string(r.Approval)}
+			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest), Approval: canonicalApproval(r.Approval)}
 			for _, m := range r.Args {
 				cm := canonicalMatcher{Any: m.Any, Integer: m.Integer, Choice: m.Choice}
 				if m.Literal != nil {
@@ -771,7 +786,7 @@ func (p *Policy) Canonical() []byte {
 			cw := &canonicalWrite{
 				MaxFileSize: wc.MaxFileSize, Create: wc.Create,
 				Overwrite: wc.Overwrite, Atomic: wc.Atomic,
-				Approval: string(wc.Approval),
+				Approval: canonicalApproval(wc.Approval),
 			}
 			for _, root := range wc.Roots {
 				cw.Roots = append(cw.Roots, filepath.Clean(root))
