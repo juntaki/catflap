@@ -150,9 +150,10 @@ func TestExpireLeavesActiveBeforeNameFreed(t *testing.T) {
 // their own reason. So the caller reporting success (and thus the
 // admin API's revoke status) did not necessarily match whichever reason
 // actually reached Task.Stop's cancellation cause and terminal audit
-// record. stopDetached now claims termination ownership (lt.stopping)
-// BEFORE calling RequestStop, so exactly one caller's reason is ever
-// used, and that caller is always the one reporting success.
+// record. stopDetached now delegates ownership entirely to
+// Task.TryRequestStop's won bool (Phase 0's single arbiter, backed by
+// sync.Once), so exactly one caller's reason is ever used, and that
+// caller is always the one reporting success.
 func TestStopDetachedOwnershipMatchesWinner(t *testing.T) {
 	dir := t.TempDir()
 	s := &server{
@@ -312,6 +313,70 @@ func TestTaskContextDecoupledFromSignalContext(t *testing.T) {
 	}
 	if task.StateOf() != gateway.StateActive {
 		t.Errorf("task must remain ACTIVE, got state=%v", task.StateOf())
+	}
+}
+
+// TestShutdownCancelsAllTasksBeforeAnyTeardownWaits covers the P1
+// regression codex's Phase 0 review caught: shutdown() originally called
+// TryRequestStop and waited for one task's full teardown before moving
+// to the next. Once task contexts stopped being children of the
+// process's signal context (context.WithoutCancel in mkTask), that
+// ordering meant a later task in iteration order stayed ACTIVE — its
+// in-flight commands still running — for as long as an earlier task's
+// drain took (up to 10s). shutdown() now requests every stop first (the
+// synchronous, cancel-now half of TryRequestStop) and only then waits on
+// every completion channel, so no task's cancellation is ever delayed by
+// another's teardown.
+func TestShutdownCancelsAllTasksBeforeAnyTeardownWaits(t *testing.T) {
+	mkBareTask := func(id string, onStop func()) *gateway.Task {
+		task := &gateway.Task{ID: id, Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Hour)}
+		task.InitContext(context.Background())
+		task.TryActivate()
+		task.OnStopFunc(onStop)
+		return task
+	}
+
+	slowStarted := make(chan struct{})
+	unblockSlow := make(chan struct{})
+	slowTask := mkBareTask("agt_slow", func() {
+		close(slowStarted)
+		<-unblockSlow
+	})
+	fastTask := mkBareTask("agt_fast", func() {})
+
+	s := &server{live: map[string]*liveTask{
+		"agt_slow": {task: slowTask},
+		"agt_fast": {task: fastTask},
+	}}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		s.shutdown()
+	}()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow task's teardown never started")
+	}
+
+	// The slow task's teardown is now blocked mid-flight. If shutdown
+	// still serialized stop-then-wait per task, the fast task would
+	// still be ACTIVE right now, uncancelled, since its turn hasn't
+	// come up yet.
+	if fastTask.Context().Err() == nil {
+		t.Error("fast task's context must already be cancelled while the slow task's teardown is still in flight")
+	}
+	if fastTask.StateOf() == gateway.StateActive {
+		t.Error("fast task must have left ACTIVE while the slow task's teardown is still in flight")
+	}
+
+	close(unblockSlow)
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown never returned after the slow task unblocked")
 	}
 }
 

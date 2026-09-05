@@ -180,8 +180,11 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		maxTasks: opts.MaxTasks,
 	}
 
-	// Root context for the process: every task context derives from it, so
-	// shutdown cancels any task that outlives its own teardown path.
+	// Root context for the process. Task contexts are NOT children of
+	// it (mkTask wraps it in context.WithoutCancel) — this only gates
+	// the <-ctx.Done() below, which triggers shutdown()'s own explicit,
+	// two-pass per-task TryRequestStop("shutdown"). See mkTask and
+	// shutdown for why the signal must not cancel task contexts directly.
 	ctx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSig()
 
@@ -665,12 +668,29 @@ func (s *server) shutdown() {
 	live := s.live
 	s.live = map[string]*liveTask{}
 	s.mu.Unlock()
+	// Two passes, not one call+wait per task: TryRequestStop's
+	// synchronous half cancels a task's context immediately, but its
+	// teardown half can block up to 10s draining in-flight ops (see
+	// TryRequestStop). Task contexts are no longer children of the
+	// process's signal context (context.WithoutCancel in mkTask), so
+	// nothing else cancels a task except this call — calling and
+	// waiting one task at a time would leave every later task in the
+	// iteration ACTIVE, its in-flight commands still running, for as
+	// long as each earlier task's drain takes. Requesting every stop
+	// first — all synchronous halves run back-to-back, uncontested,
+	// before any waiting — cancels every task's context up front,
+	// independent of how long any one drain takes; only then do we wait
+	// for every teardown to finish.
+	dones := make([]<-chan struct{}, 0, len(live))
 	for _, lt := range live {
 		// TryRequestStop, not Stop, purely for consistency: every
 		// termination path funnels through the same primitive, so
 		// "shutdown" only wins here if nothing else (a concurrent
 		// revoke, say) already claimed this task first.
 		done, _ := lt.task.TryRequestStop("shutdown")
+		dones = append(dones, done)
+	}
+	for _, done := range dones {
 		<-done
 	}
 }
