@@ -267,6 +267,61 @@ func TestApprovalHashBindingWrite(t *testing.T) {
 	}
 }
 
+// TestApprovalHashBindingWriteUsesResolvedPath covers the codex-round-1
+// P1: the approval hash must bind to the absolute, filepath.Clean'd
+// path SafeFS actually opens, not to whatever unclean string the
+// caller sent. Two different spellings of the same target (a bare
+// path and one with a redundant "./" segment) must resolve to the
+// identical approval identity, so a once-cache hit on the first write
+// covers the second — if normalizeWriteRequest hashed the raw path
+// instead, these would be treated as different operations.
+func TestApprovalHashBindingWriteUsesResolvedPath(t *testing.T) {
+	root := t.TempDir()
+	p := writePolicy(t, root, `
+      roots: ["`+root+`"]
+      max_file_size: 4096
+      create: true
+      overwrite: true
+      approval: once
+`)
+	s, task := testStoreWithPolicy(t, p, time.Minute)
+	ap := &fakeApprover{decide: alwaysApprove}
+	task.SetApprover(ap)
+
+	clean := root + "/f.txt"
+	unclean := root + "/./f.txt"
+	if res := call(t, s, rpc.ToolWrite, rpc.WriteArgs{Path: clean, Content: "v1"}); !res.OK {
+		t.Fatalf("first write must succeed: %+v", res)
+	}
+	if res := call(t, s, rpc.ToolWrite, rpc.WriteArgs{Path: unclean, Content: "v1"}); !res.OK {
+		t.Fatalf("write via an unclean spelling of the same path must succeed: %+v", res)
+	}
+	if got := ap.calls.Load(); got != 1 {
+		t.Errorf("same resolved path and content via different spellings must prompt exactly once, got %d", got)
+	}
+}
+
+// TestApprovalExecRejectsNulInArgv covers the codex-round-1 P1: NUL
+// bytes in argv must never reach the once-cache hash, because
+// normalizeExecRequest joins argv with NUL delimiters — an argv
+// element containing NUL would let ["x\x00y"] and ["x","y"] collide on
+// the same hash, letting an approved malformed argv silently cover an
+// unapproved one. MatchExec must refuse to match (and so never even
+// reach approval) once any argv element contains a NUL byte.
+func TestApprovalExecRejectsNulInArgv(t *testing.T) {
+	s, task := testStoreWithPolicy(t, execAlwaysPolicy(t), time.Minute)
+	ap := &fakeApprover{decide: alwaysApprove}
+	task.SetApprover(ap)
+
+	res := call(t, s, rpc.ToolExec, rpc.ExecArgs{Command: "echo", Args: []string{"x\x00y"}})
+	if res.OK {
+		t.Fatal("argv containing a NUL byte must be denied by policy, not reach approval")
+	}
+	if ap.calls.Load() != 0 {
+		t.Error("the approver must never be consulted for an argv containing a NUL byte")
+	}
+}
+
 // TestApprovalCannotOverridePolicyDeny covers the non-negotiable
 // ordering: approval is an ADDITIONAL restriction, never a substitute
 // authorization. A command the policy doesn't allow at all must stay

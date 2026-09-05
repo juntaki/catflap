@@ -838,7 +838,7 @@ func (p *Policy) MatchExec(command string, argv []string) (exe string, approval 
 		return "", ApprovalNever, false
 	}
 	for _, a := range argv {
-		if len(a) > 4096 {
+		if len(a) > 4096 || strings.ContainsRune(a, 0) {
 			return "", ApprovalNever, false
 		}
 	}

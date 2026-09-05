@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -444,14 +445,17 @@ func normalizeExecRequest(taskID, exe string, argv []string) ApprovalRequest {
 }
 
 // normalizeWriteRequest builds the approval identity for one file
-// write. The preimage covers the request's path plus a hash of the
-// exact content bytes — not the content itself, so the approval
-// identity is fixed-size and never embeds untrusted bytes verbatim.
-// Rewriting different bytes to the same path is a different request.
-// Detail deliberately carries no raw content preview: whatever renders
-// this to a human (a future terminal approver) owns sanitizing it for
-// display, and not embedding it here means there's no raw-bytes field
-// to forget to sanitize later.
+// write. path MUST be the absolute, filepath.Clean'd path — the same
+// normal form safefs.FS.split applies before resolving the write — so
+// the approved hash binds to what SafeFS actually opens, not to
+// whatever relative/unclean string the caller happened to send. The
+// preimage covers that path plus a hash of the exact content bytes —
+// not the content itself, so the approval identity is fixed-size and
+// never embeds untrusted bytes verbatim. Rewriting different bytes to
+// the same path is a different request. Detail deliberately carries
+// no raw content preview: whatever renders this to a human (a future
+// terminal approver) owns sanitizing it for display, and not embedding
+// it here means there's no raw-bytes field to forget to sanitize later.
 func normalizeWriteRequest(taskID, path string, content []byte) ApprovalRequest {
 	contentSum := sha256.Sum256(content)
 	contentHash := hex.EncodeToString(contentSum[:])
@@ -857,7 +861,12 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 		return deny("file write is not allowed by policy")
 	}
 	if approval := t.Policy.Tools.File.Write.Approval; approval.RequiresApproval() {
-		if denyMsg := t.checkApproval(normalizeWriteRequest(t.ID, args.Path, []byte(args.Content)), approval); denyMsg != "" {
+		absPath, err := filepath.Abs(args.Path)
+		if err != nil {
+			return deny("bad path: " + err.Error())
+		}
+		absPath = filepath.Clean(absPath)
+		if denyMsg := t.checkApproval(normalizeWriteRequest(t.ID, absPath, []byte(args.Content)), approval); denyMsg != "" {
 			return deny(denyMsg)
 		}
 	}
