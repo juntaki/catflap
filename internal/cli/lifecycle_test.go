@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -139,6 +140,52 @@ func TestExpireLeavesActiveBeforeNameFreed(t *testing.T) {
 	<-done
 	if !claimed {
 		t.Fatal("task1 never released its slot/name within the deadline")
+	}
+}
+
+// TestStopDetachedOwnershipMatchesWinner covers the P1 fix: stopDetached
+// used to decide "who won" by which caller's RequestStop happened to
+// delete the live entry first — a step that runs AFTER RequestStop, by
+// which point both callers may already have called RequestStop with
+// their own reason. So the caller reporting success (and thus the
+// admin API's revoke status) did not necessarily match whichever reason
+// actually reached Task.Stop's cancellation cause and terminal audit
+// record. stopDetached now claims termination ownership (lt.stopping)
+// BEFORE calling RequestStop, so exactly one caller's reason is ever
+// used, and that caller is always the one reporting success.
+func TestStopDetachedOwnershipMatchesWinner(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{
+		transport: "local",
+		auditDir:  dir,
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  1,
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
+	_, task, err := s.mkTask(context.Background(), p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wonExpired, wonRevoked bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); wonExpired = s.stopDetached(task.ID, "expired") }()
+	go func() { defer wg.Done(); wonRevoked = s.stopDetached(task.ID, "revoked") }()
+	wg.Wait()
+
+	if wonExpired == wonRevoked {
+		t.Fatalf("exactly one of expire/revoke must win the race, got expired=%v revoked=%v", wonExpired, wonRevoked)
+	}
+
+	cause := context.Cause(task.Context())
+	if wonExpired && !errors.Is(cause, gateway.ErrTaskExpired) {
+		t.Errorf("expire won the claim but cancellation cause is %v, want ErrTaskExpired", cause)
+	}
+	if wonRevoked && !errors.Is(cause, gateway.ErrTaskRevoked) {
+		t.Errorf("revoke won the claim but cancellation cause is %v, want ErrTaskRevoked", cause)
 	}
 }
 

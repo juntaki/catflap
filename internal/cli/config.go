@@ -54,18 +54,42 @@ func resolveRendezvous(flagVal string) (string, error) {
 	return pair.DefaultRendezvousURL, nil
 }
 
-// validateRendezvousURL requires https, except for loopback/localhost
-// endpoints used for local development. The AEAD-sealed envelope's
-// confidentiality doesn't depend on transport security — the wrap key
-// travels out-of-band in the pairing code, never over this connection —
-// but plaintext HTTP still lets a network attacker deny availability
-// (drop or corrupt publish/fetch, or burn a pairing code before the
-// intended recipient fetches it) without needing to break the AEAD at
-// all.
+// validateRendezvousURL requires https (except for loopback/localhost,
+// for local development) and a plain base-URL shape: host required, no
+// userinfo/query/fragment, and a path of "" or "/" only. pair.Fetch and
+// pair.Publish build request URLs by string-concatenating a path onto
+// this value (strings.TrimSuffix(rendezvousURL, "/") + "/v1/envelopes/…")
+// rather than resolving it as a base via net/url, so any of those extra
+// components would silently corrupt the request instead of erroring.
+//
+// The https requirement itself is availability, not confidentiality: the
+// AEAD-sealed envelope's confidentiality doesn't depend on transport
+// security — the wrap key travels out-of-band in the pairing code, never
+// over this connection — but plaintext HTTP still lets a network
+// attacker deny availability (drop or corrupt publish/fetch, or burn a
+// pairing code before its intended recipient fetches it) for free.
 func validateRendezvousURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("bad rendezvous URL %q: %w", raw, err)
+	}
+	if u.Opaque != "" {
+		return fmt.Errorf("rendezvous URL %q must not be opaque (missing //?)", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("rendezvous URL %q must include a host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("rendezvous URL %q must not contain userinfo", raw)
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("rendezvous URL %q must not contain a query string", raw)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("rendezvous URL %q must not contain a fragment", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("rendezvous URL %q must not contain a path", raw)
 	}
 	if u.Scheme == "https" {
 		return nil

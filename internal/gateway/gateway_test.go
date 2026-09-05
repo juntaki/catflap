@@ -253,6 +253,36 @@ func TestPingFailsClosedOnAuditFailure(t *testing.T) {
 	}
 }
 
+// TestTerminationCauseMapping covers the P2 fix: ping's fail-closed check
+// used to hardcode "task terminated: audit unavailable" for ANY reason a
+// concurrent revoke/expiry/shutdown/audit-failure left the task
+// non-ACTIVE, not just an audit failure — terminationCause is the single
+// mapping doExec's in-flight-kill path and ping now both use, so neither
+// can drift from the other or hardcode the wrong cause.
+func TestTerminationCauseMapping(t *testing.T) {
+	cases := []struct {
+		reason       string
+		wantMsg      string
+		wantDecision string
+	}{
+		{"expired", "capability expired", "expired"},
+		{"revoked", "task revoked", "revoked"},
+		{"shutdown", "task shutdown", "shutdown"},
+		{"audit sink failed", "task terminated: audit unavailable", "error"},
+	}
+	for _, c := range cases {
+		task := &Task{ID: "agt_test", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Minute)}
+		task.InitContext(context.Background())
+		task.TryActivate()
+		task.Stop(c.reason)
+		msg, decision := task.terminationCause()
+		if msg != c.wantMsg || decision != c.wantDecision {
+			t.Errorf("Stop(%q): terminationCause() = (%q, %q), want (%q, %q)",
+				c.reason, msg, decision, c.wantMsg, c.wantDecision)
+		}
+	}
+}
+
 // TestRequestStopSynchronousStateTransition covers the P1 fix: the state
 // flip to StateStopping (and thus beginOp refusing new ops) must happen
 // before RequestStop returns, not somewhere inside an async goroutine.

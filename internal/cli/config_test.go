@@ -79,6 +79,36 @@ func TestConfigRendezvousRejectsTrailingDocument(t *testing.T) {
 	}
 }
 
+// TestRendezvousURLRejectsUnsafeShapes covers the P2 fix: Fetch/Publish
+// build request URLs by string-concatenating a path onto the resolved
+// rendezvous URL rather than resolving it as a base via net/url, so a
+// query string, fragment, userinfo, missing host, or extra path
+// component would silently corrupt every request instead of erroring
+// up front at configuration time.
+func TestRendezvousURLRejectsUnsafeShapes(t *testing.T) {
+	t.Setenv("CATFLAP_CONFIG", "")
+	t.Setenv("CATFLAP_RENDEZVOUS", "")
+	bad := []string{
+		"https:opaque",                        // no host, opaque
+		"https://",                            // no host
+		"https://user:pass@pair.example.com",  // userinfo
+		"https://pair.example.com?x=1",        // query
+		"https://pair.example.com#frag",       // fragment
+		"https://pair.example.com/extra/path", // path
+	}
+	for _, raw := range bad {
+		if _, err := ResolveRendezvous(raw); err == nil {
+			t.Errorf("ResolveRendezvous(%q) must be rejected", raw)
+		}
+	}
+	good := []string{"https://pair.example.com", "https://pair.example.com/"}
+	for _, raw := range good {
+		if _, err := ResolveRendezvous(raw); err != nil {
+			t.Errorf("ResolveRendezvous(%q) must be accepted: %v", raw, err)
+		}
+	}
+}
+
 func TestConfigRendezvousPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

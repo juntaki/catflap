@@ -44,6 +44,30 @@ func causeForReason(reason string) error {
 	}
 }
 
+// terminationCause reports why this task is no longer usable, keyed off
+// its context's cancellation cause — the same mapping doExec's in-flight-
+// kill path and ping's fail-closed check both need, so a task that
+// stopped for one reason (revoked, shutdown, audit failure) is never
+// misreported as "capability expired" just because that happens to be
+// the default. Meaningful only once the context is actually cancelled
+// (StateOf() != StateActive, or equivalently Context().Err() != nil);
+// callers are expected to have already checked that.
+func (t *Task) terminationCause() (msg, decision string) {
+	switch {
+	case errors.Is(context.Cause(t.Context()), ErrTaskRevoked):
+		return "task revoked", "revoked"
+	case errors.Is(context.Cause(t.Context()), ErrTaskShutdown):
+		return "task shutdown", "shutdown"
+	case errors.Is(context.Cause(t.Context()), ErrTaskAuditFailed):
+		// Not a TTL expiry: a request's audit write failed and
+		// fail-closed stopped this task. The caller should see a
+		// distinct cause, not "expired".
+		return "task terminated: audit unavailable", "error"
+	default:
+		return "capability expired", "expired"
+	}
+}
+
 // State is the task lifecycle state (§8). The zero value is StateCreating;
 // a task becomes usable only after Activate, and Stop drives it through
 // StateStopping to StateStopped exactly once.
@@ -422,12 +446,14 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		defer t.endControlOp()
 		t.auditLog(req.Tool, req.Args, "allow", rpc.MustRaw(map[string]string{"task": t.ID}), 0)
 		// auditLog may have just stopped this task fail-closed (its audit
-		// write failed). A caller can use ping as an "is this task alive
-		// and paired" liveness check, so it must not report OK for a task
-		// that is dying — recheck state after the write, not just at
-		// beginControlOp's admission a moment earlier.
+		// write failed) — or a concurrent revoke/expiry/shutdown could
+		// land in the same instant. A caller can use ping as an "is this
+		// task alive and paired" liveness check, so it must not report OK
+		// for a task that is dying, and the reason it reports must match
+		// whichever actually stopped it, not always "audit unavailable".
 		if t.StateOf() != StateActive {
-			return rpc.Response{ID: req.ID, OK: false, Error: "task terminated: audit unavailable"}
+			msg, _ := t.terminationCause()
+			return rpc.Response{ID: req.ID, OK: false, Error: msg}
 		}
 		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.PingResult{Task: t.ID})}
 	case rpc.ToolRevokeSelf:
@@ -508,18 +534,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 		// termination must report its cause, never a normal result. The
 		// group SIGKILL already landed via cmd.Cancel at cancel time.
 		if t.Context().Err() != nil {
-			msg, decision := "capability expired", "expired"
-			switch {
-			case errors.Is(context.Cause(t.Context()), ErrTaskRevoked):
-				msg, decision = "task revoked", "revoked"
-			case errors.Is(context.Cause(t.Context()), ErrTaskShutdown):
-				msg, decision = "task shutdown", "shutdown"
-			case errors.Is(context.Cause(t.Context()), ErrTaskAuditFailed):
-				// Not a TTL expiry: a concurrent request's audit write
-				// failed and fail-closed stopped this task mid-op. The
-				// agent should see a distinct cause, not "expired".
-				msg, decision = "task terminated: audit unavailable", "error"
-			}
+			msg, decision := t.terminationCause()
 			t.auditLog(req.Tool, req.Args, decision, nil, time.Since(start))
 			return rpc.Response{ID: req.ID, OK: false, Error: msg}
 		}

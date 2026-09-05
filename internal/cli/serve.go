@@ -36,6 +36,10 @@ type liveTask struct {
 	task  *gateway.Task
 	srv   transport.Server
 	timer *time.Timer
+	// stopping claims ownership of *why* this task is stopping. Set
+	// under s.mu by stopDetached before it calls RequestStop, so exactly
+	// one caller's reason ever reaches Task.Stop — see stopDetached.
+	stopping bool
 }
 
 type server struct {
@@ -267,7 +271,7 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		// Idempotent: revoking an unknown (already gone) task succeeds
 		// with status "unknown" — repeated revoke is not an error.
 		status := "unknown"
-		if lt := s.peekLive(rreq.Task); lt != nil && s.stopDetached(rreq.Task, lt, "revoked") {
+		if s.stopDetached(rreq.Task, "revoked") {
 			status = "revoked"
 			fmt.Fprintf(os.Stderr, "catflap serve: task %s revoked — server closed, address dead\n", rreq.Task)
 		}
@@ -595,39 +599,41 @@ func sanitizeName(preferred string) (string, error) {
 	return s, nil
 }
 
-// peekLive returns the live task without removing it (see stopDetached
-// for why removal happens later, not here).
-func (s *server) peekLive(taskID string) *liveTask {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.live[taskID]
-}
-
-// stopDetached synchronously requests lt's stop — leaving ACTIVE happens
-// before this returns — and only THEN removes it from the live map,
-// freeing its name for reuse. The two must not be reordered: if the name
-// became free (removed from live) before the old task actually left
-// ACTIVE, a concurrent grant resolving names against s.live could pick
-// that name while the dying task could still, for a brief window, answer
-// as if it were a live ACTIVE task under it. Deferring the map removal
-// to after RequestStop's synchronous phase closes that window.
+// stopDetached is the single termination entry point for expire and
+// revoke. It first claims termination ownership for taskID under s.mu
+// (lt.stopping): of two callers racing on the same task — TTL expiry
+// firing at the same moment as an admin revoke — only the one that wins
+// this claim calls RequestStop, so that caller's reason is the only one
+// that ever reaches Task.Stop, the terminal audit record, and the
+// context cancellation cause. The loser must report "did nothing", not
+// silently succeed with the wrong reason or claim credit for a stop it
+// didn't perform.
 //
-// The map removal doubles as the race gate against a concurrent
-// revoke/expire of the same task: both may reach here with the same lt,
-// both call RequestStop (idempotent — Task.Stop's stopOnce guards it),
-// but only the caller that actually deletes the entry (won == true)
-// should report success or print a message; the other lost the race to
-// an already-in-flight teardown and must stay silent.
-func (s *server) stopDetached(taskID string, lt *liveTask, reason string) (won bool) {
+// Only after RequestStop returns (leaving ACTIVE synchronously) does it
+// remove the live entry, freeing the task's name for reuse. The two must
+// not be reordered: if the name became free before the old task actually
+// left ACTIVE, a concurrent grant resolving names against s.live could
+// pick that name while the dying task could still, for a brief window,
+// answer as if it were a live ACTIVE task under it.
+func (s *server) stopDetached(taskID, reason string) bool {
+	s.mu.Lock()
+	lt, ok := s.live[taskID]
+	if !ok || lt.stopping {
+		s.mu.Unlock()
+		return false
+	}
+	lt.stopping = true
+	s.mu.Unlock()
+
 	done := lt.task.RequestStop(reason)
+
 	s.mu.Lock()
 	if cur, ok := s.live[taskID]; ok && cur == lt {
 		delete(s.live, taskID)
-		won = true
 	}
 	s.mu.Unlock()
 	<-done
-	return won
+	return true
 }
 
 // expire destroys one task: network identity dies here, not just RPC
@@ -636,11 +642,7 @@ func (s *server) stopDetached(taskID string, lt *liveTask, reason string) (won b
 // (see commit); stopDetached only orders the ACTIVE-leave before the
 // live-map/name removal and gates against a concurrent revoke.
 func (s *server) expire(taskID string) {
-	lt := s.peekLive(taskID)
-	if lt == nil {
-		return
-	}
-	if !s.stopDetached(taskID, lt, "expired") {
+	if !s.stopDetached(taskID, "expired") {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
