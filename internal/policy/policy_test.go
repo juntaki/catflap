@@ -371,6 +371,70 @@ func TestCanonicalHashStable(t *testing.T) {
 	}
 }
 
+// TestApprovalModeParsing covers ApprovalMode's YAML surface for exec
+// rules: absent/empty means never (the pre-existing default, unchanged
+// for policies that don't use approval at all), the three valid values
+// parse, and anything else fails closed at policy-load time rather than
+// silently becoming "never".
+func TestApprovalModeParsing(t *testing.T) {
+	base := "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n"
+
+	p := mustParse(t, base)
+	if got := p.Tools.Exec.Allow[0].Approval; got != ApprovalNever {
+		t.Errorf("absent approval must default to never, got %q", got)
+	}
+
+	for _, mode := range []ApprovalMode{ApprovalNever, ApprovalOnce, ApprovalAlways} {
+		y := base + "        approval: " + string(mode) + "\n"
+		p := mustParse(t, y)
+		if got := p.Tools.Exec.Allow[0].Approval; got != mode {
+			t.Errorf("approval: %s parsed as %q", mode, got)
+		}
+	}
+
+	y := base + "        approval: sometimes\n"
+	if _, err := Parse([]byte(y)); err == nil {
+		t.Error("an invalid approval value must be rejected, not default to never")
+	}
+}
+
+// TestApprovalModeParsingWrite mirrors TestApprovalModeParsing for
+// file.write's approval field, using the structured (map) write form —
+// the legacy roots-only list form has no room for extra keys at all.
+func TestApprovalModeParsingWrite(t *testing.T) {
+	y := "version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      create: true\n      approval: once\n"
+	p := mustParse(t, y)
+	if got := p.Tools.File.Write.Approval; got != ApprovalOnce {
+		t.Errorf("write approval = %q, want once", got)
+	}
+
+	bad := "version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      approval: sometimes\n"
+	if _, err := Parse([]byte(bad)); err == nil {
+		t.Error("an invalid write approval value must be rejected")
+	}
+}
+
+// TestApprovalIsPartOfCanonicalIdentity covers why Approval lives in
+// Canonical at all: two policies whose exec/write authorization is
+// otherwise identical, but differ only in whether/how they require
+// operator approval, are NOT the same authorization semantics — a
+// capability minted under one must not be treated as equivalent to one
+// minted under the other (e.g. by anything that compares policy hashes
+// as a cache key or an audit cross-check).
+func TestApprovalIsPartOfCanonicalIdentity(t *testing.T) {
+	never := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n")
+	always := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        approval: always\n")
+	if never.CanonicalHash() == always.CanonicalHash() {
+		t.Error("differing only in approval mode must still produce a different canonical hash")
+	}
+
+	writeNever := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      create: true\n")
+	writeOnce := mustParse(t, "version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      create: true\n      approval: once\n")
+	if writeNever.CanonicalHash() == writeOnce.CanonicalHash() {
+		t.Error("write rules differing only in approval mode must still hash differently")
+	}
+}
+
 func TestLimitsParseAndDefaults(t *testing.T) {
 	p := mustParse(t, `
 version: 1
