@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -47,56 +49,85 @@ func (a *TerminalApprover) readLoop(in io.Reader) {
 // Approve implements gateway.Approver. It never returns until the operator
 // answers, ctx is cancelled (the task died — TryRequestStop cancels the
 // context checkApproval waits on), or the input stream closes.
+//
+// Each call mints its own random token and only accepts a line that starts
+// with it. This is not a secrecy mechanism — it defeats a timing hazard
+// specific to a shared line-based terminal: the mutex guarantees at most
+// one prompt is ever outstanding, but an operator's answer for a prompt
+// that already returned (because its task died mid-prompt, so Approve
+// returned via ctx.Done before they typed anything) can still arrive on
+// the shared reader AFTER a new, unrelated prompt has already started
+// waiting — arriving late is not the same as arriving before the drain
+// step would see it, so a fixed "y"/"n" grammar cannot tell that answer
+// apart from a genuine one for the new prompt. Binding each prompt to its
+// own token makes a stale answer simply not match, at any arrival time,
+// so it is discarded and Approve keeps waiting instead of ever crediting
+// it to a different request. Any line that arrives already-stale from
+// before this call started is handled the exact same way, by the same
+// loop — no separate pre-drain step is needed.
 func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequest) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// The mutex means at most one prompt is ever outstanding, so anything
-	// still sitting in `lines` right now was typed for a PREVIOUS prompt
-	// that already returned (most likely: the task died and this
-	// Approve call's predecessor returned on ctx.Done before the operator
-	// answered). It must never be misread as the answer to THIS request —
-	// drain it before showing the new prompt.
-	for drained := false; !drained; {
+	token, err := shortApprovalToken()
+	if err != nil {
+		return false, fmt.Errorf("generate approval token: %w", err)
+	}
+	_, _ = fmt.Fprint(a.out, formatApprovalPrompt(req, token))
+
+	for {
 		select {
-		case _, ok := <-a.lines:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case line, ok := <-a.lines:
 			if !ok {
-				drained = true
+				return false, errors.New("approval input closed (EOF); denying")
 			}
-		default:
-			drained = true
+			approved, matched := parseApprovalAnswer(line, token)
+			if !matched {
+				_, _ = fmt.Fprintf(a.out, "(ignoring unrelated input; reply exactly: %s y  or  %s n)\n", token, token)
+				continue
+			}
+			return approved, nil
 		}
-	}
-
-	_, _ = fmt.Fprint(a.out, formatApprovalPrompt(req))
-
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case line, ok := <-a.lines:
-		if !ok {
-			return false, errors.New("approval input closed (EOF); denying")
-		}
-		return parseApprovalAnswer(line), nil
 	}
 }
 
-func parseApprovalAnswer(line string) bool {
-	switch strings.ToLower(strings.TrimSpace(line)) {
+// parseApprovalAnswer reports whether line is an answer to THIS prompt
+// (its token prefix matches) and, if so, whether it approves. A line
+// whose token does not match is never treated as an answer at all —
+// matched is false and the caller keeps waiting.
+func parseApprovalAnswer(line, token string) (approved, matched bool) {
+	line = strings.TrimSpace(line)
+	lower := strings.ToLower(line)
+	tok := strings.ToLower(token)
+	if !strings.HasPrefix(lower, tok) {
+		return false, false
+	}
+	switch strings.TrimSpace(lower[len(tok):]) {
 	case "y", "yes":
-		return true
+		return true, true
 	default:
-		return false
+		return false, true
 	}
 }
 
-func formatApprovalPrompt(req gateway.ApprovalRequest) string {
+func shortApprovalToken() (string, error) {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func formatApprovalPrompt(req gateway.ApprovalRequest, token string) string {
 	return fmt.Sprintf(
-		"\n--- approval required ---\ntask:    %s\ntool:    %s\n%s\n%s\napprove? [y/N]: ",
+		"\n--- approval required ---\ntask:    %s\ntool:    %s\n%s\n%s\napprove? reply exactly: %s y   (anything else, including plain y/n, denies)\n> ",
 		sanitizeForTerminal(req.TaskID),
 		sanitizeForTerminal(req.Tool),
 		sanitizeForTerminal(req.Summary),
 		sanitizeForTerminal(req.Detail),
+		token,
 	)
 }
 

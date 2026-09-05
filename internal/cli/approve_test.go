@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,10 +30,10 @@ func TestSanitizeForTerminalEscapesControlBytes(t *testing.T) {
 }
 
 func TestSanitizeForTerminalCannotForgeApprovalLine(t *testing.T) {
-	// An argv element trying to visually forge the prompt's own
-	// "approve? [y/N]: y" line must never render as a real newline —
-	// it must show up as an escaped, inert \x0a in the operator's view.
-	forged := "harmless\napprove? [y/N]: y"
+	// An argv element trying to visually forge the prompt's own answer
+	// line must never render as a real newline — it must show up as an
+	// escaped, inert \x0a in the operator's view.
+	forged := "harmless\napprove exactly: abc123 y"
 	got := sanitizeForTerminal(forged)
 	if strings.Contains(got, "\n") {
 		t.Fatalf("sanitized output must contain no raw newline, got %q", got)
@@ -42,31 +43,154 @@ func TestSanitizeForTerminalCannotForgeApprovalLine(t *testing.T) {
 	}
 }
 
-func TestTerminalApproverApprovesOnYes(t *testing.T) {
-	in := strings.NewReader("y\n")
-	var out bytes.Buffer
-	a := NewTerminalApprover(in, &out)
+// syncBuf is a concurrency-safe io.Writer/fmt.Stringer for tests that
+// write from the approver's goroutine while polling from the test
+// goroutine.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
 
-	ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{
-		TaskID: "agt_x", Tool: "remote_exec", Summary: "run echo hi",
-	})
-	if err != nil || !ok {
-		t.Fatalf("Approve() = %v, %v; want true, nil", ok, err)
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// waitForToken polls out for a NEW prompt's token (the "reply exactly:
+// <token> y" line) appearing strictly after byte offset since — so a
+// second call, after a previous prompt already printed the same marker
+// text, cannot return stale data: it waits for output that wasn't there
+// yet. Returns the token and the buffer length to pass as `since` to the
+// next call.
+func waitForToken(t *testing.T, out *syncBuf, since int) (token string, newSince int) {
+	t.Helper()
+	const marker = "reply exactly: "
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s := out.String()
+		if len(s) > since {
+			if i := strings.LastIndex(s[since:], marker); i >= 0 {
+				rest := strings.TrimSpace(s[since+i+len(marker):])
+				if fields := strings.Fields(rest); len(fields) > 0 {
+					return fields[0], len(s)
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for approval prompt/token")
+	return "", since
+}
+
+func TestTerminalApproverApprovesOnMatchingToken(t *testing.T) {
+	pr, pw := io.Pipe()
+	out := &syncBuf{}
+	a := NewTerminalApprover(pr, out)
+
+	type result struct {
+		ok  bool
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{
+			TaskID: "agt_x", Tool: "remote_exec", Summary: "run echo hi",
+		})
+		resCh <- result{ok, err}
+	}()
+
+	token, _ := waitForToken(t, out, 0)
+	if _, err := pw.Write([]byte(token + " y\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case r := <-resCh:
+		if r.err != nil || !r.ok {
+			t.Fatalf("Approve() = %v, %v; want true, nil", r.ok, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Approve() did not return after a matching-token yes")
 	}
 	if !strings.Contains(out.String(), "approval required") {
 		t.Errorf("prompt must be printed, got %q", out.String())
 	}
 }
 
-func TestTerminalApproverDeniesOnAnythingElse(t *testing.T) {
-	for _, answer := range []string{"n\n", "no\n", "\n", "sure\n"} {
-		in := strings.NewReader(answer)
-		var out bytes.Buffer
-		a := NewTerminalApprover(in, &out)
+func TestTerminalApproverDeniesOnMatchingTokenNo(t *testing.T) {
+	pr, pw := io.Pipe()
+	out := &syncBuf{}
+	a := NewTerminalApprover(pr, out)
+
+	resCh := make(chan bool, 1)
+	errCh := make(chan error, 1)
+	go func() {
 		ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{TaskID: "agt_x"})
-		if err != nil || ok {
-			t.Fatalf("answer %q: Approve() = %v, %v; want false, nil", answer, ok, err)
+		resCh <- ok
+		errCh <- err
+	}()
+
+	token, _ := waitForToken(t, out, 0)
+	if _, err := pw.Write([]byte(token + " n\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ok := <-resCh:
+		if err := <-errCh; err != nil || ok {
+			t.Fatalf("Approve() = %v, %v; want false, nil", ok, err)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Approve() did not return after a matching-token no")
+	}
+}
+
+// TestTerminalApproverIgnoresUntaggedInput covers the core Phase C fix:
+// plain "y"/"n" with no token, or a token that doesn't match the current
+// prompt, must never be treated as an answer — Approve keeps waiting
+// instead of resolving on it.
+func TestTerminalApproverIgnoresUntaggedInput(t *testing.T) {
+	pr, pw := io.Pipe()
+	out := &syncBuf{}
+	a := NewTerminalApprover(pr, out)
+
+	resCh := make(chan bool, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{TaskID: "agt_x"})
+		resCh <- ok
+		errCh <- err
+	}()
+
+	token, _ := waitForToken(t, out, 0)
+	// Untagged "y" and a wrong token must both be ignored.
+	if _, err := pw.Write([]byte("y\nffffff y\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-resCh:
+		t.Fatal("Approve() must not resolve on untagged or mismatched-token input")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The real, correctly tagged answer still resolves it.
+	if _, err := pw.Write([]byte(token + " y\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ok := <-resCh:
+		if err := <-errCh; err != nil || !ok {
+			t.Fatalf("Approve() = %v, %v; want true, nil", ok, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Approve() never resolved on the correctly tagged answer")
 	}
 }
 
@@ -80,15 +204,18 @@ func TestTerminalApproverDeniesOnEOF(t *testing.T) {
 	}
 }
 
-// TestTerminalApproverCancelledPromptNeverLeaksIntoNextAnswer covers the
-// contamination hazard the drain loop in Approve exists to close: an
-// operator's answer typed for a prompt that already died (task
-// cancelled) must never be silently consumed as the answer to a later,
-// unrelated prompt on the shared terminal.
+// TestTerminalApproverCancelledPromptNeverLeaksIntoNextAnswer is the
+// codex-round-1 P1 regression: an operator's answer typed for a prompt
+// that already died (task cancelled) must never be silently consumed as
+// the answer to a later, unrelated prompt on the shared terminal — even
+// when the stray answer arrives strictly AFTER the next prompt has
+// already started waiting (the timing the original pre-drain-only
+// design could not close, since the drain only ever ran once, before the
+// new prompt was shown).
 func TestTerminalApproverCancelledPromptNeverLeaksIntoNextAnswer(t *testing.T) {
 	pr, pw := io.Pipe()
-	var out bytes.Buffer
-	a := NewTerminalApprover(pr, &out)
+	out := &syncBuf{}
+	a := NewTerminalApprover(pr, out)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	firstDone := make(chan struct{})
@@ -100,31 +227,49 @@ func TestTerminalApproverCancelledPromptNeverLeaksIntoNextAnswer(t *testing.T) {
 		close(firstDone)
 	}()
 
-	// Give Approve time to print its prompt and start waiting, then kill
-	// the task (cancel) — simulating TryRequestStop while a prompt is
-	// pending — before the operator's stray "y" (meant, if anything, for
-	// this dead prompt) arrives.
-	time.Sleep(50 * time.Millisecond)
+	firstToken, offset := waitForToken(t, out, 0)
 	cancel()
 	<-firstDone
 
+	// Start the second, unrelated prompt BEFORE the stray answer for the
+	// first arrives — this is exactly the ordering a pre-drain step
+	// cannot handle.
+	secondDone := make(chan struct{ ok bool })
+	go func() {
+		ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{TaskID: "agt_second"})
+		if err != nil {
+			t.Errorf("second Approve() error: %v", err)
+		}
+		secondDone <- struct{ ok bool }{ok}
+	}()
+	secondToken, _ := waitForToken(t, out, offset)
+	if secondToken == firstToken {
+		t.Fatal("second prompt must mint a fresh token, not reuse the first's")
+	}
+
 	// The operator, unaware the first prompt already died, answers it
-	// late with "y" — then answers the real, second prompt with "n".
-	if _, err := pw.Write([]byte("y\nn\n")); err != nil {
+	// late using its (now stale) token — after the second prompt is
+	// already visible and waiting.
+	if _, err := pw.Write([]byte(firstToken + " y\n")); err != nil {
 		t.Fatal(err)
 	}
-	// Let the background reader actually scan "y" and block trying to
-	// deliver it (nothing is draining yet) before the second Approve
-	// call's drain loop runs — otherwise the drain could race the
-	// scanner and find nothing to discard yet.
-	time.Sleep(50 * time.Millisecond)
-
-	ok, err := a.Approve(context.Background(), gateway.ApprovalRequest{TaskID: "agt_second"})
-	if err != nil {
-		t.Fatalf("second Approve() error: %v", err)
+	select {
+	case r := <-secondDone:
+		t.Fatalf("stray answer for the dead first prompt must not resolve the second, got ok=%v", r.ok)
+	case <-time.After(200 * time.Millisecond):
 	}
-	if ok {
-		t.Fatal("the stray 'y' left over from the cancelled first prompt must not be read as the second prompt's answer")
+
+	// The real answer to the second prompt still works.
+	if _, err := pw.Write([]byte(secondToken + " n\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-secondDone:
+		if r.ok {
+			t.Fatal("second prompt's own 'n' answer must deny")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Approve() never resolved on its own correctly tagged answer")
 	}
 }
 
