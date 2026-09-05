@@ -3,14 +3,14 @@ package cli
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/juntaki/catflap/internal/gateway"
 )
@@ -27,6 +27,13 @@ type TerminalApprover struct {
 	// never more than one goroutine ever reads `in`, so two concurrent
 	// prompts can never race for the same keystroke.
 	lines chan string
+	// nextID mints each prompt's token. A strictly increasing counter,
+	// not random bits: codex round 2 correctly flagged a fixed-width
+	// random token as only PROBABLY unique, which is not what "a stale
+	// answer can never match a different prompt" requires — a counter
+	// makes every token distinct by construction, for the life of this
+	// TerminalApprover (one process), no collision possible at any size.
+	nextID atomic.Uint64
 }
 
 // NewTerminalApprover starts a permanent background reader over in and
@@ -50,29 +57,29 @@ func (a *TerminalApprover) readLoop(in io.Reader) {
 // answers, ctx is cancelled (the task died — TryRequestStop cancels the
 // context checkApproval waits on), or the input stream closes.
 //
-// Each call mints its own random token and only accepts a line that starts
-// with it. This is not a secrecy mechanism — it defeats a timing hazard
-// specific to a shared line-based terminal: the mutex guarantees at most
-// one prompt is ever outstanding, but an operator's answer for a prompt
-// that already returned (because its task died mid-prompt, so Approve
-// returned via ctx.Done before they typed anything) can still arrive on
-// the shared reader AFTER a new, unrelated prompt has already started
-// waiting — arriving late is not the same as arriving before the drain
-// step would see it, so a fixed "y"/"n" grammar cannot tell that answer
+// Each call mints its own token (a.nextID, strictly increasing — see the
+// field comment) and only accepts a line whose first field is EXACTLY
+// that token (see parseApprovalAnswer — not merely prefixed by it, since
+// counter values like "1" and "12" share a prefix). This is not
+// a secrecy mechanism — it defeats a timing hazard specific to a shared
+// line-based terminal: the mutex guarantees at most one prompt is ever
+// outstanding, but an operator's answer for a prompt that already
+// returned (because its task died mid-prompt, so Approve returned via
+// ctx.Done before they typed anything) can still arrive on the shared
+// reader AFTER a new, unrelated prompt has already started waiting —
+// arriving late is not the same as arriving before a one-time drain step
+// would have seen it, so a fixed "y"/"n" grammar cannot tell that answer
 // apart from a genuine one for the new prompt. Binding each prompt to its
-// own token makes a stale answer simply not match, at any arrival time,
-// so it is discarded and Approve keeps waiting instead of ever crediting
-// it to a different request. Any line that arrives already-stale from
-// before this call started is handled the exact same way, by the same
-// loop — no separate pre-drain step is needed.
+// own never-repeated token makes a stale answer simply not match, at any
+// arrival time, so it is discarded and Approve keeps waiting instead of
+// ever crediting it to a different request. Any line that arrives
+// already-stale from before this call started is handled the exact same
+// way, by the same loop — no separate pre-drain step is needed.
 func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequest) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	token, err := shortApprovalToken()
-	if err != nil {
-		return false, fmt.Errorf("generate approval token: %w", err)
-	}
+	token := strconv.FormatUint(a.nextID.Add(1), 10)
 	_, _ = fmt.Fprint(a.out, formatApprovalPrompt(req, token))
 
 	for {
@@ -94,30 +101,23 @@ func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequ
 }
 
 // parseApprovalAnswer reports whether line is an answer to THIS prompt
-// (its token prefix matches) and, if so, whether it approves. A line
-// whose token does not match is never treated as an answer at all —
-// matched is false and the caller keeps waiting.
+// (its first field is EXACTLY token, not merely prefixed by it — token
+// "1" must not match a line for token "12") and, if so, whether it
+// approves. A line whose first field isn't exactly token is never
+// treated as an answer at all — matched is false and the caller keeps
+// waiting.
 func parseApprovalAnswer(line, token string) (approved, matched bool) {
-	line = strings.TrimSpace(line)
-	lower := strings.ToLower(line)
-	tok := strings.ToLower(token)
-	if !strings.HasPrefix(lower, tok) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || fields[0] != token {
 		return false, false
 	}
-	switch strings.TrimSpace(lower[len(tok):]) {
-	case "y", "yes":
-		return true, true
-	default:
-		return false, true
+	if len(fields) >= 2 {
+		switch strings.ToLower(fields[1]) {
+		case "y", "yes":
+			return true, true
+		}
 	}
-}
-
-func shortApprovalToken() (string, error) {
-	var b [3]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
+	return false, true
 }
 
 func formatApprovalPrompt(req gateway.ApprovalRequest, token string) string {

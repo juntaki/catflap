@@ -43,6 +43,22 @@ func TestSanitizeForTerminalCannotForgeApprovalLine(t *testing.T) {
 	}
 }
 
+// TestParseApprovalAnswerRequiresExactToken covers a bug caught while
+// fixing the round-2 collision finding: tokens are now a plain
+// increasing counter (1, 2, 3, ...), so "1" is a string PREFIX of "12" —
+// a naive strings.HasPrefix check would let token "1"'s answer match a
+// line actually tagged for token "12". parseApprovalAnswer must compare
+// the first whitespace-delimited field for exact equality instead.
+func TestParseApprovalAnswerRequiresExactToken(t *testing.T) {
+	if _, matched := parseApprovalAnswer("12 y", "1"); matched {
+		t.Fatal(`token "1" must not match a line tagged for token "12"`)
+	}
+	approved, matched := parseApprovalAnswer("12 y", "12")
+	if !matched || !approved {
+		t.Fatalf("exact token match failed: approved=%v matched=%v", approved, matched)
+	}
+}
+
 // syncBuf is a concurrency-safe io.Writer/fmt.Stringer for tests that
 // write from the approver's goroutine while polling from the test
 // goroutine.
