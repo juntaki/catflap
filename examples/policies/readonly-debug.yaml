@@ -1,0 +1,17 @@
+name: readonly-debug
+ttl: 15m
+
+tools:
+  exec:
+    commands:
+      - systemctl status '*'
+      - journalctl '*'
+      - docker ps
+      - echo '*'
+      - uname '*'
+      - ls '*'
+  file:
+    read:
+      roots:
+        - /var/log/myapp
+        - ./testdata
