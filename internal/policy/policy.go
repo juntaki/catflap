@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/juntaki/catflap/internal/safefs"
 )
 
 // SchemaVersion is the only policy schema version Catflap v0.2-A accepts.
@@ -26,8 +28,7 @@ const SchemaVersion = 1
 //
 // v0.1.1: exec is a structured argv allowlist — there is deliberately no
 // shell anywhere in the execution path, so shell metacharacters in arguments
-// are inert data. File reads are confined to roots with symlink traversal
-// rejected (see ResolveRead).
+// are inert data. File access goes through SafeFS (see ReadFS/WriteFS).
 type Policy struct {
 	Name  string        `yaml:"-"`
 	TTL   time.Duration `yaml:"-"`
@@ -75,10 +76,30 @@ type IntRange struct {
 
 type FilePolicy struct {
 	Read []string `yaml:"-"`
-	// RealRead holds best-effort symlink-resolved roots for containment
-	// checks after EvalSymlinks. Empty entry = fall back to lexical root.
-	RealRead   []string `yaml:"-"`
-	WriteRoots []string `yaml:"-"`
+	// Write is nil when file writes are not granted (default deny).
+	Write *WriteConfig `yaml:"-"`
+}
+
+// WriteConfig grants scoped file writes. All constraints default to deny:
+// Create and Overwrite are false unless set, MaxSize bounds content bytes,
+// Atomic selects temp+rename replacement.
+type WriteConfig struct {
+	Roots       []string
+	MaxFileSize int64
+	Create      bool
+	Overwrite   bool
+	Atomic      bool
+}
+
+// Options maps the grant to SafeFS write options.
+func (c *WriteConfig) Options() safefs.WriteOptions {
+	if c == nil {
+		return safefs.WriteOptions{}
+	}
+	return safefs.WriteOptions{
+		MaxSize: c.MaxFileSize, Create: c.Create,
+		Overwrite: c.Overwrite, Atomic: c.Atomic,
+	}
 }
 
 // Default returns a conservative demo policy for `serve` without --policy.
@@ -97,17 +118,9 @@ func Default() *Policy {
 				{Command: "whoami"},
 				{Command: "date", Rest: "any"},
 			}},
-			File: &FilePolicy{Read: []string{"."}, RealRead: []string{mustAbs(".")}},
+			File: &FilePolicy{Read: []string{"."}},
 		},
 	}
-}
-
-func mustAbs(p string) string {
-	a, err := filepath.Abs(p)
-	if err != nil {
-		return p
-	}
-	return filepath.Clean(a)
 }
 
 // Load reads a YAML policy file.
@@ -190,16 +203,15 @@ func Parse(data []byte) (*Policy, error) {
 			return nil, fmt.Errorf("file.read: %w", err)
 		}
 		fp.Read = roots
-		fp.RealRead = resolveRoots(roots)
 	}
 	if raw.Tools.File.Write != nil {
-		roots, err := normalizeRoots(raw.Tools.File.Write)
+		wc, err := parseWrite(raw.Tools.File.Write)
 		if err != nil {
 			return nil, fmt.Errorf("file.write: %w", err)
 		}
-		fp.WriteRoots = roots
+		fp.Write = wc
 	}
-	if len(fp.Read) > 0 || len(fp.WriteRoots) > 0 {
+	if len(fp.Read) > 0 || fp.Write != nil {
 		p.Tools.File = fp
 	} else if raw.Tools.File.Read != nil || raw.Tools.File.Write != nil {
 		p.Tools.File = fp
@@ -369,33 +381,69 @@ func normalizeRoots(v any) ([]string, error) {
 	}
 }
 
-// resolveRoots cleans roots and resolves symlinks best-effort.
-func resolveRoots(roots []string) []string {
-	out := make([]string, 0, len(roots))
-	for _, r := range roots {
-		rr := stripWildcards(strings.TrimSpace(r))
-		if rr == "" || rr == "." {
-			rr = "."
-		}
-		abs, err := filepath.Abs(rr)
+// parseWrite parses the file.write grant. Two forms:
+//
+//	file:
+//	  write: [/workspace/**]            # legacy roots-only (all ops denied)
+//	  write:
+//	    roots: [/workspace/**]
+//	    max_file_size: 1048576
+//	    create: true
+//	    overwrite: false
+//	    atomic: true
+//
+// Unknown mapping keys fail closed. Omitted constraints deny.
+func parseWrite(v any) (*WriteConfig, error) {
+	wc := &WriteConfig{Atomic: true}
+	switch t := v.(type) {
+	case []any:
+		roots, err := normalizeRoots(v)
 		if err != nil {
-			out = append(out, "")
-			continue
+			return nil, err
 		}
-		abs = filepath.Clean(abs)
-		if real, err := filepath.EvalSymlinks(abs); err == nil {
-			abs = filepath.Clean(real)
+		wc.Roots = roots
+		return wc, nil
+	case map[string]any:
+		for key, val := range t {
+			switch key {
+			case "roots":
+				roots, err := normalizeRoots(val)
+				if err != nil {
+					return nil, err
+				}
+				wc.Roots = roots
+			case "max_file_size":
+				n, err := toInt64(val)
+				if err != nil {
+					return nil, fmt.Errorf("max_file_size: %w", err)
+				}
+				wc.MaxFileSize = n
+			case "create":
+				b, ok := val.(bool)
+				if !ok {
+					return nil, fmt.Errorf("create must be a boolean")
+				}
+				wc.Create = b
+			case "overwrite":
+				b, ok := val.(bool)
+				if !ok {
+					return nil, fmt.Errorf("overwrite must be a boolean")
+				}
+				wc.Overwrite = b
+			case "atomic":
+				b, ok := val.(bool)
+				if !ok {
+					return nil, fmt.Errorf("atomic must be a boolean")
+				}
+				wc.Atomic = b
+			default:
+				return nil, fmt.Errorf("unknown file.write key %q", key)
+			}
 		}
-		out = append(out, abs)
+		return wc, nil
+	default:
+		return nil, fmt.Errorf("unsupported write value of type %T", v)
 	}
-	return out
-}
-
-func stripWildcards(r string) string {
-	r = strings.TrimSuffix(r, "/**")
-	r = strings.TrimSuffix(r, "/*")
-	r = strings.TrimSuffix(r, "*")
-	return r
 }
 
 func (p *Policy) Validate() error {
@@ -417,7 +465,33 @@ func (p *Policy) Validate() error {
 			seen[r.Command] = true
 		}
 	}
+	if p.Tools.File != nil && p.Tools.File.Write != nil {
+		wc := p.Tools.File.Write
+		if len(wc.Roots) == 0 {
+			return fmt.Errorf("file.write.roots is required when file.write is granted")
+		}
+		if wc.MaxFileSize < 0 || wc.MaxFileSize > 16<<20 {
+			return fmt.Errorf("file.write.max_file_size must be within [0, 16MiB]")
+		}
+	}
 	return nil
+}
+
+// ReadFS builds the SafeFS for file reads (nil when reads are not granted).
+func (p *Policy) ReadFS() *safefs.FS {
+	if p.Tools.File == nil || len(p.Tools.File.Read) == 0 {
+		return nil
+	}
+	return safefs.New(p.Tools.File.Read)
+}
+
+// WriteFS builds the SafeFS for file writes (nil when writes are not
+// granted — the default).
+func (p *Policy) WriteFS() *safefs.FS {
+	if p.Tools.File == nil || p.Tools.File.Write == nil || len(p.Tools.File.Write.Roots) == 0 {
+		return nil
+	}
+	return safefs.New(p.Tools.File.Write.Roots)
 }
 
 // canonicalPolicy is the deterministic JSON envelope for Canonical.
@@ -430,7 +504,15 @@ type canonicalPolicy struct {
 	TTLns   int64           `json:"ttl_ns"`
 	Exec    []canonicalRule `json:"exec,omitempty"`
 	Read    []string        `json:"read,omitempty"`
-	Write   []string        `json:"write,omitempty"`
+	Write   *canonicalWrite `json:"write,omitempty"`
+}
+
+type canonicalWrite struct {
+	Roots       []string `json:"roots"`
+	MaxFileSize int64    `json:"max_file_size"`
+	Create      bool     `json:"create,omitempty"`
+	Overwrite   bool     `json:"overwrite,omitempty"`
+	Atomic      bool     `json:"atomic,omitempty"`
 }
 
 type canonicalRule struct {
@@ -473,7 +555,16 @@ func (p *Policy) Canonical() []byte {
 		for _, root := range p.Tools.File.Read {
 			cp.Read = append(cp.Read, filepath.Clean(root))
 		}
-		cp.Write = append(cp.Write, p.Tools.File.WriteRoots...)
+		if wc := p.Tools.File.Write; wc != nil {
+			cw := &canonicalWrite{
+				MaxFileSize: wc.MaxFileSize, Create: wc.Create,
+				Overwrite: wc.Overwrite, Atomic: wc.Atomic,
+			}
+			for _, root := range wc.Roots {
+				cw.Roots = append(cw.Roots, filepath.Clean(root))
+			}
+			cp.Write = cw
+		}
 	}
 	raw, _ := json.Marshal(cp) //nolint:errchkjson // reason: struct of strings/ints/slices only — no maps, interfaces, or Marshalers — so encoding cannot fail.
 	return raw
@@ -605,68 +696,4 @@ func (m ArgMatcher) match(arg string) bool {
 		return err == nil && ok
 	}
 	return false
-}
-
-// ResolveRead maps a requested path to the file to open, enforcing root
-// containment AFTER symlink resolution:
-//
-//  1. lexical containment of the cleaned absolute path in a root (fast deny),
-//  2. Lstat: a symlink as the final component is denied outright,
-//  3. EvalSymlinks over the whole path, then containment in the resolved root.
-//
-// This closes the /workspace/outside->/etc escape. (A fully TOCTOU-proof
-// openat/dirfd chain is future work; the window here needs a concurrent
-// local writer, which the agent is not.)
-func (p *Policy) ResolveRead(path string) (string, error) {
-	if p.Tools.File == nil || len(p.Tools.File.Read) == 0 {
-		return "", fmt.Errorf("file access is not allowed by policy")
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("bad path: %w", err)
-	}
-	abs = filepath.Clean(abs)
-	rootIdx := -1
-	for i, r := range p.Tools.File.Read {
-		rr := stripWildcards(strings.TrimSpace(r))
-		if rr == "" || rr == "." {
-			rr = "."
-		}
-		rabs, rootErr := filepath.Abs(rr)
-		if rootErr != nil {
-			continue
-		}
-		rabs = filepath.Clean(rabs)
-		if abs == rabs || strings.HasPrefix(abs, rabs+string(filepath.Separator)) {
-			rootIdx = i
-			break
-		}
-	}
-	if rootIdx < 0 {
-		return "", fmt.Errorf("path not allowed by policy")
-	}
-	fi, err := os.Lstat(abs)
-	if err != nil {
-		return "", fmt.Errorf("stat: %w", err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("symlinks are not allowed")
-	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", fmt.Errorf("stat: %w", err)
-	}
-	resolved = filepath.Clean(resolved)
-	realRoot := ""
-	if rootIdx < len(p.Tools.File.RealRead) {
-		realRoot = p.Tools.File.RealRead[rootIdx]
-	}
-	if realRoot == "" {
-		realRoot, _ = filepath.Abs(stripWildcards(strings.TrimSpace(p.Tools.File.Read[rootIdx])))
-		realRoot = filepath.Clean(realRoot)
-	}
-	if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
-		return "", fmt.Errorf("path escapes allowed roots (symlink traversal denied)")
-	}
-	return resolved, nil
 }

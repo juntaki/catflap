@@ -66,6 +66,8 @@ print("== read denied (/etc/passwd) ==")
 print(json.dumps(tool("remote_read", {"path": "/etc/passwd"}))[:200])
 print("== stat allowed ==")
 print(json.dumps(tool("remote_stat", {"path": "./testdata/hello.txt"}))[:260])
+print("== remote_write denied without grant ==")
+print(json.dumps(tool("remote_write", {"path": "./testdata/hello.txt", "content": "x"}))[:260])
 
 p.stdin.close()
 p.wait(timeout=10)

@@ -104,8 +104,10 @@ Claude Code (`claude mcp add`):
 ```
 
 After the TTL, the task's server is closed: handshakes fail and calls fail
-with `capability expired`. The agent sees only three tools: `remote_exec`
-(command + argv, no shell), `remote_read`, `remote_stat`.
+with `capability expired` (or `task revoked` / `task shutdown` when killed
+that way). The agent sees at most four tools: `remote_exec` (command +
+argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
+`file.write` grant — `remote_write`.
 
 `--transport local` runs the same stack over loopback (tests, LAN demos).
 
@@ -146,6 +148,26 @@ File access is confined to roots **after** symlink resolution: final-component
 symlinks are denied, intermediate-symlink escapes (`root/outside -> /etc`)
 are denied, files open with `O_NOFOLLOW`. Anything else is denied **and**
 logged as denied. See [`examples/policies/`](examples/policies/).
+
+All file access goes through the SafeFS layer (`internal/safefs`): every
+open starts from a directory fd for the root and walks components with
+`O_NOFOLLOW`; on Linux the final component additionally uses `openat2`
+(`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`). Writes exist only through
+`remote_write` with a separate `file.write` grant:
+
+```yaml
+  file:
+    write:
+      roots:
+        - /workspace/work
+      max_file_size: 1048576
+      create: true      # allow new files (parent must exist)
+      overwrite: false  # allow replacing existing files
+      atomic: true      # temp + fsync + rename; preserves mode on replace
+```
+
+Reads and writes are independent grants; without `file.write` the write
+tool denies everything (default deny). New files are `0600`.
 
 ## Audit
 
@@ -219,9 +241,9 @@ Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
 - Bearer tokens travel via files (`--out` / `--cap-file`), not argv.
 
 Known gaps: no human approval yet, no network egress policy yet, no resource
-limits yet, symlink defense is check-then-open rather than `openat`-chained
-(the residual window needs a concurrent local writer, which the agent is
-not), audit chain has no external anchor yet.
+limits yet, SafeFS is dirfd-walk (not full `openat2`-only) with a residual
+rename race against concurrent local writers (which the agent is not),
+audit chain has no external anchor yet.
 
 ## Layout (Tailcat is quarantined)
 
@@ -233,7 +255,8 @@ internal/
     tailcat/            ONLY package that imports github.com/tailscale/tailcat
     local/              loopback transport (tests/demos)
   capability/           agc1_… bearer tokens (task, endpoint, client key, secret, expiry)
-  policy/               structured argv policy + symlink-aware file roots
+  policy/               structured argv policy + file grants (schema v1)
+  safefs/               dedicated filesystem layer (dirfd walk, openat2)
   gateway/              per-task auth, TTL, enforcement (no shell), Stop/GC
   rpc/                  JSONL request/response frames
   audit/                hash-chained JSONL logger
@@ -249,9 +272,12 @@ testdata/               e2e drivers (local + live-Tailcat probes) + adversarial 
 v0.1   Tailcat transport, ephemeral credentials, TTL, exec/read/stat, JSONL audit ✓
 v0.1.1 security semantics: structured argv, symlink封じ, 1 task = 1 server, Close, cap-file ✓
 v0.1.2 endpoint↔task binding, TTL cancels trees, ordered teardown, hardened --out, CI ✓
-v0.2   human approval, read/write distinction, network restrictions, resource limits
-v0.3   audit verify + external anchor, specialized adapters: PostgreSQL, Docker, GPU, serial/robot
-v0.4   remote task issuance: GitHub Actions / Claude Code / Codex integration
+v0.2-A policy schema v1 (version required, strict decode, canonical hash) ✓
+v0.2-B revoke + lifecycle CREATING/ACTIVE/STOPPING/STOPPED ✓
+v0.2-C SafeFS (dirfd walk, Linux openat2) ✓
+v0.2-D remote_write on SafeFS (read/write split, default deny) ✓
+v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tools/list
+v0.3   human approval, audit verify + external anchor, specialized adapters
 ```
 
 ## License

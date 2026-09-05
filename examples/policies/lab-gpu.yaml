@@ -17,6 +17,10 @@ tools:
     write:
       roots:
         - /workspace/**
+      max_file_size: 2097152
+      create: true
+      overwrite: true
+      atomic: true
 
 limits:
   ttl: 30m

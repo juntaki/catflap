@@ -169,11 +169,23 @@ func toolDefs() []map[string]any {
 				"required":   []string{"path"},
 			},
 		},
+		{
+			"name":        rpc.ToolWrite,
+			"description": "Write a file inside the task's file.write grant (separate from read; default denied).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    map[string]any{"type": "string"},
+					"content": map[string]any{"type": "string", "description": "Full replacement content (UTF-8 text)"},
+				},
+				"required": []string{"path", "content"},
+			},
+		},
 	}
 }
 
 func (s *Server) callTool(id any, name string, args json.RawMessage) {
-	if name != rpc.ToolExec && name != rpc.ToolRead && name != rpc.ToolStat {
+	if name != rpc.ToolExec && name != rpc.ToolRead && name != rpc.ToolStat && name != rpc.ToolWrite {
 		s.respondErr(id, -32602, fmt.Sprintf("unknown tool %q", name))
 		return
 	}

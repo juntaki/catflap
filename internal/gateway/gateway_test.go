@@ -572,3 +572,171 @@ tools:
 		}
 	}
 }
+
+// writeFixture builds testdata/write-gw/root with a docs dir, a secret
+// outside the root, and an escape symlink. In-project, cleaned up after.
+func writeFixture(t *testing.T) string {
+	t.Helper()
+	base := "testdata/write-gw"
+	_ = os.RemoveAll(base)
+	if err := os.MkdirAll(base+"/root/docs", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	if err := os.WriteFile(base+"/root/docs/orig.txt", []byte("orig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base+"/secret.txt", []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", base+"/root/escape"); err != nil {
+		t.Fatal(err)
+	}
+	abs, err := filepath.Abs(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func writePolicy(t *testing.T, root, writeYAML string) *policy.Policy {
+	t.Helper()
+	p, err := policy.Parse([]byte(`
+version: 1
+name: writer
+ttl: 15m
+tools:
+  file:
+    read: ["` + root + `"]
+    write:
+` + writeYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func writeResult(t *testing.T, res rpc.Response) rpc.WriteResult {
+	t.Helper()
+	if !res.OK {
+		t.Fatalf("write denied: %s", res.Error)
+	}
+	var out rpc.WriteResult
+	if err := json.Unmarshal(res.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestRemoteWrite(t *testing.T) {
+	absBase := writeFixture(t)
+	root := absBase + "/root"
+	full := `
+      roots: ["` + root + `"]
+      max_file_size: 1048576
+      create: true
+      overwrite: true
+      atomic: true
+`
+	t.Run("create and read back", func(t *testing.T) {
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, full), time.Minute)
+		out := writeResult(t, call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/new.txt", Content: "hello"}))
+		if !out.Created || out.Size != 5 {
+			t.Errorf("bad result: %+v", out)
+		}
+		res := call(t, s, rpc.ToolRead, rpc.ReadArgs{Path: root + "/docs/new.txt"})
+		if !res.OK {
+			t.Fatalf("readback denied: %s", res.Error)
+		}
+		var got rpc.ReadResult
+		if err := json.Unmarshal(res.Result, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Content != "hello" {
+			t.Errorf("bad roundtrip: %q", got.Content)
+		}
+	})
+
+	t.Run("overwrite allowed", func(t *testing.T) {
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, full), time.Minute)
+		out := writeResult(t, call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/orig.txt", Content: "v2"}))
+		if out.Created {
+			t.Error("existing file must report created=false")
+		}
+	})
+
+	t.Run("overwrite denied", func(t *testing.T) {
+		noOver := `
+      roots: ["` + root + `"]
+      max_file_size: 1048576
+      create: true
+      overwrite: false
+`
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, noOver), time.Minute)
+		if res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/orig.txt", Content: "v2"}); res.OK {
+			t.Error("overwrite without grant must be denied")
+		}
+	})
+
+	t.Run("create denied", func(t *testing.T) {
+		noCreate := `
+      roots: ["` + root + `"]
+      max_file_size: 1048576
+      create: false
+      overwrite: true
+`
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, noCreate), time.Minute)
+		if res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/nope.txt", Content: "x"}); res.OK {
+			t.Error("create without grant must be denied")
+		}
+	})
+
+	t.Run("no write grant denies", func(t *testing.T) {
+		s, _ := testStore(t, time.Minute) // Default policy: read-only
+		res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/nope.txt", Content: "x"})
+		if res.OK || res.Error != "file write is not allowed by policy" {
+			t.Errorf("expected write denial, got %+v", res)
+		}
+	})
+
+	t.Run("symlink escape denied", func(t *testing.T) {
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, full), time.Minute)
+		if res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/escape/pwned.txt", Content: "x"}); res.OK {
+			t.Error("write via symlink escape must be denied")
+		}
+		if _, err := os.Stat(absBase + "/pwned.txt"); !os.IsNotExist(err) {
+			t.Error("escape write landed outside the root")
+		}
+		if _, err := os.Stat(absBase + "/secret.txt"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("outside root denied", func(t *testing.T) {
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, full), time.Minute)
+		if res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: absBase + "/secret.txt", Content: "x"}); res.OK {
+			t.Error("write outside root must be denied")
+		}
+	})
+
+	t.Run("oversize denied", func(t *testing.T) {
+		tiny := `
+      roots: ["` + root + `"]
+      max_file_size: 4
+      create: true
+      overwrite: true
+`
+		s, _ := testStoreWithPolicy(t, writePolicy(t, root, tiny), time.Minute)
+		if res := call(t, s, rpc.ToolWrite,
+			rpc.WriteArgs{Path: root + "/docs/big.txt", Content: "12345"}); res.OK {
+			t.Error("oversize write must be denied")
+		}
+	})
+}

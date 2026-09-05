@@ -133,7 +133,7 @@ tools:
 	}
 }
 
-func TestResolveReadSymlinkEscape(t *testing.T) {
+func TestReadFSSymlinkEscape(t *testing.T) {
 	base := "testdata/symlink-case"
 	_ = os.RemoveAll(base)
 	if err := os.MkdirAll(base+"/root/sub", 0o750); err != nil {
@@ -163,21 +163,89 @@ tools:
   file:
     read: ["`+base+`/root"]
 `)
+	fs := p.ReadFS()
+	if fs == nil {
+		t.Fatal("expected read FS")
+	}
 	absBase, _ := filepath.Abs(base)
 
-	if got, err := p.ResolveRead(absBase + "/root/sub/ok.txt"); err != nil {
+	fh, err := fs.OpenRead(absBase + "/root/sub/ok.txt")
+	if err != nil {
 		t.Errorf("legit file denied: %v", err)
-	} else if got == "" {
-		t.Error("empty resolved path")
+	} else {
+		_ = fh.Close()
 	}
-	if _, err := p.ResolveRead(absBase + "/root/outside/outside-secret.txt"); err == nil {
-		t.Error("intermediate-symlink escape must be denied")
+	for _, bad := range []string{
+		absBase + "/root/outside/outside-secret.txt",
+		absBase + "/root/linkfile",
+		"/etc/passwd",
+	} {
+		if fh, err := fs.OpenRead(bad); err == nil {
+			_ = fh.Close()
+			t.Errorf("escape must be denied: %s", bad)
+		}
+		if _, err := fs.Stat(bad); err == nil {
+			t.Errorf("escape (stat) must be denied: %s", bad)
+		}
 	}
-	if _, err := p.ResolveRead(absBase + "/root/linkfile"); err == nil {
-		t.Error("final-component symlink must be denied")
+	if p.WriteFS() != nil {
+		t.Error("absent file.write must yield nil FS (default deny)")
 	}
-	if _, err := p.ResolveRead("/etc/passwd"); err == nil {
-		t.Error("outside-root path must be denied")
+}
+
+func TestWriteConfigParse(t *testing.T) {
+	p := mustParse(t, `
+version: 1
+name: demo
+ttl: 15m
+tools:
+  file:
+    read: ["./testdata"]
+    write:
+      roots: ["./testdata/work"]
+      max_file_size: 1024
+      create: true
+      overwrite: false
+      atomic: true
+`)
+	wc := p.Tools.File.Write
+	if wc == nil {
+		t.Fatal("expected write config")
+	}
+	if len(wc.Roots) != 1 || wc.MaxFileSize != 1024 || !wc.Create || wc.Overwrite || !wc.Atomic {
+		t.Errorf("bad write config: %+v", wc)
+	}
+	if p.WriteFS() == nil {
+		t.Error("expected write FS")
+	}
+	opts := wc.Options()
+	if opts.MaxSize != 1024 || !opts.Create || opts.Overwrite || !opts.Atomic {
+		t.Errorf("bad write options: %+v", opts)
+	}
+
+	// Legacy roots-only form: present but all ops denied.
+	legacy := mustParse(t, `
+version: 1
+name: demo
+ttl: 15m
+tools:
+  file:
+    write: ["./testdata/work"]
+`)
+	if legacy.Tools.File.Write == nil || len(legacy.Tools.File.Write.Roots) != 1 {
+		t.Fatal("expected legacy write roots")
+	}
+	if opts := legacy.Tools.File.Write.Options(); opts.Create || opts.Overwrite || opts.MaxSize != 0 {
+		t.Errorf("legacy form must deny all ops: %+v", opts)
+	}
+
+	// Unknown write keys fail closed.
+	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      teleport: true\n")); err == nil {
+		t.Error("unknown file.write key must be rejected")
+	}
+	// Write without roots fails validation.
+	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      create: true\n")); err == nil {
+		t.Error("file.write without roots must be rejected")
 	}
 }
 
@@ -195,14 +263,16 @@ tools:
       roots: ["./testdata"]
 `)
 	abs, _ := filepath.Abs("./testdata/hello.txt")
-	if _, err := p.ResolveRead(abs); err != nil {
+	if fh, err := p.ReadFS().OpenRead(abs); err != nil {
 		// testdata/hello.txt may not exist in unit-test cwd; the gate itself
 		// must pass containment — accept stat errors, reject policy denials.
 		if err.Error() == "path not allowed by policy" {
 			t.Errorf("expected containment to pass, got %v", err)
 		}
+	} else {
+		_ = fh.Close()
 	}
-	if _, err := p.ResolveRead("/etc/passwd"); err == nil {
+	if _, err := p.ReadFS().Stat("/etc/passwd"); err == nil {
 		t.Error("expected /etc/passwd denied")
 	}
 	if _, ok := p.MatchExec("echo", nil); !ok {

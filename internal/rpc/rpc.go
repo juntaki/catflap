@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// Tools exposed over the gateway transport in v0.1.
+// Tools exposed over the gateway transport.
 const (
-	ToolExec = "remote_exec"
-	ToolRead = "remote_read"
-	ToolStat = "remote_stat"
+	ToolExec  = "remote_exec"
+	ToolRead  = "remote_read"
+	ToolStat  = "remote_stat"
+	ToolWrite = "remote_write"
 )
 
 // MaxLine caps a single JSONL frame (1 MiB + headroom).
@@ -70,6 +71,18 @@ type StatResult struct {
 	Mode    string `json:"mode"`
 	ModTime string `json:"mod_time"`
 	IsDir   bool   `json:"is_dir"`
+}
+
+type WriteArgs struct {
+	// Path is the destination inside the file.write grant; Content is the
+	// full replacement bytes (UTF-8 text in v0.2; binary comes later).
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type WriteResult struct {
+	Size    int64 `json:"size"`
+	Created bool  `json:"created"`
 }
 
 // WriteRequest writes one JSONL frame with a write deadline.

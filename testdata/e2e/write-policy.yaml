@@ -1,0 +1,19 @@
+version: 1
+name: e2e-write
+ttl: 15m
+
+tools:
+  exec:
+    allow:
+      - command: echo
+        rest: any
+  file:
+    read:
+      - ./testdata/e2e/work
+    write:
+      roots:
+        - ./testdata/e2e/work
+      max_file_size: 1048576
+      create: true
+      overwrite: true
+      atomic: true

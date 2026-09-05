@@ -7,19 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/policy"
 	"github.com/juntaki/catflap/internal/rpc"
+	"github.com/juntaki/catflap/internal/safefs"
 )
 
 // Task termination causes. Stop(reason) cancels the task context with the
@@ -310,6 +308,8 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		return s.doRead(t, req)
 	case rpc.ToolStat:
 		return s.doStat(t, req)
+	case rpc.ToolWrite:
+		return s.doWrite(t, req)
 	default:
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
@@ -399,7 +399,14 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
-	real, err := t.Policy.ResolveRead(args.Path)
+	fs := t.Policy.ReadFS()
+	if fs == nil {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: "file read is not allowed by policy"}
+	}
+	f, err := fs.OpenRead(args.Path)
 	if err != nil {
 		decision := "deny"
 		if isStatError(err) {
@@ -410,43 +417,23 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
 	}
-	info, err := os.Stat(real)
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
 	}
-	if info.IsDir() {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
-		return rpc.Response{ID: req.ID, OK: false, Error: "is a directory (use remote_stat)"}
-	}
 	const maxRead = 1 << 20
-	// O_NOFOLLOW: the final component must not be a symlink at open time.
-	//nolint:gosec // reason: real passed ResolveRead — lexical containment plus Lstat/EvalSymlinks containment — immediately above.
-	f, err := os.OpenFile(real, os.O_RDONLY|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
-		return rpc.Response{ID: req.ID, OK: false, Error: "open: " + err.Error()}
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxRead+1))
-	_ = f.Close()
+	data, truncated, err := safefs.ReadAllCapped(f, maxRead)
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "read: " + err.Error()}
 	}
-	res := rpc.ReadResult{Size: info.Size()}
-	if len(data) > maxRead {
-		res.Content, res.Truncated = string(data[:maxRead]), true
-	} else {
-		res.Content = string(data)
-	}
+	res := rpc.ReadResult{Size: info.Size(), Content: string(data), Truncated: truncated}
 	raw := rpc.MustRaw(res)
 	if t.Audit != nil {
 		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
@@ -466,7 +453,14 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
-	real, err := t.Policy.ResolveRead(args.Path)
+	fs := t.Policy.ReadFS()
+	if fs == nil {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: "file read is not allowed by policy"}
+	}
+	info, err := fs.Stat(args.Path)
 	if err != nil {
 		decision := "deny"
 		if isStatError(err) {
@@ -476,13 +470,6 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 			t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
-	}
-	info, err := os.Stat(real)
-	if err != nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-		}
-		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
 	}
 	res := rpc.StatResult{
 		Name: info.Name(), Size: info.Size(),
@@ -497,7 +484,72 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
 }
 
+// doWrite implements remote_write: the ONLY write path, and only through
+// SafeFS with a file.write grant. Reads and writes are separate grants;
+// without file.write this tool denies everything (default deny).
+func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
+	start := time.Now()
+	var args rpc.WriteArgs
+	if err := json.Unmarshal(req.Args, &args); err != nil {
+		return rpc.Response{ID: req.ID, OK: false, Error: "bad write args"}
+	}
+	deny := func(msg string) rpc.Response {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: msg}
+	}
+	if args.Path == "" {
+		return deny("path not allowed by policy")
+	}
+	if t.Policy.Tools.File == nil || t.Policy.Tools.File.Write == nil {
+		return deny("file write is not allowed by policy")
+	}
+	fs := t.Policy.WriteFS()
+	if fs == nil {
+		return deny("file write is not allowed by policy")
+	}
+	created := !existsForWrite(fs, args.Path)
+	if err := fs.WriteFile(args.Path, []byte(args.Content), t.Policy.Tools.File.Write.Options()); err != nil {
+		if isStatError(err) || isIOError(err) {
+			if t.Audit != nil {
+				t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
+			}
+			return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
+		}
+		return deny(err.Error())
+	}
+	info, err := fs.Stat(args.Path)
+	if err != nil {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
+	}
+	raw := rpc.MustRaw(rpc.WriteResult{Size: info.Size(), Created: created})
+	if t.Audit != nil {
+		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
+	}
+	return rpc.Response{ID: req.ID, OK: true, Result: raw}
+}
+
+// existsForWrite probes existence for the Created flag. Informational only;
+// the write itself re-resolves, so races here change metadata, not access.
+func existsForWrite(fs *safefs.FS, path string) bool {
+	_, err := fs.Stat(path)
+	return err == nil
+}
+
 func isStatError(err error) bool {
 	msg := err.Error()
 	return len(msg) >= 6 && msg[:6] == "stat: "
+}
+
+func isIOError(err error) bool {
+	for _, prefix := range []string{"open: ", "write: ", "read: ", "rename: ", "sync: ", "temp: ", "close: "} {
+		if strings.HasPrefix(err.Error(), prefix) {
+			return true
+		}
+	}
+	return false
 }
