@@ -54,6 +54,7 @@ func Serve(args []string) int {
 	statePath := fs.String("state", DefaultStatePath(), "state file for `grant` coordination")
 	adminAddr := fs.String("admin", "127.0.0.1:0", "loopback admin API listen address")
 	outPath := fs.String("out", "", "write the initial capability to this file (0600) instead of stdout")
+	outForce := fs.Bool("force", false, "allow --out to overwrite an existing file")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -160,7 +161,7 @@ func Serve(args []string) int {
 	}
 
 	if *outPath != "" {
-		if err := writeCapFile(*outPath, firstCap.Encode()); err != nil {
+		if err := writeCapFile(*outPath, firstCap.Encode(), *outForce); err != nil {
 			fmt.Fprintf(os.Stderr, "write --out: %v\n", err)
 			s.shutdown()
 			return 1
@@ -251,7 +252,7 @@ func (s *server) expire(taskID string) {
 		return
 	}
 	lt.timer.Stop()
-	lt.task.Stop() // closes this task's server + audit
+	lt.task.Stop("expired") // closes this task's server + audit
 	s.store.Delete(taskID)
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
 }
@@ -264,7 +265,7 @@ func (s *server) shutdown() {
 	s.mu.Unlock()
 	for id, lt := range live {
 		lt.timer.Stop()
-		lt.task.Stop()
+		lt.task.Stop("shutdown")
 		s.store.Delete(id)
 	}
 }

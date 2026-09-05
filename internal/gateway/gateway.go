@@ -37,6 +37,12 @@ type Task struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopOnce sync.Once
+	// opMu + stopping + wg form the operation registry: Stop flips stopping
+	// (new ops fail), cancels the context (running ops die), then drains
+	// in-flight ops boundedly before the terminal audit event and close.
+	opMu     sync.Mutex
+	stopping bool
+	wg       sync.WaitGroup
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
@@ -58,12 +64,33 @@ func (t *Task) Context() context.Context {
 	return t.ctx
 }
 
-// Stop destroys the task: cancels in-flight operations first, then closes
-// audit and releases the network server. Must be followed by Store.Delete.
-func (t *Task) Stop() {
+// Stop destroys the task with the given reason ("expired", "revoked",
+// "shutdown"). Ordering is fixed:
+//
+//	stop accepting → cancel task context (kill trees) → bounded drain of
+//	in-flight ops → terminal audit event → release server → close audit.
+//
+// It MUST be followed by Store.Delete, and every termination path (expiry,
+// revoke, shutdown) funnels through it (INV-3).
+func (t *Task) Stop(reason string) {
 	t.stopOnce.Do(func() {
+		if reason == "" {
+			reason = "shutdown"
+		}
+		t.opMu.Lock()
+		t.stopping = true
+		t.opMu.Unlock()
 		if t.cancel != nil {
-			t.cancel() // kill running execs before releasing anything else
+			t.cancel() // kill running execs (whole trees) first
+		}
+		drained := make(chan struct{})
+		go func() { t.wg.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(10 * time.Second):
+		}
+		if t.Audit != nil {
+			t.Audit.Log("task.stop", nil, reason, nil, 0)
 		}
 		if t.onStop != nil {
 			t.onStop()
@@ -73,6 +100,20 @@ func (t *Task) Stop() {
 		}
 	})
 }
+
+// beginOp registers an in-flight operation. False means the task is
+// STOPPING/STOPPED and the call MUST be rejected.
+func (t *Task) beginOp() bool {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
+	if t.stopping {
+		return false
+	}
+	t.wg.Add(1)
+	return true
+}
+
+func (t *Task) endOp() { t.wg.Done() }
 
 // Store holds live tasks. The zero value is ready.
 type Store struct {
@@ -91,7 +132,7 @@ func (s *Store) Add(t *Task) {
 }
 
 // Delete removes a task so its id/secret can never authenticate again.
-// Call t.Stop() first to release its server and audit handle.
+// Call t.Stop(reason) first to release its server and audit handle.
 func (s *Store) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -201,6 +242,10 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
 	}
+	if !t.beginOp() {
+		return rpc.Response{ID: req.ID, OK: false, Error: "task stopping"}
+	}
+	defer t.endOp()
 	switch req.Tool {
 	case rpc.ToolExec:
 		return s.doExec(t, req)
@@ -240,6 +285,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	defer cancel()
 	// No shell, ever: argv goes straight to the pinned executable.
 	cmd := exec.CommandContext(ctx, exe, args.Args...)
+	startDetached(cmd) // own process group: expiry kills the whole tree
 	// Narrow environment: no passthrough of caller env.
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "LC_ALL=C"}
 	stdout, stderr := boundedBuffer(256 << 10), boundedBuffer(64 << 10)
@@ -248,8 +294,11 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	res := rpc.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		// Task death outranks every other failure: an exec killed by
-		// expiry must report expiry, never a normal result.
+		// expiry must report expiry, never a normal result. The direct
+		// child is already dead via the cancelled context; reap the rest
+		// of the tree explicitly.
 		if t.Context().Err() != nil {
+			killTree(cmd.Process)
 			if t.Audit != nil {
 				t.Audit.Log(req.Tool, req.Args, "expired", nil, time.Since(start))
 			}

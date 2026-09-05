@@ -14,6 +14,7 @@ func Grant(args []string) int {
 	ttlFlag := fs.String("ttl", "", "TTL override, e.g. 15m")
 	statePath := fs.String("state", DefaultStatePath(), "state file written by `serve`")
 	outPath := fs.String("out", "", "write the capability to this file (0600) instead of stdout")
+	outForce := fs.Bool("force", false, "allow --out to overwrite an existing file")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -45,7 +46,7 @@ func Grant(args []string) int {
 		return 1
 	}
 	if *outPath != "" {
-		if err := writeCapFile(*outPath, res.Capability); err != nil {
+		if err := writeCapFile(*outPath, res.Capability, *outForce); err != nil {
 			fmt.Fprintf(os.Stderr, "grant: write --out: %v\n", err)
 			return 1
 		}

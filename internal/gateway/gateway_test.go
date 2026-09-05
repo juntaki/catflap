@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -198,8 +200,8 @@ func TestEndpointTaskBinding(t *testing.T) {
 	defer srvB.Close()
 	taskA.OnStopFunc(func() { _ = srvA.Close() })
 	taskB.OnStopFunc(func() { _ = srvB.Close() })
-	defer taskA.Stop()
-	defer taskB.Stop()
+	defer taskA.Stop("shutdown")
+	defer taskB.Stop("shutdown")
 
 	dial := func(addr string) net.Conn {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -285,7 +287,7 @@ tools:
 	}()
 	time.Sleep(500 * time.Millisecond) // let sleep(30) start
 	start := time.Now()
-	task.Stop() // simulate TTL expiry
+	task.Stop("expired") // simulate TTL expiry
 	s.Delete(task.ID)
 	out := <-done
 	if out.err != nil {
@@ -300,7 +302,7 @@ tools:
 }
 func TestUnknownTask(t *testing.T) {
 	s, task := testStore(t, time.Minute)
-	task.Stop()
+	task.Stop("shutdown")
 	s.Delete(task.ID)
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -322,6 +324,92 @@ func TestReadRoots(t *testing.T) {
 	if res := call(t, s, rpc.ToolRead, rpc.ReadArgs{Path: "/etc/passwd"}); res.OK {
 		t.Error("/etc/passwd should be denied by default policy")
 	}
+}
+
+// TestProcessTreeKill: stopping the task must kill grandchildren too, not
+// just the direct child. Uses sh only as a test-local spawner (the product
+// never grants shells); unix-only, since tree-kill needs process groups.
+func TestProcessTreeKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group kill is unix-only")
+	}
+	for _, bin := range []string{"/bin/sh", "/bin/sleep"} {
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("missing %s on this machine", bin)
+		}
+	}
+	p, err := policy.Parse([]byte(`
+name: treekill
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: /bin/sh
+        rest: any
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, task := testStoreWithPolicy(t, p, time.Minute)
+	task.InitContext()
+
+	type outcome struct {
+		res rpc.Response
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		go s.Handler()(c2)
+		// sh spawns a grandchild sleep; both must die on Stop.
+		raw, _ := json.Marshal(rpc.ExecArgs{
+			Command: "/bin/sh", Args: []string{"-c", "sleep 45"}, TimeoutMs: 60000,
+		})
+		if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
+			done <- outcome{err: err}
+			return
+		}
+		res, err := rpc.ReadResponse(bufio.NewReader(c1))
+		done <- outcome{res: res, err: err}
+	}()
+	// Wait until the grandchild is observable, then stop the task.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if procExists("sleep 45") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("grandchild sleep never appeared")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	task.Stop("expired")
+	s.Delete(task.ID)
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("rpc failed: %v", out.err)
+	}
+	if out.res.OK || out.res.Error != "capability expired" {
+		t.Errorf("killed tree must report expiry, got %+v", out.res)
+	}
+	// The grandchild must be gone: poll briefly to let SIGKILL land.
+	gone := false
+	for i := 0; i < 50 && !gone; i++ {
+		gone = !procExists("sleep 45")
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !gone {
+		t.Error("grandchild sleep survived task Stop (process-tree kill failed)")
+	}
+}
+
+// procExists reports whether a process matching pattern exists, via pgrep.
+// Test-only helper (unix).
+func procExists(pattern string) bool {
+	cmd := exec.Command("pgrep", "-f", pattern)
+	return cmd.Run() == nil
 }
 
 // TestSymlinkEscapeGate: intermediate and final-component symlinks denied.
