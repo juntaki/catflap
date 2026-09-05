@@ -114,6 +114,21 @@ func (l *Logger) Err() error {
 	return l.writeErr
 }
 
+// BreakSinkForTest closes the underlying file descriptor while leaving the
+// Logger otherwise intact, so the next Log call hits a real write error —
+// exactly like a real disk failure would. Test-only: it exists so tests in
+// other packages (gateway, cli) can exercise fail-closed behavior without
+// reaching into Logger's private fields, which Close() cannot do for them
+// since Close() also nils l.f, and appendLocked treats a nil l.f as the
+// (deliberately non-failing) in-memory-logger case.
+func (l *Logger) BreakSinkForTest() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f != nil {
+		_ = l.f.Close()
+	}
+}
+
 // appendLocked builds the next chain entry and, only once it is fully
 // durable on disk, commits it as the new seq/prev. A write that fails or
 // lands short is never allowed to advance the in-memory chain state: if it
@@ -142,7 +157,13 @@ func (l *Logger) appendLocked(tool string, args []byte, decision string, result 
 		return e
 	}
 	// Entry is strings/ints only and cannot fail to marshal.
-	raw, _ := json.Marshal(e)
+	raw, merr := json.Marshal(e)
+	if merr != nil {
+		if l.writeErr == nil {
+			l.writeErr = merr
+		}
+		return e
+	}
 	raw = append(raw, '\n')
 	n, werr := l.f.Write(raw)
 	if werr == nil && n != len(raw) {

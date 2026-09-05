@@ -185,6 +185,47 @@ func TestBadSecretAndExpiry(t *testing.T) {
 	}
 }
 
+// TestAuditFailureStopsTaskOnEarlyReturn covers the P1 fix: handleRPC's
+// early-return deny paths (expired, endpoint mismatch, concurrency limit)
+// used to audit-log without checking whether that write itself failed, so
+// an audit sink outage there left the task ACTIVE. Every audit write now
+// funnels through Task.auditLog, which checks Err() and stops the task
+// fail-closed regardless of which code path triggered the write.
+func TestAuditFailureStopsTaskOnEarlyReturn(t *testing.T) {
+	dir := t.TempDir()
+	alog, err := audit.Open(dir, "agt_early", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{
+		ID: "agt_test", Secret: "s3cret",
+		Policy: policy.Default(),
+		// Already expired: handleRPC's early-return "expired" branch is
+		// what audits and returns, before ever reaching beginOp/dispatch.
+		ExpiresAt: time.Now().Add(-time.Minute),
+		Audit:     alog,
+	}
+	task.InitContext(context.Background())
+	s := &Store{}
+	s.Add(task)
+	task.TryActivate()
+
+	alog.BreakSinkForTest()
+
+	res := call(t, s, rpc.ToolExec, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+	if res.OK || res.Error != "capability expired" {
+		t.Fatalf("expired task must still deny normally, got %+v", res)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for task.StateOf() != StateStopped && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if task.StateOf() != StateStopped {
+		t.Fatalf("audit sink failure on the early-return path must stop the task fail-closed, state=%v", task.StateOf())
+	}
+}
+
 // TestEndpointTaskBinding is the cross-credential quadrant test: each task
 // owns an endpoint, and a valid secret for task B is useless at A's endpoint.
 func TestEndpointTaskBinding(t *testing.T) {
@@ -377,6 +418,10 @@ tools:
 	run("expired", "capability expired")
 	run("revoked", "task revoked")
 	run("shutdown", "task shutdown")
+	// P2 fix: an audit-fail-closed stop is not a TTL expiry, so an
+	// in-flight exec killed by it must not be told "capability expired" —
+	// that would misrepresent why access ended.
+	run("audit sink failed", "task terminated: audit unavailable")
 }
 
 // TestLifecycleStates walks CREATING → ACTIVE → STOPPING → STOPPED and

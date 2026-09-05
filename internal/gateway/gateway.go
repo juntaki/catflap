@@ -24,9 +24,10 @@ import (
 // matching cause so in-flight operations report *why* they died — and so
 // the v0.2 structured error codes can key off the same values.
 var (
-	ErrTaskExpired  = errors.New("task expired")
-	ErrTaskRevoked  = errors.New("task revoked")
-	ErrTaskShutdown = errors.New("task shutdown")
+	ErrTaskExpired     = errors.New("task expired")
+	ErrTaskRevoked     = errors.New("task revoked")
+	ErrTaskShutdown    = errors.New("task shutdown")
+	ErrTaskAuditFailed = errors.New("task audit sink failed")
 )
 
 // causeForReason maps a Stop reason to its cancellation cause.
@@ -36,6 +37,8 @@ func causeForReason(reason string) error {
 		return ErrTaskRevoked
 	case "shutdown":
 		return ErrTaskShutdown
+	case "audit sink failed":
+		return ErrTaskAuditFailed
 	default:
 		return ErrTaskExpired
 	}
@@ -182,6 +185,26 @@ func (t *Task) endOp() {
 	t.wg.Done()
 }
 
+// auditLog appends one audit record and, if the sink is now failing, stops
+// the task fail-closed. Every audit write in this package — including
+// handleRPC's early-return deny/expired paths, not just the tool
+// handlers' own decisions — funnels through this, so a sink failure can
+// never leave an ACTIVE task running with a degraded audit trail no
+// matter which code path happened to hit it first.
+//
+// Stop runs in a goroutine: called synchronously from inside an
+// in-flight op (between beginOp and its deferred endOp), it would
+// deadlock on Stop's wg.Wait against that very op.
+func (t *Task) auditLog(tool string, args []byte, decision string, result []byte, dur time.Duration) {
+	if t.Audit == nil {
+		return
+	}
+	t.Audit.Log(tool, args, decision, result, dur)
+	if t.Audit.Err() != nil {
+		go t.Stop("audit sink failed")
+	}
+}
+
 // Store holds live tasks. The zero value is ready.
 type Store struct {
 	mu    sync.RWMutex
@@ -288,8 +311,8 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		s.mu.RLock()
 		owner := s.tasks[boundTaskID]
 		s.mu.RUnlock()
-		if owner != nil && owner.Audit != nil {
-			owner.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
+		if owner != nil {
+			owner.auditLog(req.Tool, req.Args, "deny", nil, 0)
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "task does not belong to this endpoint"}
 	}
@@ -298,15 +321,11 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: "unknown task or bad secret"}
 	}
 	if t.Expired(time.Now()) {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "expired", nil, 0)
-		}
+		t.auditLog(req.Tool, req.Args, "expired", nil, 0)
 		return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
 	}
 	if reason := t.beginOp(); reason != "" {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, 0)
 		return rpc.Response{ID: req.ID, OK: false, Error: reason}
 	}
 	defer t.endOp()
@@ -321,22 +340,12 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 	case rpc.ToolWrite:
 		res = s.doWrite(t, req)
 	default:
-		if t.Audit != nil {
-			// Unknown tools come from untrusted clients bypassing MCP, and
-			// req.Tool is bounded/ASCII-checked by rpc.Request.validate,
-			// but it is still arbitrary agent-chosen text; don't echo it
-			// into the audit record verbatim.
-			t.Audit.Log("unknown_tool", req.Args, "deny", nil, 0)
-		}
+		// Unknown tools come from untrusted clients bypassing MCP, and
+		// req.Tool is bounded/ASCII-checked by rpc.Request.validate, but
+		// it is still arbitrary agent-chosen text; don't echo it into
+		// the audit record verbatim.
+		t.auditLog("unknown_tool", req.Args, "deny", nil, 0)
 		res = rpc.Response{ID: req.ID, OK: false, Error: fmt.Sprintf("unknown tool %q", req.Tool)}
-	}
-	// An audit sink failure is a security-relevant degradation, not a
-	// warning: continuing to grant access to a task whose actions can no
-	// longer be recorded defeats the audit trail's purpose. Stop async —
-	// synchronously here would deadlock on Stop's wg.Wait against this
-	// very op's deferred endOp.
-	if t.Audit != nil && t.Audit.Err() != nil {
-		go t.Stop("audit sink failed")
 	}
 	return res
 }
@@ -349,9 +358,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	}
 	exe, ok := t.Policy.MatchExec(args.Command, args.Args)
 	if !ok {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "command not allowed by policy"}
 	}
 	lim := t.Policy.EffectiveLimits()
@@ -390,10 +397,13 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 				msg, decision = "task revoked", "revoked"
 			case errors.Is(context.Cause(t.Context()), ErrTaskShutdown):
 				msg, decision = "task shutdown", "shutdown"
+			case errors.Is(context.Cause(t.Context()), ErrTaskAuditFailed):
+				// Not a TTL expiry: a concurrent request's audit write
+				// failed and fail-closed stopped this task mid-op. The
+				// agent should see a distinct cause, not "expired".
+				msg, decision = "task terminated: audit unavailable", "error"
 			}
-			if t.Audit != nil {
-				t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
-			}
+			t.auditLog(req.Tool, req.Args, decision, nil, time.Since(start))
 			return rpc.Response{ID: req.ID, OK: false, Error: msg}
 		}
 		var exitErr *exec.ExitError
@@ -402,17 +412,13 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 		} else {
 			res.ExitCode = 127
 			if ctx.Err() == context.DeadlineExceeded {
-				if t.Audit != nil {
-					t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-				}
+				t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 				return rpc.Response{ID: req.ID, OK: false, Error: "command timed out"}
 			}
 		}
 	}
 	raw := rpc.MustRaw(res)
-	if t.Audit != nil {
-		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
-	}
+	t.auditLog(req.Tool, req.Args, "allow", raw, time.Since(start))
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
 }
 
@@ -423,16 +429,12 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad read args"}
 	}
 	if args.Path == "" {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
 	fs := t.Policy.ReadFS()
 	if fs == nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "file read is not allowed by policy"}
 	}
 	f, err := fs.OpenRead(args.Path)
@@ -441,31 +443,23 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		if isStatError(err) {
 			decision = "error"
 		}
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, decision, nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
 	}
 	data, truncated, err := safefs.ReadAllCapped(f, t.Policy.EffectiveLimits().MaxReadBytes)
 	if err != nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "read: " + err.Error()}
 	}
 	res := rpc.ReadResult{Size: info.Size(), Content: string(data), Truncated: truncated}
 	raw := rpc.MustRaw(res)
-	if t.Audit != nil {
-		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
-	}
+	t.auditLog(req.Tool, req.Args, "allow", raw, time.Since(start))
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
 }
 
@@ -476,16 +470,12 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad stat args"}
 	}
 	if args.Path == "" {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
 	fs := t.Policy.ReadFS()
 	if fs == nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "file read is not allowed by policy"}
 	}
 	info, err := fs.Stat(args.Path)
@@ -494,9 +484,7 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 		if isStatError(err) {
 			decision = "error"
 		}
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, decision, nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
 	}
 	res := rpc.StatResult{
@@ -506,9 +494,7 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 		IsDir:   info.IsDir(),
 	}
 	raw := rpc.MustRaw(res)
-	if t.Audit != nil {
-		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
-	}
+	t.auditLog(req.Tool, req.Args, "allow", raw, time.Since(start))
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
 }
 
@@ -522,9 +508,7 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad write args"}
 	}
 	deny := func(msg string) rpc.Response {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: msg}
 	}
 	if args.Path == "" {
@@ -540,24 +524,18 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 	created := !existsForWrite(fs, args.Path)
 	if err := fs.WriteFile(args.Path, []byte(args.Content), t.Policy.Tools.File.Write.Options()); err != nil {
 		if isStatError(err) || isIOError(err) {
-			if t.Audit != nil {
-				t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-			}
+			t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 			return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
 		}
 		return deny(err.Error())
 	}
 	info, err := fs.Stat(args.Path)
 	if err != nil {
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
-		}
+		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
 	}
 	raw := rpc.MustRaw(rpc.WriteResult{Size: info.Size(), Created: created})
-	if t.Audit != nil {
-		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
-	}
+	t.auditLog(req.Tool, req.Args, "allow", raw, time.Since(start))
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
 }
 

@@ -9,6 +9,21 @@ import (
 	"testing"
 )
 
+// marshalTestRequest marshals a fixed test frame. Request carries a Secret
+// field, which trips gosec G117 (potential secret marshaling) at every
+// call site; Secret here is always a hardcoded test literal, never a real
+// credential, so one reviewed nolint covers every test that needs a frame.
+//
+//nolint:gosec // reason: test-only Request literals with fake secrets, never a real credential.
+func marshalTestRequest(t *testing.T, req Request) []byte {
+	t.Helper()
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, '\n')
+}
+
 func TestReadFrameNormal(t *testing.T) {
 	req, err := ReadRequest(bufio.NewReader(strings.NewReader("{\"task\":\"a\"}\n")))
 	if err != nil || req.Task != "a" {
@@ -39,8 +54,7 @@ func TestReadFrameHugeWithoutNewline(t *testing.T) {
 // could otherwise grow one audit line past the verifier's scan limit.
 func TestReadRequestRejectsOversizedTool(t *testing.T) {
 	req := Request{Task: "a", Tool: strings.Repeat("x", maxToolLen+1)}
-	raw, _ := json.Marshal(req)
-	raw = append(raw, '\n')
+	raw := marshalTestRequest(t, req)
 	_, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if !errors.Is(err, errBadRequest) {
 		t.Errorf("oversized tool must be rejected, got %v", err)
@@ -49,8 +63,7 @@ func TestReadRequestRejectsOversizedTool(t *testing.T) {
 
 func TestReadRequestRejectsNonIdentifierTool(t *testing.T) {
 	req := Request{Task: "a", Tool: "remote_exec; rm -rf /"}
-	raw, _ := json.Marshal(req)
-	raw = append(raw, '\n')
+	raw := marshalTestRequest(t, req)
 	_, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if !errors.Is(err, errBadRequest) {
 		t.Errorf("non-identifier tool must be rejected, got %v", err)
@@ -59,8 +72,7 @@ func TestReadRequestRejectsNonIdentifierTool(t *testing.T) {
 
 func TestReadRequestAcceptsNormalTool(t *testing.T) {
 	req := Request{Task: "a", Secret: "s", Tool: ToolExec}
-	raw, _ := json.Marshal(req)
-	raw = append(raw, '\n')
+	raw := marshalTestRequest(t, req)
 	got, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil || got.Tool != ToolExec {
 		t.Errorf("normal tool must pass, got %v %+v", err, got)

@@ -199,10 +199,7 @@ func Serve(args []string) int {
 		// with status "unknown" — repeated revoke is not an error.
 		status := "unknown"
 		if lt := s.takeLive(rreq.Task); lt != nil {
-			lt.timer.Stop()
-			lt.task.Stop("revoked") // same teardown as expiry
-			s.store.Delete(rreq.Task)
-			reportDegraded(lt)
+			lt.task.Stop("revoked") // same teardown as expiry, via onStop
 			status = "revoked"
 			fmt.Fprintf(os.Stderr, "catflap serve: task %s revoked — server closed, address dead\n", rreq.Task)
 		}
@@ -400,7 +397,27 @@ func (s *server) commit(taskID string, t *gateway.Task, srv transport.Server) er
 		return errShuttingDown
 	}
 	lt := &liveTask{task: t, srv: srv}
-	t.OnStopFunc(func() { _ = srv.Close() })
+	// detach is the single idempotent teardown for every termination path:
+	// expiry, revoke, shutdown, and Stop calls that don't originate in
+	// serve.go at all (the gateway's audit-fail-closed path stops a task
+	// directly with no server-side call site to clean up after it). It
+	// runs exactly once per task (Task.Stop's stopOnce guards this),
+	// regardless of who called Stop, so a stopped task can never keep
+	// occupying a live/store slot — and thus a max-tasks admission slot
+	// — past its own termination.
+	t.OnStopFunc(func() {
+		_ = srv.Close()
+		s.mu.Lock()
+		if cur, ok := s.live[taskID]; ok && cur == lt {
+			delete(s.live, taskID)
+		}
+		s.mu.Unlock()
+		if lt.timer != nil {
+			lt.timer.Stop()
+		}
+		s.store.Delete(taskID)
+		reportDegraded(lt)
+	})
 	s.live[taskID] = lt
 	if !t.TryActivate() {
 		delete(s.live, taskID)
@@ -445,35 +462,29 @@ func (s *server) takeLive(taskID string) *liveTask {
 }
 
 // expire destroys one task: network identity dies here, not just RPC auth.
+// takeLive is the race gate against a concurrent revoke of the same task
+// (whichever grabs the live entry first wins); the actual teardown — timer
+// stop, server close, live/store detach, degradation report — happens in
+// Task.Stop's onStop callback (see commit).
 func (s *server) expire(taskID string) {
-	s.mu.Lock()
-	lt, ok := s.live[taskID]
-	if ok {
-		delete(s.live, taskID)
-	}
-	s.mu.Unlock()
-	if !ok {
+	lt := s.takeLive(taskID)
+	if lt == nil {
 		return
 	}
-	lt.timer.Stop()
-	lt.task.Stop("expired") // closes this task's server + audit
-	s.store.Delete(taskID)
-	reportDegraded(lt)
+	lt.task.Stop("expired")
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
 }
 
-// shutdown destroys every live task.
+// shutdown destroys every live task. Teardown per task happens in
+// Task.Stop's onStop callback (see commit).
 func (s *server) shutdown() {
 	s.mu.Lock()
 	s.closing = true
 	live := s.live
 	s.live = map[string]*liveTask{}
 	s.mu.Unlock()
-	for id, lt := range live {
-		lt.timer.Stop()
+	for _, lt := range live {
 		lt.task.Stop("shutdown")
-		s.store.Delete(id)
-		reportDegraded(lt)
 	}
 }
 
