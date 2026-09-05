@@ -421,6 +421,14 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		}
 		defer t.endControlOp()
 		t.auditLog(req.Tool, req.Args, "allow", rpc.MustRaw(map[string]string{"task": t.ID}), 0)
+		// auditLog may have just stopped this task fail-closed (its audit
+		// write failed). A caller can use ping as an "is this task alive
+		// and paired" liveness check, so it must not report OK for a task
+		// that is dying — recheck state after the write, not just at
+		// beginControlOp's admission a moment earlier.
+		if t.StateOf() != StateActive {
+			return rpc.Response{ID: req.ID, OK: false, Error: "task terminated: audit unavailable"}
+		}
 		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.PingResult{Task: t.ID})}
 	case rpc.ToolRevokeSelf:
 		if reason := t.beginControlOp(); reason != "" {

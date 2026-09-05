@@ -38,6 +38,47 @@ func TestConfigRendezvousFailsClosedOnExplicitMissing(t *testing.T) {
 	}
 }
 
+// TestRendezvousURLRequiresHTTPS covers the P2 fix: a rendezvous URL
+// must be https, with an explicit carve-out for local development
+// (localhost/127.0.0.1/::1 over plain http). Plaintext HTTP to a real
+// remote endpoint doesn't leak the sealed capability (the AEAD wrap key
+// travels out-of-band in the pairing code), but it does let a network
+// attacker deny availability — drop or corrupt publish/fetch, or burn a
+// pairing code before its intended recipient — without breaking any
+// crypto at all.
+func TestRendezvousURLRequiresHTTPS(t *testing.T) {
+	t.Setenv("CATFLAP_CONFIG", "")
+	t.Setenv("CATFLAP_RENDEZVOUS", "")
+	if _, err := ResolveRendezvous("http://pair.example.com"); err == nil {
+		t.Error("plain http to a non-local host must be rejected")
+	}
+	if v, err := ResolveRendezvous("https://pair.example.com"); err != nil || v != "https://pair.example.com" {
+		t.Errorf("https must be accepted: %v %q", err, v)
+	}
+	for _, local := range []string{"http://127.0.0.1:8471", "http://localhost:8471", "http://[::1]:8471"} {
+		if v, err := ResolveRendezvous(local); err != nil || v != local {
+			t.Errorf("plain http to %q (local dev) must be accepted: %v", local, err)
+		}
+	}
+}
+
+// TestConfigRendezvousRejectsTrailingDocument covers strict-parser parity
+// with the policy YAML parser: a second `---`-separated document must be
+// rejected, not silently ignored.
+func TestConfigRendezvousRejectsTrailingDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("rendezvous_url: https://ok.example\n---\nwhatever: ignored\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CATFLAP_CONFIG", path)
+	t.Setenv("CATFLAP_RENDEZVOUS", "")
+
+	if _, err := ResolveRendezvous(""); err == nil {
+		t.Error("a second YAML document in the config file must be rejected")
+	}
+}
+
 func TestConfigRendezvousPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

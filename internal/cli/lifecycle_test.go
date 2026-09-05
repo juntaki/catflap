@@ -86,6 +86,62 @@ func TestAuditFailureDetachesTaskFromStore(t *testing.T) {
 	}
 }
 
+// TestExpireLeavesActiveBeforeNameFreed covers the P2 fix: expire/revoke
+// used to remove a task from the live map (freeing its name for reuse)
+// BEFORE calling Stop, so a new grant could claim that name while the old
+// task — Stop not yet even started — was still fully ACTIVE. stopDetached
+// now calls RequestStop (leaving ACTIVE synchronously) before removing
+// the live entry, so whenever a new grant observes a name as free, the
+// task that held it is provably no longer ACTIVE.
+func TestExpireLeavesActiveBeforeNameFreed(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{
+		transport: "local",
+		auditDir:  dir,
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  1, // task2 can only be admitted once task1's slot frees
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
+
+	_, task1, err := s.mkTask(context.Background(), p, "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task1.Name != "foo" {
+		t.Fatalf("task1 must get the preferred name, got %q", task1.Name)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.expire(task1.ID)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	claimed := false
+	for time.Now().Before(deadline) && !claimed {
+		_, task2, err := s.mkTask(context.Background(), p, "foo")
+		if err != nil {
+			continue // slot/name not free yet: task1 hasn't fully detached
+		}
+		claimed = true
+		if task2.Name != "foo" {
+			t.Fatalf("task2 should have claimed the freed name, got %q", task2.Name)
+		}
+		// The instant a new grant can claim "foo", task1 must already be
+		// unable to serve as an ACTIVE task under it.
+		if task1.StateOf() == gateway.StateActive {
+			t.Error("task1 was still ACTIVE when its name became reusable")
+		}
+	}
+	<-done
+	if !claimed {
+		t.Fatal("task1 never released its slot/name within the deadline")
+	}
+}
+
 // TestConcurrentGrantsNeverDuplicateName covers the P1 fix: deciding a
 // task's name (against s.live) and committing it into s.live used to be
 // two separate critical sections, so two concurrent grants could both

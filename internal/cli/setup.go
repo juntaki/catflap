@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -30,7 +29,6 @@ func Setup(args []string) int {
 
 func setupClaude(args []string) int {
 	fs := flag.NewFlagSet("setup claude", flag.ContinueOnError)
-	force := fs.Bool("force", false, "re-register even if already present")
 	rendezvous := fs.String("rendezvous", "", "rendezvous URL to persist (default: resolved chain)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -52,21 +50,16 @@ func setupClaude(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if !*force {
-		// Idempotency checks the ACTUAL registered config, not just
-		// whether some entry named "catflap" exists: a stale rendezvous
-		// URL left over from a previous setup must not be silently kept
-		// as if it still matched.
-		//nolint:gosec // reason: fixed argv against the operator's PATH-resolved claude binary; no agent input.
-		if out, getErr := exec.CommandContext(ctx, claude, "mcp", "get", "catflap").Output(); getErr == nil && bytes.Contains(out, []byte(rdv)) {
-			fmt.Printf("✓ Catflap MCP already registered with the current rendezvous\n")
-			return 0
-		}
-	}
-	// Either --force, or no existing registration matched the resolved
-	// rendezvous: clear whatever is there first so `claude mcp add`
-	// doesn't fail on a duplicate name. A missing entry makes this a
-	// harmless no-op.
+	// Always clear any existing USER-scope registration before re-adding,
+	// rather than trying to detect "already correctly registered" first.
+	// Claude Code resolves MCP servers local > project > user: a
+	// `claude mcp get catflap` that finds a local/project-scope entry
+	// with a matching rendezvous URL would look "already set up" while
+	// the user scope — the one that makes catflap work from every other
+	// project — stays unregistered, silently breaking the "setup once,
+	// `claude` works everywhere" promise. Setup is not a hot path, so
+	// the small extra cost of an unconditional remove+add is worth the
+	// certainty. A missing entry makes remove a harmless no-op.
 	//nolint:gosec // reason: fixed argv against the operator's PATH-resolved claude binary; no agent input.
 	_ = exec.CommandContext(ctx, claude, "mcp", "remove", "--scope", "user", "catflap").Run()
 

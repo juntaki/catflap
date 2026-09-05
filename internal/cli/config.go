@@ -2,7 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +27,17 @@ import (
 // quietly published to pair.catflap.dev instead. Only the DEFAULT config
 // path simply not existing (no config was ever set up) falls through.
 func ResolveRendezvous(flagVal string) (string, error) {
+	v, err := resolveRendezvous(flagVal)
+	if err != nil {
+		return "", err
+	}
+	if err := validateRendezvousURL(v); err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+func resolveRendezvous(flagVal string) (string, error) {
 	if v := strings.TrimSpace(flagVal); v != "" {
 		return v, nil
 	}
@@ -38,6 +52,29 @@ func ResolveRendezvous(flagVal string) (string, error) {
 		return v, nil
 	}
 	return pair.DefaultRendezvousURL, nil
+}
+
+// validateRendezvousURL requires https, except for loopback/localhost
+// endpoints used for local development. The AEAD-sealed envelope's
+// confidentiality doesn't depend on transport security — the wrap key
+// travels out-of-band in the pairing code, never over this connection —
+// but plaintext HTTP still lets a network attacker deny availability
+// (drop or corrupt publish/fetch, or burn a pairing code before the
+// intended recipient fetches it) without needing to break the AEAD at
+// all.
+func validateRendezvousURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("bad rendezvous URL %q: %w", raw, err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	host := u.Hostname()
+	if u.Scheme == "http" && (host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "127.0.0.1" || host == "::1") {
+		return nil
+	}
+	return fmt.Errorf("rendezvous URL %q must use https (http allowed only for localhost/127.0.0.1)", raw)
 }
 
 // DefaultRendezvous returns the configured rendezvous URL, if any.
@@ -79,6 +116,17 @@ func configRendezvous() (string, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return "", fmt.Errorf("parse rendezvous config %s: %w", path, err)
+	}
+	// Strict parsing must also reject a second YAML document: otherwise
+	// "unknown fields fail closed" only holds for the first one.
+	var extra any
+	switch derr := dec.Decode(&extra); {
+	case derr == nil:
+		return "", fmt.Errorf("parse rendezvous config %s: unexpected second document", path)
+	case errors.Is(derr, io.EOF):
+		// only document present, as expected
+	default:
+		return "", fmt.Errorf("parse rendezvous config %s: %w", path, derr)
 	}
 	return cfg.RendezvousURL, nil
 }

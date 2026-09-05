@@ -267,8 +267,7 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		// Idempotent: revoking an unknown (already gone) task succeeds
 		// with status "unknown" — repeated revoke is not an error.
 		status := "unknown"
-		if lt := s.takeLive(rreq.Task); lt != nil {
-			lt.task.Stop("revoked") // same teardown as expiry, via onStop
+		if lt := s.peekLive(rreq.Task); lt != nil && s.stopDetached(rreq.Task, lt, "revoked") {
 			status = "revoked"
 			fmt.Fprintf(os.Stderr, "catflap serve: task %s revoked — server closed, address dead\n", rreq.Task)
 		}
@@ -301,6 +300,11 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		WriteTimeout:      30 * time.Second,
 	}
 	go func() { _ = adminSrv.Serve(ln) }()
+	// Every RunGateway return path below (writeState/announce failure,
+	// or the normal shutdown at the end) must close the admin listener —
+	// not just the CLI's process-exit path, since share will call this
+	// same function and keep running afterward.
+	defer func() { _ = adminSrv.Close() }()
 
 	st := StateFile{Transport: opts.Transport, AdminAddr: ln.Addr().String(), AdminToken: adminToken}
 	if err := writeState(opts.StatePath, st); err != nil {
@@ -320,7 +324,6 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 
 	<-ctx.Done()
 	fmt.Fprintf(os.Stderr, "catflap serve: shutting down, destroying all task keys\n")
-	_ = adminSrv.Close()
 	removeOwnState(opts.StatePath, st)
 	s.shutdown()
 	return 0
@@ -592,29 +595,54 @@ func sanitizeName(preferred string) (string, error) {
 	return s, nil
 }
 
-// takeLive removes a live task from the registry and returns it.
-// Used by revoke; expiry uses its own path via expire().
-func (s *server) takeLive(taskID string) *liveTask {
+// peekLive returns the live task without removing it (see stopDetached
+// for why removal happens later, not here).
+func (s *server) peekLive(taskID string) *liveTask {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	lt, ok := s.live[taskID]
-	if ok {
-		delete(s.live, taskID)
-	}
-	return lt
+	return s.live[taskID]
 }
 
-// expire destroys one task: network identity dies here, not just RPC auth.
-// takeLive is the race gate against a concurrent revoke of the same task
-// (whichever grabs the live entry first wins); the actual teardown — timer
-// stop, server close, live/store detach, degradation report — happens in
-// Task.Stop's onStop callback (see commit).
+// stopDetached synchronously requests lt's stop — leaving ACTIVE happens
+// before this returns — and only THEN removes it from the live map,
+// freeing its name for reuse. The two must not be reordered: if the name
+// became free (removed from live) before the old task actually left
+// ACTIVE, a concurrent grant resolving names against s.live could pick
+// that name while the dying task could still, for a brief window, answer
+// as if it were a live ACTIVE task under it. Deferring the map removal
+// to after RequestStop's synchronous phase closes that window.
+//
+// The map removal doubles as the race gate against a concurrent
+// revoke/expire of the same task: both may reach here with the same lt,
+// both call RequestStop (idempotent — Task.Stop's stopOnce guards it),
+// but only the caller that actually deletes the entry (won == true)
+// should report success or print a message; the other lost the race to
+// an already-in-flight teardown and must stay silent.
+func (s *server) stopDetached(taskID string, lt *liveTask, reason string) (won bool) {
+	done := lt.task.RequestStop(reason)
+	s.mu.Lock()
+	if cur, ok := s.live[taskID]; ok && cur == lt {
+		delete(s.live, taskID)
+		won = true
+	}
+	s.mu.Unlock()
+	<-done
+	return won
+}
+
+// expire destroys one task: network identity dies here, not just RPC
+// auth. The actual resource teardown — timer stop, server close, store
+// detach, degradation report — happens in Task.Stop's onStop callback
+// (see commit); stopDetached only orders the ACTIVE-leave before the
+// live-map/name removal and gates against a concurrent revoke.
 func (s *server) expire(taskID string) {
-	lt := s.takeLive(taskID)
+	lt := s.peekLive(taskID)
 	if lt == nil {
 		return
 	}
-	lt.task.Stop("expired")
+	if !s.stopDetached(taskID, lt, "expired") {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
 }
 

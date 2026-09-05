@@ -226,6 +226,33 @@ func TestAuditFailureStopsTaskOnEarlyReturn(t *testing.T) {
 	}
 }
 
+// TestPingFailsClosedOnAuditFailure covers the P1 fix: ping must not
+// report OK for a task whose audit write just failed and stopped it —
+// pairing uses ping as an "is this task alive" liveness signal, so a
+// stale OK here would let it treat a dying task as successfully paired.
+func TestPingFailsClosedOnAuditFailure(t *testing.T) {
+	dir := t.TempDir()
+	alog, err := audit.Open(dir, "agt_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{ID: "agt_test", Secret: "s3cret", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Minute), Audit: alog}
+	task.InitContext(context.Background())
+	s := &Store{}
+	s.Add(task)
+	task.TryActivate()
+
+	_ = alog.Close()
+
+	res := call(t, s, rpc.ToolPing, struct{}{})
+	if res.OK {
+		t.Errorf("ping must not report OK when its own audit write just failed, got %+v", res)
+	}
+	if task.StateOf() == StateActive {
+		t.Errorf("task must have left ACTIVE, got state=%v", task.StateOf())
+	}
+}
+
 // TestRequestStopSynchronousStateTransition covers the P1 fix: the state
 // flip to StateStopping (and thus beginOp refusing new ops) must happen
 // before RequestStop returns, not somewhere inside an async goroutine.

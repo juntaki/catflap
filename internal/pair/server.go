@@ -22,9 +22,12 @@ import (
 // all answer the same 404: no oracle beyond that.
 //
 // Client identity is the TCP peer. Behind a reverse proxy, pass the proxy
-// CIDRs via SetTrustedProxies so the leftmost X-Forwarded-For entry is
-// used; XFF is never trusted otherwise. Terminating TLS in front is a
-// deployment concern, not a protocol one.
+// CIDRs via SetTrustedProxies so the nearest non-trusted-proxy entry in
+// X-Forwarded-For is used (scanned from the right, peeling known proxy
+// hops — a proxy only appends what it saw, so the leftmost entry is
+// whatever the client itself wrote and is never safe to trust); XFF is
+// never consulted otherwise. Terminating TLS in front is a deployment
+// concern, not a protocol one.
 type Server struct {
 	mu        sync.Mutex
 	items     map[string]stored
