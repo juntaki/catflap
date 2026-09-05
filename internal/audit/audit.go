@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -113,12 +114,18 @@ func (l *Logger) Err() error {
 	return l.writeErr
 }
 
+// appendLocked builds the next chain entry and, only once it is fully
+// durable on disk, commits it as the new seq/prev. A write that fails or
+// lands short is never allowed to advance the in-memory chain state: if it
+// did, the next successful entry would chain onto a hash whose entry never
+// made it to the file, permanently breaking the chain for anyone auditing
+// this task later. The failure is still recorded as a sticky writeErr, so
+// callers can fail the task closed instead of continuing silently degraded.
 func (l *Logger) appendLocked(tool string, args []byte, decision string, result []byte, dur time.Duration) Entry {
-	l.seq++
 	e := Entry{
 		V:          AuditVersion,
 		Task:       l.task,
-		Seq:        l.seq,
+		Seq:        l.seq + 1,
 		Time:       time.Now().UTC().Format(time.RFC3339Nano),
 		AgentKey:   shortKey(l.agentKey),
 		Tool:       tool,
@@ -129,18 +136,26 @@ func (l *Logger) appendLocked(tool string, args []byte, decision string, result 
 		Prev:       l.prev,
 	}
 	e.Hash = HashEntry(e)
-	l.prev = e.Hash
-	if l.f != nil {
-		// Entry is strings/ints only and cannot fail to marshal; a
-		// failure must not advance the file past the in-memory chain,
-		// so skip the write rather than recording a partial entry.
-		if raw, merr := json.Marshal(e); merr == nil {
-			raw = append(raw, '\n')
-			if _, werr := l.f.Write(raw); werr != nil && l.writeErr == nil {
-				l.writeErr = werr
-			}
-		}
+	if l.f == nil {
+		l.seq = e.Seq
+		l.prev = e.Hash
+		return e
 	}
+	// Entry is strings/ints only and cannot fail to marshal.
+	raw, _ := json.Marshal(e)
+	raw = append(raw, '\n')
+	n, werr := l.f.Write(raw)
+	if werr == nil && n != len(raw) {
+		werr = io.ErrShortWrite
+	}
+	if werr != nil {
+		if l.writeErr == nil {
+			l.writeErr = werr
+		}
+		return e
+	}
+	l.seq = e.Seq
+	l.prev = e.Hash
 	return e
 }
 

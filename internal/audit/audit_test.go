@@ -215,3 +215,33 @@ func TestStickyWriteError(t *testing.T) {
 	}
 	_ = l.Close()
 }
+
+// TestFailedWriteDoesNotAdvanceChain covers the P1 fix: a write failure
+// must not move seq/prev forward, or the next successful entry chains onto
+// a hash whose entry never reached the file, permanently breaking verify.
+func TestFailedWriteDoesNotAdvanceChain(t *testing.T) {
+	dir := "testdata/audit-chain-break"
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	l, err := Open(dir, "agt_chainbreak", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Log("task.create", nil, "active", nil, 0)
+	seqBefore, prevBefore := l.seq, l.prev
+
+	if err := l.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l.Log("remote_exec", nil, "allow", nil, 0) // write fails; must not advance
+	if l.seq != seqBefore || l.prev != prevBefore {
+		t.Fatalf("chain advanced past a failed write: seq %d->%d prev %q->%q",
+			seqBefore, l.seq, prevBefore, l.prev)
+	}
+	if l.Err() == nil {
+		t.Error("expected sticky write error")
+	}
+}

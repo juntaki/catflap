@@ -25,6 +25,40 @@ const MaxLine = 2 << 20
 // errFrameTooLarge aborts a connection the moment a frame exceeds MaxLine.
 var errFrameTooLarge = errors.New("frame too large")
 
+// errBadRequest flags a request whose fixed fields violate protocol bounds.
+// Args is exempt (validated per-tool downstream); Task/Secret/Tool are
+// bounded here because they land unbounded in audit records: without this,
+// a request with a huge Tool value can blow past the audit verifier's
+// per-line scan limit and grow the audit file without limit.
+var errBadRequest = errors.New("bad request")
+
+const (
+	maxTaskLen   = 64
+	maxSecretLen = 128
+	maxToolLen   = 64
+)
+
+// validate rejects Task/Secret/Tool values that can't be legitimate: Tool
+// is restricted to a plain identifier since it is echoed into audit
+// records verbatim, and Task/Secret are bounded to their expected shape.
+func (r Request) validate() error {
+	if len(r.Task) > maxTaskLen || len(r.Secret) > maxSecretLen || len(r.Tool) > maxToolLen {
+		return errBadRequest
+	}
+	for i := 0; i < len(r.Tool); i++ {
+		c := r.Tool[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '_' || c == '.':
+		default:
+			return errBadRequest
+		}
+	}
+	return nil
+}
+
 // Request is one gateway call. Task+Secret authenticate the task;
 // the Tailcat layer underneath authenticates the client identity.
 type Request struct {
@@ -52,9 +86,11 @@ type ExecArgs struct {
 }
 
 type ExecResult struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	ExitCode        int    `json:"exit_code"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
 }
 
 type ReadArgs struct {
@@ -158,6 +194,9 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 		return req, err
 	}
 	if err := json.Unmarshal(line, &req); err != nil {
+		return req, err
+	}
+	if err := req.validate(); err != nil {
 		return req, err
 	}
 	return req, nil

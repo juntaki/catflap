@@ -34,6 +34,39 @@ func TestReadFrameHugeWithoutNewline(t *testing.T) {
 	}
 }
 
+// TestReadRequestRejectsOversizedTool covers the P1 fix: an unbounded
+// Tool value lands verbatim in audit records, so a client bypassing MCP
+// could otherwise grow one audit line past the verifier's scan limit.
+func TestReadRequestRejectsOversizedTool(t *testing.T) {
+	req := Request{Task: "a", Tool: strings.Repeat("x", maxToolLen+1)}
+	raw, _ := json.Marshal(req)
+	raw = append(raw, '\n')
+	_, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+	if !errors.Is(err, errBadRequest) {
+		t.Errorf("oversized tool must be rejected, got %v", err)
+	}
+}
+
+func TestReadRequestRejectsNonIdentifierTool(t *testing.T) {
+	req := Request{Task: "a", Tool: "remote_exec; rm -rf /"}
+	raw, _ := json.Marshal(req)
+	raw = append(raw, '\n')
+	_, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+	if !errors.Is(err, errBadRequest) {
+		t.Errorf("non-identifier tool must be rejected, got %v", err)
+	}
+}
+
+func TestReadRequestAcceptsNormalTool(t *testing.T) {
+	req := Request{Task: "a", Secret: "s", Tool: ToolExec}
+	raw, _ := json.Marshal(req)
+	raw = append(raw, '\n')
+	got, err := ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+	if err != nil || got.Tool != ToolExec {
+		t.Errorf("normal tool must pass, got %v %+v", err, got)
+	}
+}
+
 func TestWriteRoundTrip(t *testing.T) {
 	raw := MustRaw(ExecResult{Stdout: "hi"})
 	var out ExecResult

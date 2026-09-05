@@ -310,21 +310,35 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: reason}
 	}
 	defer t.endOp()
+	var res rpc.Response
 	switch req.Tool {
 	case rpc.ToolExec:
-		return s.doExec(t, req)
+		res = s.doExec(t, req)
 	case rpc.ToolRead:
-		return s.doRead(t, req)
+		res = s.doRead(t, req)
 	case rpc.ToolStat:
-		return s.doStat(t, req)
+		res = s.doStat(t, req)
 	case rpc.ToolWrite:
-		return s.doWrite(t, req)
+		res = s.doWrite(t, req)
 	default:
 		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
+			// Unknown tools come from untrusted clients bypassing MCP, and
+			// req.Tool is bounded/ASCII-checked by rpc.Request.validate,
+			// but it is still arbitrary agent-chosen text; don't echo it
+			// into the audit record verbatim.
+			t.Audit.Log("unknown_tool", req.Args, "deny", nil, 0)
 		}
-		return rpc.Response{ID: req.ID, OK: false, Error: fmt.Sprintf("unknown tool %q", req.Tool)}
+		res = rpc.Response{ID: req.ID, OK: false, Error: fmt.Sprintf("unknown tool %q", req.Tool)}
 	}
+	// An audit sink failure is a security-relevant degradation, not a
+	// warning: continuing to grant access to a task whose actions can no
+	// longer be recorded defeats the audit trail's purpose. Stop async —
+	// synchronously here would deadlock on Stop's wg.Wait against this
+	// very op's deferred endOp.
+	if t.Audit != nil && t.Audit.Err() != nil {
+		go t.Stop("audit sink failed")
+	}
+	return res
 }
 
 func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
@@ -359,7 +373,12 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	stdout, stderr := boundedBuffer(lim.MaxStdoutBytes), boundedBuffer(lim.MaxStderrBytes)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	err := cmd.Run()
-	res := rpc.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := rpc.ExecResult{
+		Stdout:          stdout.String(),
+		Stderr:          stderr.String(),
+		StdoutTruncated: stdout.truncated,
+		StderrTruncated: stderr.truncated,
+	}
 	if err != nil {
 		// Task death outranks every other failure: an exec killed by
 		// termination must report its cause, never a normal result. The
