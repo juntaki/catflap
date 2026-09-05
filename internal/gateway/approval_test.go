@@ -267,6 +267,61 @@ func TestApprovalHashBindingWrite(t *testing.T) {
 	}
 }
 
+// TestApprovalWriteDeniesIfTaskDiedDuringApproval is the full-branch
+// merge-gate P1: an Approver's own select races the task's context
+// against the operator's answer (see TerminalApprover.Approve), so if
+// both become ready at the same instant — the task died AT THE SAME
+// MOMENT the operator answered — Go's select can pick either arm, and
+// checkApproval can return "" (approved) even though the task is
+// already dead. Unlike exec (cancelled via its own context, and
+// doExec already re-checks Context().Err() after Run() fails),
+// SafeFS.WriteFile takes no context and cannot be killed once
+// started — doWrite MUST re-verify the task is still alive itself
+// right after approval, or a task that died mid-prompt could still
+// land a real write after revoke/expiry/audit fail-closed already
+// tore it down.
+//
+// This fakeApprover simulates that exact coincidence deterministically
+// (no need to actually win a goroutine race): its decide callback
+// cancels the task's context directly (task.cancel, the same
+// primitive Stop uses internally to kill the task) and STILL returns
+// approved — modeling the case where the racy select happened to pick
+// the "answer" arm. This deliberately bypasses Task.Stop's own
+// drain/teardown machinery, which would otherwise self-deadlock: Stop
+// would try to wait for THIS call's own in-flight op (via beginOp's
+// wg) to finish, while this call is itself blocked inside Stop.
+// Cancelling the context is exactly the observable effect the new
+// guard in doWrite checks for, without dragging in that unrelated
+// deadlock.
+func TestApprovalWriteDeniesIfTaskDiedDuringApproval(t *testing.T) {
+	root := t.TempDir()
+	p := writePolicy(t, root, `
+      roots: ["`+root+`"]
+      max_file_size: 4096
+      create: true
+      overwrite: true
+      approval: once
+`)
+	s, task := testStoreWithPolicy(t, p, time.Minute)
+	ap := &fakeApprover{decide: func(ApprovalRequest) (bool, error) {
+		task.cancel(ErrTaskRevoked)
+		return true, nil
+	}}
+	task.SetApprover(ap)
+
+	path := root + "/died-during-approval.txt"
+	res := call(t, s, rpc.ToolWrite, rpc.WriteArgs{Path: path, Content: "v1"})
+	if res.OK {
+		t.Fatalf("write must be denied when the task died during its own approval, got %+v", res)
+	}
+	if !strings.Contains(res.Error, "revoked") {
+		t.Errorf("expected the task's actual termination cause in the error, got %q", res.Error)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("the file must not exist: the write must never have executed")
+	}
+}
+
 // TestApprovalHashBindingWriteUsesResolvedPath covers the codex-round-1
 // P1: the approval hash must bind to the absolute, filepath.Clean'd
 // path SafeFS actually opens, not to whatever unclean string the

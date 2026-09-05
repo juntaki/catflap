@@ -869,6 +869,23 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 		if denyMsg := t.checkApproval(normalizeWriteRequest(t.ID, absPath, []byte(args.Content)), approval); denyMsg != "" {
 			return deny(denyMsg)
 		}
+		// checkApproval's own select (in an Approver like TerminalApprover)
+		// races the task's context against the operator's answer — if
+		// both are ready at once (the task died AT THE SAME MOMENT the
+		// operator answered), Go's select can pick either arm, so a
+		// "" (approved) return here does not guarantee the task is
+		// still alive. SafeFS.WriteFile takes no context and cannot be
+		// killed once started, unlike exec (which is cancelled via its
+		// own context and already re-checks Context().Err() after
+		// Run() fails) — so a write is the one call in this file that
+		// MUST re-verify liveness itself, right here, or a task that
+		// died mid-approval could still land a real write after
+		// revoke/expiry/audit fail-closed already tore it down.
+		if err := t.Context().Err(); err != nil {
+			msg, decision := t.terminationCause()
+			t.auditLog(req.Tool, req.Args, decision, nil, time.Since(start))
+			return rpc.Response{ID: req.ID, OK: false, Error: msg}
+		}
 	}
 	created := !existsForWrite(fs, args.Path)
 	if err := fs.WriteFile(args.Path, []byte(args.Content), t.Policy.Tools.File.Write.Options()); err != nil {
