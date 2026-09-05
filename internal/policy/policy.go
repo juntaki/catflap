@@ -57,6 +57,32 @@ type ExecRule struct {
 	// for commands that cannot reach outside the task (echo, uname…);
 	// never use it for file-reading commands like cat.
 	Rest string
+	// Approval is never (default), once, or always. once/ always require
+	// a human approver at runtime; without one the call is denied.
+	Approval ApprovalMode
+}
+
+// ApprovalMode gates a rule behind operator approval.
+type ApprovalMode string
+
+const (
+	ApprovalNever  ApprovalMode = "never"
+	ApprovalOnce   ApprovalMode = "once"
+	ApprovalAlways ApprovalMode = "always"
+)
+
+// ParseApproval validates an approval value ("" means never).
+func ParseApproval(s string) (ApprovalMode, error) {
+	switch ApprovalMode(strings.TrimSpace(s)) {
+	case "", ApprovalNever:
+		return ApprovalNever, nil
+	case ApprovalOnce:
+		return ApprovalOnce, nil
+	case ApprovalAlways:
+		return ApprovalAlways, nil
+	default:
+		return "", fmt.Errorf("approval must be never|once|always, got %q", s)
+	}
 }
 
 // ArgMatcher matches a single argv element.
@@ -90,6 +116,9 @@ type WriteConfig struct {
 	Create      bool
 	Overwrite   bool
 	Atomic      bool
+	// Approval is never (default), once, or always. once/always require
+	// a human approver at runtime; without one the write is denied.
+	Approval ApprovalMode
 }
 
 // Options maps the grant to SafeFS write options.
@@ -327,9 +356,10 @@ func compileLimits(raw *rawLimits) (*Limits, error) {
 }
 
 type rawExecRule struct {
-	Command string `yaml:"command"`
-	Args    []any  `yaml:"args"`
-	Rest    string `yaml:"rest"`
+	Command  string `yaml:"command"`
+	Args     []any  `yaml:"args"`
+	Rest     string `yaml:"rest"`
+	Approval string `yaml:"approval"`
 }
 
 func (r rawExecRule) compile() (ExecRule, error) {
@@ -343,6 +373,11 @@ func (r rawExecRule) compile() (ExecRule, error) {
 	if rule.Rest != "" && rule.Rest != "any" {
 		return ExecRule{}, fmt.Errorf("rest must be \"any\" if set")
 	}
+	approval, err := ParseApproval(r.Approval)
+	if err != nil {
+		return ExecRule{}, err
+	}
+	rule.Approval = approval
 	for i, a := range r.Args {
 		m, err := compileMatcher(a)
 		if err != nil {
@@ -540,6 +575,16 @@ func parseWrite(v any) (*WriteConfig, error) {
 					return nil, fmt.Errorf("atomic must be a boolean")
 				}
 				wc.Atomic = b
+			case "approval":
+				s, ok := val.(string)
+				if !ok {
+					return nil, fmt.Errorf("approval must be a string")
+				}
+				mode, err := ParseApproval(s)
+				if err != nil {
+					return nil, err
+				}
+				wc.Approval = mode
 			default:
 				return nil, fmt.Errorf("unknown file.write key %q", key)
 			}
@@ -626,12 +671,14 @@ type canonicalWrite struct {
 	Create      bool     `json:"create,omitempty"`
 	Overwrite   bool     `json:"overwrite,omitempty"`
 	Atomic      bool     `json:"atomic,omitempty"`
+	Approval    string   `json:"approval,omitempty"`
 }
 
 type canonicalRule struct {
-	Command string             `json:"command"`
-	Args    []canonicalMatcher `json:"args,omitempty"`
-	Rest    string             `json:"rest,omitempty"`
+	Command  string             `json:"command"`
+	Args     []canonicalMatcher `json:"args,omitempty"`
+	Rest     string             `json:"rest,omitempty"`
+	Approval string             `json:"approval,omitempty"`
 }
 
 type canonicalMatcher struct {
@@ -659,7 +706,7 @@ func (p *Policy) Canonical() []byte {
 	}
 	if p.Tools.Exec != nil {
 		for _, r := range p.Tools.Exec.Allow {
-			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest)}
+			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest), Approval: string(r.Approval)}
 			for _, m := range r.Args {
 				cm := canonicalMatcher{Any: m.Any, Integer: m.Integer, Choice: m.Choice}
 				if m.Literal != nil {
@@ -682,6 +729,7 @@ func (p *Policy) Canonical() []byte {
 			cw := &canonicalWrite{
 				MaxFileSize: wc.MaxFileSize, Create: wc.Create,
 				Overwrite: wc.Overwrite, Atomic: wc.Atomic,
+				Approval: string(wc.Approval),
 			}
 			for _, root := range wc.Roots {
 				cw.Roots = append(cw.Roots, filepath.Clean(root))

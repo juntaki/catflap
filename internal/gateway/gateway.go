@@ -3,12 +3,15 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +22,123 @@ import (
 	"github.com/juntaki/catflap/internal/rpc"
 	"github.com/juntaki/catflap/internal/safefs"
 )
+
+// ApprovalRequest is one operator approval prompt. Hash is the scope
+// identity: approval covers exactly this normalized request, and any
+// mutation produces a different hash that is not covered.
+type ApprovalRequest struct {
+	TaskID     string
+	Tool       string
+	Summary    string
+	Detail     string
+	Normalized string
+	Hash       string
+}
+
+// Approver asks the operator to authorize one normalized request. It runs
+// in the serve process, fed by the operator's terminal — never by the
+// agent: the agent's only channel is MCP, which cannot answer prompts.
+// A nil Approver denies everything that requires approval (headless safe
+// default); headless automation uses approval:never-only policies.
+type Approver interface {
+	Approve(ctx context.Context, req ApprovalRequest) (bool, error)
+}
+
+// normalizeExecRequest builds the approval identity for one argv vector.
+// The preimage covers the RESOLVED executable path plus exact argv, so any
+// mutation — different binary, reordered flags, one changed character —
+// yields a different hash that no prior approval covers.
+func normalizeExecRequest(taskID, exe string, argv []string) ApprovalRequest {
+	var b strings.Builder
+	b.WriteString("exec\x00")
+	b.WriteString(exe)
+	for _, a := range argv {
+		b.WriteString("\x00")
+		b.WriteString(a)
+	}
+	normalized := b.String()
+	sum := sha256.Sum256([]byte(normalized))
+	display := "exec " + exe
+	if len(argv) > 0 {
+		display += " " + strings.Join(argv, " ")
+	}
+	return ApprovalRequest{
+		TaskID: taskID, Tool: rpc.ToolExec,
+		Summary:    truncateDisplay(display, 200),
+		Detail:     "command: " + exe + "\nargv: " + strings.Join(argv, " "),
+		Normalized: normalized,
+		Hash:       hex.EncodeToString(sum[:]),
+	}
+}
+
+// normalizeWriteRequest builds the approval identity for one file write.
+// The preimage covers the absolute path plus the content hash, so rewriting
+// different bytes to the same path is a different request.
+func normalizeWriteRequest(taskID, absPath string, content []byte) ApprovalRequest {
+	contentSum := sha256.Sum256(content)
+	contentHash := hex.EncodeToString(contentSum[:])
+	normalized := "write\x00" + absPath + "\x00" + contentHash
+	sum := sha256.Sum256([]byte(normalized))
+	preview := string(content)
+	if len(preview) > 500 {
+		preview = preview[:500] + "…(truncated)"
+	}
+	return ApprovalRequest{
+		TaskID: taskID, Tool: rpc.ToolWrite,
+		Summary:    fmt.Sprintf("write %s (%d bytes, sha256:%s…)", absPath, len(content), contentHash[:12]),
+		Detail:     fmt.Sprintf("path: %s\nsize: %d\nsha256: %s\npreview:\n%s", absPath, len(content), contentHash, preview),
+		Normalized: normalized,
+		Hash:       hex.EncodeToString(sum[:]),
+	}
+}
+
+func truncateDisplay(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// checkApproval enforces never/once/always for one normalized request.
+// "" means authorized, else the denial message. Requested/granted/
+// denied decisions are audited; static allows are audited by the caller.
+// Approvers MUST respect ctx (task death aborts the prompt); the prompt
+// holds one concurrency slot while waiting.
+func (t *Task) checkApproval(req ApprovalRequest, mode policy.ApprovalMode) string {
+	if mode == policy.ApprovalNever {
+		return ""
+	}
+	if mode == policy.ApprovalOnce && t.isApproved(req.Hash) {
+		return ""
+	}
+	if t.Audit != nil {
+		t.Audit.Log("approval", []byte(req.Normalized), "requested", nil, 0)
+	}
+	approver := t.getApprover()
+	if approver == nil {
+		if t.Audit != nil {
+			t.Audit.Log("approval", []byte(req.Normalized), "denied", nil, 0)
+		}
+		return "approval required by policy (no operator approver attached; run serve with --approval=terminal or use approval:never)"
+	}
+	ok, err := approver.Approve(t.Context(), req)
+	if err != nil || !ok {
+		if t.Audit != nil {
+			t.Audit.Log("approval", []byte(req.Normalized), "denied", nil, 0)
+		}
+		if err != nil {
+			return fmt.Sprintf("approval failed: %v", err)
+		}
+		return "approval denied by operator"
+	}
+	if t.Audit != nil {
+		t.Audit.Log("approval", []byte(req.Normalized), "granted", nil, 0)
+	}
+	if mode == policy.ApprovalOnce {
+		t.recordApproval(req.Hash)
+	}
+	return ""
+}
 
 // Task termination causes. Stop(reason) cancels the task context with the
 // matching cause so in-flight operations report *why* they died — and so
@@ -96,9 +216,46 @@ type Task struct {
 	// sem bounds concurrent operations per task (limits.max_concurrent_calls).
 	// Sized in InitContext; admission is non-blocking (fail fast on exhaustion).
 	sem chan struct{}
+	// approver answers operator approval prompts (nil = deny all gated
+	// calls). approved records once-scoped grants by normalized request
+	// hash; guarded by apMu.
+	approver Approver
+	apMu     sync.Mutex
+	approved map[string]bool
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
+}
+
+// SetApprover installs the operator approver for the task.
+func (t *Task) SetApprover(a Approver) {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	t.approver = a
+	if t.approved == nil {
+		t.approved = map[string]bool{}
+	}
+}
+
+func (t *Task) isApproved(hash string) bool {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	return t.approved[hash]
+}
+
+func (t *Task) recordApproval(hash string) {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	if t.approved == nil {
+		t.approved = map[string]bool{}
+	}
+	t.approved[hash] = true
+}
+
+func (t *Task) getApprover() Approver {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	return t.approver
 }
 
 // StateOf returns the current lifecycle state.

@@ -193,8 +193,7 @@ tools:
 	}
 }
 
-func TestWriteConfigParse(t *testing.T) {
-	p := mustParse(t, `
+func TestWriteConfigParse(t *testing.T) {	p := mustParse(t, `
 version: 1
 name: demo
 ttl: 15m
@@ -402,5 +401,75 @@ tools:
 	m := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 1048576\n")
 	if m.EffectiveLimits().MaxReadBytes != 1048576 {
 		t.Error("1MiB must be accepted")
+	}
+}
+
+func TestApprovalParse(t *testing.T) {
+	for _, mode := range []string{"never", "once", "always", ""} {
+		if _, err := ParseApproval(mode); err != nil {
+			t.Errorf("approval %q must parse: %v", mode, err)
+		}
+	}
+	if _, err := ParseApproval("sometimes"); err == nil {
+		t.Error("bad approval value must be rejected")
+	}
+	p := mustParse(t, `
+version: 1
+name: demo
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: echo
+        approval: always
+      - command: pwd
+  file:
+    read: ["./testdata"]
+    write:
+      roots: ["./testdata/work"]
+      max_file_size: 1024
+      create: true
+      approval: once
+`)
+	if p.Tools.Exec.Allow[0].Approval != ApprovalAlways {
+		t.Errorf("exec approval = %q, want always", p.Tools.Exec.Allow[0].Approval)
+	}
+	if p.Tools.Exec.Allow[1].Approval != ApprovalNever {
+		t.Errorf("default exec approval = %q, want never", p.Tools.Exec.Allow[1].Approval)
+	}
+	if p.Tools.File.Write.Approval != ApprovalOnce {
+		t.Errorf("write approval = %q, want once", p.Tools.File.Write.Approval)
+	}
+	// Unknown approval values fail closed (strict decode + validation).
+	for _, y := range []string{
+		"version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        approval: maybe\n",
+		"version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      approval: 42\n",
+	} {
+		if _, err := Parse([]byte(y)); err == nil {
+			t.Errorf("bad approval must be rejected: %q", y)
+		}
+	}
+	// Approval joins the canonical identity: identical policies differing
+	// only in approval must hash distinctly.
+	p2 := mustParse(t, `
+version: 1
+name: demo
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: echo
+        approval: never
+      - command: pwd
+  file:
+    read: ["./testdata"]
+    write:
+      roots: ["./testdata/work"]
+      max_file_size: 1024
+      create: true
+      approval: once
+`)
+	if p.CanonicalHash() == p2.CanonicalHash() {
+		t.Error("approval differences must hash distinctly")
 	}
 }
