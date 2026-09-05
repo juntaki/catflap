@@ -93,7 +93,7 @@ tools:
 		{"echo", make([]string, 65), false}, // too many args
 	}
 	for _, c := range cases {
-		_, got := p.MatchExec(c.cmd, c.argv)
+		_, _, got := p.MatchExec(c.cmd, c.argv)
 		if c.want && !got && !have(c.cmd) {
 			t.Logf("note: %s not installed here, shape-match untestable", c.cmd)
 			continue
@@ -114,7 +114,7 @@ tools:
     allow:
       - command: echo
 `)
-	exe1, ok := p.MatchExec("echo", nil)
+	exe1, _, ok := p.MatchExec("echo", nil)
 	if !ok || exe1 == "" {
 		t.Fatal("echo should match")
 	}
@@ -125,7 +125,7 @@ tools:
 		t.Log("note: /bin/echo absent here, skipping absolute-form check")
 		return
 	}
-	exe2, ok := p.MatchExec("/bin/echo", nil)
+	exe2, _, ok := p.MatchExec("/bin/echo", nil)
 	if !ok {
 		t.Fatal("absolute /bin/echo should match bare rule by base name")
 	}
@@ -289,13 +289,13 @@ tools:
 	if _, err := p.ReadFS().Stat("/etc/passwd"); err == nil {
 		t.Error("expected /etc/passwd denied")
 	}
-	if _, ok := p.MatchExec("echo", nil); !ok {
+	if _, _, ok := p.MatchExec("echo", nil); !ok {
 		t.Error("expected bare echo allowed")
 	}
-	if _, ok := p.MatchExec("echo", []string{"hello"}); ok {
+	if _, _, ok := p.MatchExec("echo", []string{"hello"}); ok {
 		t.Error("rule without args/rest must deny extra argv")
 	}
-	if _, ok := p.MatchExec("rm", []string{"-rf", "/"}); ok {
+	if _, _, ok := p.MatchExec("rm", []string{"-rf", "/"}); ok {
 		t.Error("expected rm denied")
 	}
 }

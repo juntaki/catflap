@@ -3,7 +3,9 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,9 +113,48 @@ type Task struct {
 	// sem bounds concurrent operations per task (limits.max_concurrent_calls).
 	// Sized in InitContext; admission is non-blocking (fail fast on exhaustion).
 	sem chan struct{}
+	// approver answers operator approval prompts for this task (nil =
+	// deny every gated call — the headless-safe default). approved
+	// records approval:once grants by normalized-request hash, scoped
+	// to this task alone: it is never consulted for, or shared with,
+	// any other task. Both guarded by apMu.
+	approver Approver
+	apMu     sync.Mutex
+	approved map[string]bool
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
+}
+
+// SetApprover installs the operator approver for this task. Called by
+// the serve loop before the task starts serving RPCs; nil (the zero
+// value) is a valid, deliberate "deny every gated call" default for
+// headless automation running approval:never-only policies.
+func (t *Task) SetApprover(a Approver) {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	t.approver = a
+}
+
+func (t *Task) getApprover() Approver {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	return t.approver
+}
+
+func (t *Task) isApproved(hash string) bool {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	return t.approved[hash]
+}
+
+func (t *Task) recordApproval(hash string) {
+	t.apMu.Lock()
+	defer t.apMu.Unlock()
+	if t.approved == nil {
+		t.approved = map[string]bool{}
+	}
+	t.approved[hash] = true
 }
 
 // StateOf returns the current lifecycle state.
@@ -327,6 +368,141 @@ func (t *Task) auditLog(tool string, args []byte, decision string, result []byte
 	}
 }
 
+// approvalTool is the audit tool name for approval decisions —
+// distinct from the operation's own tool name (remote_exec,
+// remote_write), so "was this call approved" and "did this call
+// succeed" are always two separate, individually-inspectable audit
+// lines, never conflated into one.
+const approvalTool = "approval"
+
+// ApprovalRequest is one operator approval prompt for a normalized
+// operation. Hash is the approval's scope: it covers exactly this
+// operation — the resolved executable plus exact argv for exec, or the
+// path plus a content hash for write — and any mutation (different
+// argv, different content, different path) produces a different hash
+// that no prior approval covers. Approval is an additional restriction
+// layered on top of policy: it can only narrow what an allowed rule
+// permits, never substitute for a policy-denied one.
+type ApprovalRequest struct {
+	TaskID     string
+	Tool       string
+	Summary    string
+	Detail     string
+	Normalized string
+	Hash       string
+}
+
+// Approver asks the operator to authorize one normalized request. It
+// runs in the serve process, driven by the operator's own terminal —
+// never by the agent: the agent's only channel is MCP/RPC, which has no
+// way to answer a prompt. A nil Approver denies everything that
+// requires approval; this is the deliberate headless-safe default —
+// headless automation must stick to approval:never-only policies.
+//
+// Implementations MUST respect ctx: it carries the task's own
+// cancellation (revoke/expiry/shutdown/audit-failure all cancel it, via
+// TryRequestStop) composed with a bounded prompt timeout, so a task
+// that dies while a prompt is pending, or an operator who never
+// answers, cannot hold this task's concurrency slot forever.
+type Approver interface {
+	Approve(ctx context.Context, req ApprovalRequest) (bool, error)
+}
+
+// approvalPromptTimeout bounds how long one pending approval can hold
+// this task's concurrency slot (the exec/write op is already admitted
+// via beginOp by the time checkApproval runs): an unresponsive operator
+// must not let one agent request starve every other in-flight operation
+// on the same task indefinitely.
+const approvalPromptTimeout = 5 * time.Minute
+
+// normalizeExecRequest builds the approval identity for one argv vector.
+// The preimage covers the RESOLVED executable path (what MatchExec
+// pinned, not the possibly-bare command the caller sent) plus the exact
+// argv, so a different binary, a reordered flag, or one changed
+// character all yield a different hash that no prior approval covers.
+func normalizeExecRequest(taskID, exe string, argv []string) ApprovalRequest {
+	var b strings.Builder
+	b.WriteString("exec\x00")
+	b.WriteString(exe)
+	for _, a := range argv {
+		b.WriteString("\x00")
+		b.WriteString(a)
+	}
+	normalized := b.String()
+	sum := sha256.Sum256([]byte(normalized))
+	display := "exec " + exe
+	if len(argv) > 0 {
+		display += " " + strings.Join(argv, " ")
+	}
+	return ApprovalRequest{
+		TaskID: taskID, Tool: rpc.ToolExec,
+		Summary:    display,
+		Detail:     "command: " + exe + "\nargv: " + strings.Join(argv, " "),
+		Normalized: normalized,
+		Hash:       hex.EncodeToString(sum[:]),
+	}
+}
+
+// normalizeWriteRequest builds the approval identity for one file
+// write. The preimage covers the request's path plus a hash of the
+// exact content bytes — not the content itself, so the approval
+// identity is fixed-size and never embeds untrusted bytes verbatim.
+// Rewriting different bytes to the same path is a different request.
+// Detail deliberately carries no raw content preview: whatever renders
+// this to a human (a future terminal approver) owns sanitizing it for
+// display, and not embedding it here means there's no raw-bytes field
+// to forget to sanitize later.
+func normalizeWriteRequest(taskID, path string, content []byte) ApprovalRequest {
+	contentSum := sha256.Sum256(content)
+	contentHash := hex.EncodeToString(contentSum[:])
+	normalized := "write\x00" + path + "\x00" + contentHash
+	sum := sha256.Sum256([]byte(normalized))
+	return ApprovalRequest{
+		TaskID: taskID, Tool: rpc.ToolWrite,
+		Summary:    fmt.Sprintf("write %s (%d bytes, sha256:%s…)", path, len(content), contentHash[:12]),
+		Detail:     fmt.Sprintf("path: %s\nsize: %d\nsha256: %s", path, len(content), contentHash),
+		Normalized: normalized,
+		Hash:       hex.EncodeToString(sum[:]),
+	}
+}
+
+// checkApproval enforces never/once/always for one normalized request.
+// "" means authorized; anything else is the denial message to return to
+// the caller. Every audit write here goes through auditLog, never a raw
+// Audit.Log call, so a sink failure while recording an approval
+// decision stops the task fail-closed exactly like every other audit
+// write in this package — an approval history that silently stopped
+// recording would defeat the point of auditing approvals at all.
+func (t *Task) checkApproval(req ApprovalRequest, mode policy.ApprovalMode) string {
+	if !mode.RequiresApproval() {
+		return ""
+	}
+	if mode == policy.ApprovalOnce && t.isApproved(req.Hash) {
+		return ""
+	}
+	t.auditLog(approvalTool, []byte(req.Normalized), "requested", nil, 0)
+	approver := t.getApprover()
+	if approver == nil {
+		t.auditLog(approvalTool, []byte(req.Normalized), "denied", nil, 0)
+		return "approval required by policy (no operator approver attached to this task; run serve/share with a terminal approver, or use approval:never)"
+	}
+	actx, cancel := context.WithTimeout(t.Context(), approvalPromptTimeout)
+	defer cancel()
+	ok, err := approver.Approve(actx, req)
+	if err != nil || !ok {
+		t.auditLog(approvalTool, []byte(req.Normalized), "denied", nil, 0)
+		if err != nil {
+			return fmt.Sprintf("approval failed: %v", err)
+		}
+		return "approval denied by operator"
+	}
+	t.auditLog(approvalTool, []byte(req.Normalized), "granted", nil, 0)
+	if mode == policy.ApprovalOnce {
+		t.recordApproval(req.Hash)
+	}
+	return ""
+}
+
 // Store holds live tasks. The zero value is ready.
 type Store struct {
 	mu    sync.RWMutex
@@ -514,10 +690,19 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 		t.auditLog(req.Tool, req.Args, "error", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad exec args"}
 	}
-	exe, ok := t.Policy.MatchExec(args.Command, args.Args)
+	exe, approval, ok := t.Policy.MatchExec(args.Command, args.Args)
 	if !ok {
 		t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
 		return rpc.Response{ID: req.ID, OK: false, Error: "command not allowed by policy"}
+	}
+	if approval.RequiresApproval() {
+		// checkApproval audits the requested/granted/denied decision
+		// itself; this deny is the exec call's OWN audit line, matching
+		// every other deny path in this function.
+		if denyMsg := t.checkApproval(normalizeExecRequest(t.ID, exe, args.Args), approval); denyMsg != "" {
+			t.auditLog(req.Tool, req.Args, "deny", nil, time.Since(start))
+			return rpc.Response{ID: req.ID, OK: false, Error: denyMsg}
+		}
 	}
 	lim := t.Policy.EffectiveLimits()
 	timeout := time.Duration(args.TimeoutMs) * time.Millisecond
@@ -670,6 +855,11 @@ func (s *Store) doWrite(t *Task, req rpc.Request) rpc.Response {
 	fs := t.Policy.WriteFS()
 	if fs == nil {
 		return deny("file write is not allowed by policy")
+	}
+	if approval := t.Policy.Tools.File.Write.Approval; approval.RequiresApproval() {
+		if denyMsg := t.checkApproval(normalizeWriteRequest(t.ID, args.Path, []byte(args.Content)), approval); denyMsg != "" {
+			return deny(denyMsg)
+		}
 	}
 	created := !existsForWrite(fs, args.Path)
 	if err := fs.WriteFile(args.Path, []byte(args.Content), t.Policy.Tools.File.Write.Options()); err != nil {

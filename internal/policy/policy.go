@@ -84,6 +84,19 @@ const (
 	ApprovalAlways ApprovalMode = "always"
 )
 
+// RequiresApproval reports whether mode gates the call at all. Treats
+// the zero value ("") as never, same as ParseApproval("") does — an
+// ExecRule/WriteConfig built as a Go struct literal (policy.Default(),
+// or any test fixture that doesn't go through YAML parsing) leaves
+// Approval as "" rather than the ApprovalNever constant, and "" ==
+// ApprovalNever is NOT true as Go string values. Callers gating on
+// approval MUST use this, never `mode != ApprovalNever` directly, or
+// every zero-value rule silently starts requiring approval it was
+// never configured to require.
+func (m ApprovalMode) RequiresApproval() bool {
+	return m == ApprovalOnce || m == ApprovalAlways
+}
+
 // ParseApproval validates an approval value ("" means never).
 func ParseApproval(s string) (ApprovalMode, error) {
 	switch ApprovalMode(strings.TrimSpace(s)) {
@@ -809,20 +822,24 @@ func (p *Policy) CanonicalHash() string {
 // MatchExec checks command+argv against the structured allowlist and returns
 // the pinned absolute executable path. No shell is ever involved, so
 // metacharacters in argv are inert.
-func (p *Policy) MatchExec(command string, argv []string) (string, bool) {
+// MatchExec resolves command+argv against the policy's exec allowlist.
+// ok reports whether it matched at all; approval reports the matched
+// rule's ApprovalMode (ApprovalNever if ok is false — meaningless then,
+// since there's nothing to gate).
+func (p *Policy) MatchExec(command string, argv []string) (exe string, approval ApprovalMode, ok bool) {
 	if p.Tools.Exec == nil {
-		return "", false
+		return "", ApprovalNever, false
 	}
 	command = strings.TrimSpace(command)
 	if command == "" || strings.ContainsAny(command, "\x00\n") {
-		return "", false
+		return "", ApprovalNever, false
 	}
 	if len(argv) > 64 {
-		return "", false
+		return "", ApprovalNever, false
 	}
 	for _, a := range argv {
 		if len(a) > 4096 {
-			return "", false
+			return "", ApprovalNever, false
 		}
 	}
 	for i := range p.Tools.Exec.Allow {
@@ -833,13 +850,13 @@ func (p *Policy) MatchExec(command string, argv []string) (string, bool) {
 		if !matchArgs(rule, argv) {
 			continue
 		}
-		exe, err := rule.resolve()
+		resolved, err := rule.resolve()
 		if err != nil {
 			continue // executable not present on this machine: deny
 		}
-		return exe, true
+		return resolved, rule.Approval, true
 	}
-	return "", false
+	return "", ApprovalNever, false
 }
 
 // sameExecutable compares the requested command to a rule's command by base
