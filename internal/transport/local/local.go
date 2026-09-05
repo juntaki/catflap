@@ -20,7 +20,7 @@ type client struct {
 }
 
 func Serve(handler transport.Handler) (transport.Server, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}

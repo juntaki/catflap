@@ -9,10 +9,12 @@ import (
 	"net"
 	"time"
 
-	"github.com/tailscale/tailcat"
-	"tailscale.com/types/key"
-	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/filter"
+	// Each tailscale import below carries the quarantine exception: this
+	// package IS the boundary. (Directives apply per import spec.)
+	"github.com/tailscale/tailcat"  //nolint:depguard // quarantine: tailcat API stays in this adapter.
+	"tailscale.com/types/key"       //nolint:depguard // quarantine: tailscale types stay in this adapter.
+	"tailscale.com/types/logger"    //nolint:depguard // quarantine: tailscale types stay in this adapter.
+	"tailscale.com/wgengine/filter" //nolint:depguard // quarantine: tailscale types stay in this adapter.
 
 	"github.com/juntaki/catflap/internal/transport"
 )

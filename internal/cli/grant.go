@@ -25,20 +25,20 @@ func Grant(args []string) int {
 	}
 	var req GrantRequest
 	if *policyPath != "" {
-		raw, err := os.ReadFile(*policyPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "grant: %v\n", err)
+		policyRaw, readErr := os.ReadFile(*policyPath)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "grant: %v\n", readErr)
 			return 1
 		}
-		req.PolicyYAML = string(raw)
+		req.PolicyYAML = string(policyRaw)
 	}
 	if *ttlFlag != "" {
-		d, err := time.ParseDuration(*ttlFlag)
-		if err != nil || d <= 0 {
+		ttlDur, ttlErr := time.ParseDuration(*ttlFlag)
+		if ttlErr != nil || ttlDur <= 0 {
 			fmt.Fprintf(os.Stderr, "invalid --ttl %q\n", *ttlFlag)
 			return 1
 		}
-		req.TTLOverrideMs = d.Milliseconds()
+		req.TTLOverrideMs = ttlDur.Milliseconds()
 	}
 	res, err := PostGrant(st.AdminAddr, st.AdminToken, req)
 	if err != nil {

@@ -1,0 +1,86 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+
+  enable:
+    # Core correctness
+    - govet
+    - staticcheck
+    - errcheck
+    - errorlint
+    - ineffassign
+    - unused
+
+    # Security / untrusted input
+    - gosec
+    - bidichk
+    - asciicheck
+    - forcetypeassert
+
+    # Error / nil handling
+    - nilerr
+    - nilnesserr
+    - errchkjson
+
+    # Context / resource lifecycle
+    - contextcheck
+    - noctx
+    - bodyclose
+    - durationcheck
+    - makezero
+
+    # DB adapters will use these later
+    - rowserrcheck
+    - sqlclosecheck
+
+    # Defensive maintenance
+    - exhaustive
+    - reassign
+    - gocheckcompilerdirectives
+    - gomoddirectives
+    - nolintlint
+
+    # Architecture boundary
+    - depguard
+
+  settings:
+    govet:
+      enable:
+        - shadow
+
+    gomoddirectives:
+      exclude-forbidden: true
+      ignore-forbidden: true
+      check-module-path: true
+
+    depguard:
+      rules:
+        tailcat-quarantine:
+          # Tailcat/Tailscale implementation details must stay in
+          # internal/transport/tailcat. The adapter package itself carries
+          # one reasoned //nolint at its import block; every other file
+          # importing these packages fails here.
+          deny:
+            - pkg: github.com/tailscale/tailcat
+              desc: Tailcat must only be imported by internal/transport/tailcat
+            - pkg: tailscale.com
+              desc: Tailscale implementation types must not leak outside the Tailcat transport adapter
+
+  exclusions:
+    generated: strict
+    warn-unused: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/juntaki/catflap

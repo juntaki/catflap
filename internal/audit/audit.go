@@ -46,6 +46,7 @@ func Open(dir, task, agentKey string) (*Logger, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, task+".jsonl")
+	//nolint:gosec // reason: path derives from the operator's --audit dir and the server-minted task id, never from agent input.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
@@ -85,9 +86,13 @@ func (l *Logger) Log(tool string, args []byte, decision string, result []byte, d
 		e.Task, e.Seq, e.Time, e.AgentKey, e.Tool, e.ArgsHash, e.Decision, e.ResultHash, e.DurationMs) + "|" + e.Prev))
 	l.prev = e.Hash
 	if l.f != nil {
-		raw, _ := json.Marshal(e)
-		raw = append(raw, '\n')
-		_, _ = l.f.Write(raw)
+		// Entry is strings/ints only and cannot fail to marshal; a
+		// failure must not advance the file past the in-memory chain,
+		// so skip the write rather than recording a partial entry.
+		if raw, merr := json.Marshal(e); merr == nil {
+			raw = append(raw, '\n')
+			_, _ = l.f.Write(raw)
+		}
 	}
 	return e
 }
@@ -115,7 +120,7 @@ func shortKey(k string) string {
 }
 
 func lastHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := readAuditFile(path)
 	if err != nil || len(data) == 0 {
 		return "", err
 	}
@@ -130,7 +135,7 @@ func lastHash(path string) (string, error) {
 }
 
 func lastSeq(path string) (int64, error) {
-	data, err := os.ReadFile(path)
+	data, err := readAuditFile(path)
 	if err != nil || len(data) == 0 {
 		return 0, err
 	}
@@ -142,6 +147,13 @@ func lastSeq(path string) (int64, error) {
 		}
 	}
 	return 0, nil
+}
+
+// readAuditFile reads back this process's own audit file for chain resume.
+// The path always originates from the operator's --audit dir (see Open).
+func readAuditFile(path string) ([]byte, error) {
+	//nolint:gosec // reason: operator-configured audit dir joined with a server-minted task id; never agent input.
+	return os.ReadFile(path)
 }
 
 func splitLines(data []byte) [][]byte {

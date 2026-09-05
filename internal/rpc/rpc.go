@@ -75,6 +75,7 @@ type StatResult struct {
 // WriteRequest writes one JSONL frame with a write deadline.
 func WriteRequest(c net.Conn, req Request) error {
 	_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	//nolint:gosec // reason: the secret travels here by design — it is the RPC half of the task credential, and the server (not the token) is authoritative for expiry/policy.
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -130,6 +131,12 @@ func ReadResponse(r *bufio.Reader) (Response, error) {
 }
 
 func MustRaw(v any) json.RawMessage {
-	raw, _ := json.Marshal(v)
+	// Callers pass marshal-safe gateway result structs. On the impossible
+	// failure, return a fixed error payload (a literal, so encoding itself
+	// cannot fail) rather than silently dropping the call.
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{"error":"result encoding failed"}`)
+	}
 	return raw
 }

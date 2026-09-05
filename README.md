@@ -46,16 +46,20 @@ CREATE (task id, ephemeral server+client keys, frozen policy, own address)
 
 - [x] 1 task = 1 Tailcat server (per-task key, PSK, address; expiry = Close)
 - [x] Endpoint↔task binding: a secret stolen from task B is useless at A's endpoint
-- [x] Expiry cancels in-flight execs, killing whole process trees (unix pgid);
-  ordered teardown: stop-accepting → cancel → bounded drain → terminal
-  `task.stop` audit event → server close → audit close
+- [x] Expiry cancels in-flight execs, killing whole process trees (unix pgid,
+  SIGKILL lands at cancel time via `Cmd.Cancel` — no reap window);
+  ordered teardown: stop-accepting → cancel(cause) → bounded drain →
+  terminal `task.stop` audit event → server close → audit close.
+  Kill reasons propagate (`expired`/`revoked`/`shutdown`), ready for
+  structured error codes.
 - [x] Structured argv exec — no shell anywhere (`;`, `&&`, `$()` are inert)
 - [x] Symlink/root-escape rejection on file tools
 - [x] Ephemeral capabilities (`agc1_…`), TTL, `serve` / `grant` / `mcp`
 - [x] `--cap-file` / `--out` flows: no symlinks, no silent overwrite
   (`--force`), atomic 0600 writes — tokens avoid argv and shell history
 - [x] Hash-chained JSONL audit incl. terminal lifecycle events
-- [x] CI: `go vet` + `go test` (+ `-race`) + `go build` on push/PR
+- [x] CI: golangci-lint (correctness/security/context/resource boundary,
+  Tailcat quarantine via depguard) + `go test -race` + `go build` + govulncheck
 - [ ] Human approval, network restrictions, specialized adapters (roadmap)
 
 ## Quickstart

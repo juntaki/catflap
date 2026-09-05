@@ -70,7 +70,7 @@ tools:
 		want bool
 	}{
 		{"echo", []string{"hello"}, true},
-		{"echo", []string{"a", "b", "c"}, true}, // rest:any
+		{"echo", []string{"a", "b", "c"}, true},  // rest:any
 		{"echo", []string{"hi; rm -rf /"}, true}, // single argv: inert without shell
 		{"echo", []string{"$(touch /tmp/x)"}, true},
 		{"journalctl", []string{"-u", "myapp", "-n", "50"}, true},
@@ -133,14 +133,14 @@ tools:
 func TestResolveReadSymlinkEscape(t *testing.T) {
 	base := "testdata/symlink-case"
 	_ = os.RemoveAll(base)
-	if err := os.MkdirAll(base+"/root/sub", 0o755); err != nil {
+	if err := os.MkdirAll(base+"/root/sub", 0o750); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
-	if err := os.WriteFile(base+"/root/sub/ok.txt", []byte("ok"), 0o644); err != nil {
+	if err := os.WriteFile(base+"/root/sub/ok.txt", []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(base+"/outside-secret.txt", []byte("secret"), 0o644); err != nil {
+	if err := os.WriteFile(base+"/outside-secret.txt", []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// root/outside -> parent dir (escape via intermediate symlink)

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -66,12 +67,12 @@ func Serve(args []string) int {
 		return 1
 	}
 	if *ttlFlag != "" {
-		d, err := time.ParseDuration(*ttlFlag)
-		if err != nil || d <= 0 {
+		ttlDur, ttlErr := time.ParseDuration(*ttlFlag)
+		if ttlErr != nil || ttlDur <= 0 {
 			fmt.Fprintf(os.Stderr, "invalid --ttl %q\n", *ttlFlag)
 			return 1
 		}
-		pol.TTL = d
+		pol.TTL = ttlDur
 	}
 
 	s := &server{
@@ -79,7 +80,12 @@ func Serve(args []string) int {
 		auditDir: *auditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
 	}
 
-	firstCap, firstTask, err := s.mkTask(pol, policyYAML)
+	// Root context for the process: every task context derives from it, so
+	// shutdown cancels any task that outlives its own teardown path.
+	ctx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSig()
+
+	firstCap, firstTask, err := s.mkTask(ctx, pol, policyYAML)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mint task: %v\n", err)
 		return 1
@@ -87,7 +93,7 @@ func Serve(args []string) int {
 
 	// Admin API for `grant`.
 	adminToken := randomToken()
-	ln, err := net.Listen("tcp", *adminAddr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *adminAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "admin listen: %v\n", err)
 		s.shutdown()
@@ -107,7 +113,7 @@ func Serve(args []string) int {
 		body, _ := io_ReadAll(r.Body, 1<<20)
 		_ = json.Unmarshal(body, &greq)
 		p := pol // default: same policy snapshot family
-		var pYAML []byte = policyYAML
+		pYAML := policyYAML
 		if greq.PolicyYAML != "" {
 			pp, err := policy.Parse([]byte(greq.PolicyYAML))
 			if err != nil {
@@ -125,7 +131,7 @@ func Serve(args []string) int {
 			}
 			p = &cp
 		}
-		cap, _, err := s.mkTask(p, pYAML)
+		cap, _, err := s.mkTask(ctx, p, pYAML)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -151,7 +157,15 @@ func Serve(args []string) int {
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	})
-	go func() { _ = http.Serve(ln, mux) }()
+	// Timeouts on the loopback admin API: no handler should hold a
+	// connection open indefinitely (G114).
+	adminSrv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
+	go func() { _ = adminSrv.Serve(ln) }()
 
 	st := StateFile{Transport: *transportFlag, AdminAddr: ln.Addr().String(), AdminToken: adminToken}
 	if err := writeState(*statePath, st); err != nil {
@@ -175,11 +189,9 @@ func Serve(args []string) int {
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s live for %s on its own address; Ctrl-C destroys all keys\n",
 		firstTask.ID, pol.TTL.Round(time.Second))
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	<-ctx.Done()
 	fmt.Fprintf(os.Stderr, "catflap serve: shutting down, destroying all task keys\n")
-	_ = ln.Close()
+	_ = adminSrv.Close()
 	_ = os.Remove(*statePath)
 	s.shutdown()
 	return 0
@@ -187,7 +199,7 @@ func Serve(args []string) int {
 
 // mkTask creates one task with its own ephemeral network server and arms
 // its expiry: timer → server.Close + audit.Close + store.Delete.
-func (s *server) mkTask(p *policy.Policy, pYAML []byte) (*capability.Capability, *gateway.Task, error) {
+func (s *server) mkTask(ctx context.Context, p *policy.Policy, pYAML []byte) (*capability.Capability, *gateway.Task, error) {
 	taskID := capability.NewTaskID()
 	secret := capability.NewSecret()
 	expires := time.Now().Add(p.TTL)
@@ -205,17 +217,20 @@ func (s *server) mkTask(p *policy.Policy, pYAML []byte) (*capability.Capability,
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
 	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, ExpiresAt: expires, Audit: alog, AgentKey: agentKey}
-	t.InitContext() // in-flight execs die with the task (C7)
+	t.InitContext(ctx) // in-flight execs die with the task (C7)
 	s.store.Add(t)
 
 	var srv transport.Server
-	if s.transport == "tailcat" {
+	switch s.transport {
+	case "tailcat":
 		// Bound handler: only this task authenticates at this endpoint,
 		// even with another task's valid secret.
+		//nolint:contextcheck // reason: request context here IS the task context, derived from the serve root in InitContext; passing the serve ctx alongside would shadow task-scoped cancellation.
 		srv, err = tct.Serve(s.store.HandlerFor(taskID), []string{agentKey}, s.verbose)
-	} else if s.transport == "local" {
+	case "local":
+		//nolint:contextcheck // reason: see above — task context governs the request path.
 		srv, err = local.Serve(s.store.HandlerFor(taskID))
-	} else {
+	default:
 		err = fmt.Errorf("unknown transport %q (tailcat|local)", s.transport)
 	}
 	if err != nil {
@@ -274,6 +289,7 @@ func loadPolicy(path string) (*policy.Policy, []byte, error) {
 	if path == "" {
 		return policy.Default(), []byte("# built-in default"), nil
 	}
+	//nolint:gosec // reason: path is the operator's --policy CLI flag, never agent input.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
@@ -286,7 +302,10 @@ func loadPolicy(path string) (*policy.Policy, []byte, error) {
 }
 
 func writeState(path string, st StateFile) error {
-	raw, _ := json.MarshalIndent(st, "", "  ")
+	raw, merr := json.MarshalIndent(st, "", "  ")
+	if merr != nil {
+		return merr
+	}
 	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
 		return err
 	}

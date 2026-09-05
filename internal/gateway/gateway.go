@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,27 @@ import (
 	"github.com/juntaki/catflap/internal/policy"
 	"github.com/juntaki/catflap/internal/rpc"
 )
+
+// Task termination causes. Stop(reason) cancels the task context with the
+// matching cause so in-flight operations report *why* they died — and so
+// the v0.2 structured error codes can key off the same values.
+var (
+	ErrTaskExpired  = errors.New("task expired")
+	ErrTaskRevoked  = errors.New("task revoked")
+	ErrTaskShutdown = errors.New("task shutdown")
+)
+
+// causeForReason maps a Stop reason to its cancellation cause.
+func causeForReason(reason string) error {
+	switch reason {
+	case "revoked":
+		return ErrTaskRevoked
+	case "shutdown":
+		return ErrTaskShutdown
+	default:
+		return ErrTaskExpired
+	}
+}
 
 // Task is one live ephemeral grant: policy snapshot + expiry + audit chain.
 // Stop tears the whole task down; expiry and shutdown both funnel through it.
@@ -35,7 +57,7 @@ type Task struct {
 	AgentKey  string
 
 	ctx      context.Context
-	cancel   context.CancelFunc
+	cancel   context.CancelCauseFunc
 	stopOnce sync.Once
 	// opMu + stopping + wg form the operation registry: Stop flips stopping
 	// (new ops fail), cancels the context (running ops die), then drains
@@ -48,11 +70,11 @@ type Task struct {
 	onStop func()
 }
 
-// InitContext arms the task's cancellation scope. Idempotent; safe to call
-// on zero-value-derived tasks used in tests.
-func (t *Task) InitContext() {
+// InitContext arms the task's cancellation scope under a non-nil parent
+// (the serve root context in production, Background in tests). Idempotent.
+func (t *Task) InitContext(parent context.Context) {
 	if t.ctx == nil {
-		t.ctx, t.cancel = context.WithCancel(context.Background())
+		t.ctx, t.cancel = context.WithCancelCause(parent)
 	}
 }
 
@@ -81,7 +103,7 @@ func (t *Task) Stop(reason string) {
 		t.stopping = true
 		t.opMu.Unlock()
 		if t.cancel != nil {
-			t.cancel() // kill running execs (whole trees) first
+			t.cancel(causeForReason(reason)) // kill running trees with cause
 		}
 		drained := make(chan struct{})
 		go func() { t.wg.Wait(); close(drained) }()
@@ -199,7 +221,7 @@ func (s *Store) HandlerFor(taskID string) func(net.Conn) {
 }
 
 func (s *Store) serveConn(conn net.Conn, boundTaskID string) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r := bufio.NewReaderSize(conn, 64<<10)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -212,10 +234,6 @@ func (s *Store) serveConn(conn net.Conn, boundTaskID string) {
 			return
 		}
 	}
-}
-
-func (s *Store) handle(req RequestAlias) ResponseAlias {
-	return s.handleRPC(req, "")
 }
 
 // handleRPC authenticates then dispatches one call with auditing.
@@ -284,28 +302,35 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	defer cancel()
 	// No shell, ever: argv goes straight to the pinned executable.
+	//nolint:gosec // reason: this is the allowlisted exec primitive itself — MatchExec pins a policy executable and argv shape, and no shell interprets anything.
 	cmd := exec.CommandContext(ctx, exe, args.Args...)
 	startDetached(cmd) // own process group: expiry kills the whole tree
 	// Narrow environment: no passthrough of caller env.
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "LC_ALL=C"}
-	stdout, stderr := boundedBuffer(256 << 10), boundedBuffer(64 << 10)
+	stdout, stderr := boundedBuffer(256<<10), boundedBuffer(64<<10)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	err := cmd.Run()
 	res := rpc.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		// Task death outranks every other failure: an exec killed by
-		// expiry must report expiry, never a normal result. The direct
-		// child is already dead via the cancelled context; reap the rest
-		// of the tree explicitly.
+		// termination must report its cause, never a normal result. The
+		// group SIGKILL already landed via cmd.Cancel at cancel time.
 		if t.Context().Err() != nil {
-			killTree(cmd.Process)
-			if t.Audit != nil {
-				t.Audit.Log(req.Tool, req.Args, "expired", nil, time.Since(start))
+			msg, decision := "capability expired", "expired"
+			switch {
+			case errors.Is(context.Cause(t.Context()), ErrTaskRevoked):
+				msg, decision = "task revoked", "revoked"
+			case errors.Is(context.Cause(t.Context()), ErrTaskShutdown):
+				msg, decision = "task shutdown", "shutdown"
 			}
-			return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
+			if t.Audit != nil {
+				t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
+			}
+			return rpc.Response{ID: req.ID, OK: false, Error: msg}
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			res.ExitCode = ee.ExitCode()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			res.ExitCode = exitErr.ExitCode()
 		} else {
 			res.ExitCode = 127
 			if ctx.Err() == context.DeadlineExceeded {
@@ -361,6 +386,7 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 	}
 	const maxRead = 1 << 20
 	// O_NOFOLLOW: the final component must not be a symlink at open time.
+	//nolint:gosec // reason: real passed ResolveRead — lexical containment plus Lstat/EvalSymlinks containment — immediately above.
 	f, err := os.OpenFile(real, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		if t.Audit != nil {
@@ -421,7 +447,7 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 	}
 	res := rpc.StatResult{
 		Name: info.Name(), Size: info.Size(),
-		Mode: info.Mode().String(),
+		Mode:    info.Mode().String(),
 		ModTime: info.ModTime().UTC().Format(time.RFC3339),
 		IsDir:   info.IsDir(),
 	}
@@ -436,8 +462,3 @@ func isStatError(err error) bool {
 	msg := err.Error()
 	return len(msg) >= 6 && msg[:6] == "stat: "
 }
-
-// RequestAlias / ResponseAlias keep the transport seam free of refactors:
-// gateway speaks rpc types directly.
-type RequestAlias = rpc.Request
-type ResponseAlias = rpc.Response

@@ -8,11 +8,23 @@ import (
 	"syscall"
 )
 
-// startDetached puts the child in its own process group so killTree can
-// terminate the whole tree (child + grandchildren), not just the direct
-// child that os/exec would signal on context cancellation.
+// startDetached puts the child in its own process group and arranges for
+// context cancellation to SIGKILL the whole group at that instant:
+//
+//	task cancel → SIGKILL process group → Run returns
+//
+// Killing at cancel time (rather than after Run returns) leaves no window
+// in which grandchildren can survive the task, and avoids signalling a
+// possibly recycled PID after the child has been reaped.
 func startDetached(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		killTree(cmd.Process)
+		return nil
+	}
 }
 
 // killTree SIGKILLs the child's process group, then the child itself.

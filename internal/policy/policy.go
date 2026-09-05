@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,7 +68,7 @@ type FilePolicy struct {
 	Read []string `yaml:"-"`
 	// RealRead holds best-effort symlink-resolved roots for containment
 	// checks after EvalSymlinks. Empty entry = fall back to lexical root.
-	RealRead []string `yaml:"-"`
+	RealRead   []string `yaml:"-"`
 	WriteRoots []string `yaml:"-"`
 }
 
@@ -102,6 +103,7 @@ func mustAbs(p string) string {
 
 // Load reads a YAML policy file.
 func Load(path string) (*Policy, error) {
+	//nolint:gosec // reason: path is the operator's --policy CLI flag, never agent input.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -118,8 +120,8 @@ func Parse(data []byte) (*Policy, error) {
 		TTL   string `yaml:"ttl"`
 		Tools struct {
 			Exec *struct {
-				Commands any            `yaml:"commands"`
-				Allow    []rawExecRule  `yaml:"allow"`
+				Commands any           `yaml:"commands"`
+				Allow    []rawExecRule `yaml:"allow"`
 			} `yaml:"exec"`
 			File rawFilePolicy `yaml:"file"`
 		} `yaml:"tools"`
@@ -275,7 +277,7 @@ func compileMatcher(a any) (ArgMatcher, error) {
 				if !ok || s == "" {
 					return ArgMatcher{}, fmt.Errorf("match takes a non-empty glob string")
 				}
-				if _, err := filepath.Match(s, ""); err != nil && err != filepath.ErrBadPattern {
+				if _, err := filepath.Match(s, ""); err != nil && !errors.Is(err, filepath.ErrBadPattern) {
 					return ArgMatcher{}, fmt.Errorf("bad glob %q", s)
 				}
 				return ArgMatcher{Glob: s, HasGlob: true}, nil
@@ -541,8 +543,8 @@ func (p *Policy) ResolveRead(path string) (string, error) {
 		if rr == "" || rr == "." {
 			rr = "."
 		}
-		rabs, err := filepath.Abs(rr)
-		if err != nil {
+		rabs, rootErr := filepath.Abs(rr)
+		if rootErr != nil {
 			continue
 		}
 		rabs = filepath.Clean(rabs)

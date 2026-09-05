@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +46,7 @@ func DefaultAuditDir() string {
 }
 
 func LoadState(path string) (*StateFile, error) {
+	//nolint:gosec // reason: operator's --state path (or $CATFLAP_STATE); never agent input.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read state %s: %w (is `serve` running?)", path, err)
@@ -58,8 +60,8 @@ func LoadState(path string) (*StateFile, error) {
 
 // GrantRequest asks the running server to mint a task.
 type GrantRequest struct {
-	PolicyYAML string `json:"policy_yaml,omitempty"`
-	TTLOverrideMs int64 `json:"ttl_override_ms,omitempty"`
+	PolicyYAML    string `json:"policy_yaml,omitempty"`
+	TTLOverrideMs int64  `json:"ttl_override_ms,omitempty"`
 }
 
 // GrantResponse carries the minted capability.
@@ -72,19 +74,23 @@ type GrantResponse struct {
 
 // PostGrant calls the admin API.
 func PostGrant(adminAddr, token string, req GrantRequest) (*GrantResponse, error) {
-	body, _ := json.Marshal(req)
-	httpReq, err := http.NewRequest("POST", "http://"+adminAddr+"/grant", bytes.NewReader(body))
+	body, merr := json.Marshal(req)
+	if merr != nil {
+		return nil, fmt.Errorf("encode grant request: %w", merr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "http://"+adminAddr+"/grant", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 30 * time.Second}
-	res, err := client.Do(httpReq)
+	res, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("grant request: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode != 200 {
 		return nil, fmt.Errorf("grant failed (%d): %s", res.StatusCode, string(raw))

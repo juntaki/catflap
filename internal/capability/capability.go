@@ -20,15 +20,15 @@ const Prefix = "agc1_"
 // and the task auth secret. The server is the source of truth for
 // expiry; the embedded ExpiresAt is a client-side hint for fast failure.
 type Capability struct {
-	Version     int       `json:"v"`
-	TaskID      string    `json:"task"`
-	Transport   string    `json:"transport"` // "tailcat" or "local"
-	Endpoint    string    `json:"endpoint"`  // tailcat addr, or host:port for local
-	ClientPriv  string    `json:"client_priv,omitempty"`
-	TaskSecret  string    `json:"task_secret"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	Policy      string    `json:"policy"`
-	PolicyHash  string    `json:"policy_hash,omitempty"`
+	Version    int       `json:"v"`
+	TaskID     string    `json:"task"`
+	Transport  string    `json:"transport"` // "tailcat" or "local"
+	Endpoint   string    `json:"endpoint"`  // tailcat addr, or host:port for local
+	ClientPriv string    `json:"client_priv,omitempty"`
+	TaskSecret string    `json:"task_secret"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Policy     string    `json:"policy"`
+	PolicyHash string    `json:"policy_hash,omitempty"`
 }
 
 // NewTaskID returns a task id like "agt_01K..." (random, unique).
@@ -52,8 +52,13 @@ func PolicyHashOf(data []byte) string {
 }
 
 // Encode serializes the capability to its bearer string form.
+// The payload is versioned strings/time only and cannot fail to marshal;
+// callers treat "" as unusable (Decode rejects it).
 func (c *Capability) Encode() string {
-	raw, _ := json.Marshal(c)
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return ""
+	}
 	return Prefix + base64.RawURLEncoding.EncodeToString(raw)
 }
 

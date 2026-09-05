@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,7 +24,6 @@ import (
 type Server struct {
 	cap    *capability.Capability
 	client transport.Client
-	outMu  chan struct{} // serialize stdout writes via mutex channel
 	mu     chan struct{}
 	id     int64
 	stdout *bufio.Writer
@@ -71,7 +71,7 @@ func ServeReader(capStr string, r io.Reader, verbose bool) error {
 			return err
 		}
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	// Fail fast: one dial to prove reachability before advertising tools.
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	conn, err := client.Dial(ctx)
@@ -79,7 +79,7 @@ func ServeReader(capStr string, r io.Reader, verbose bool) error {
 	if err != nil {
 		return fmt.Errorf("dial gateway: %w", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	s := &Server{cap: cap, client: client, stdout: bufio.NewWriter(os.Stdout)}
 	s.mu = make(chan struct{}, 1)
@@ -193,18 +193,18 @@ func (s *Server) callTool(id any, name string, args json.RawMessage) {
 		s.mcpToolError(id, fmt.Sprintf("dial gateway: %v", err))
 		return
 	}
-	defer conn.Close()
-	if err := rpc.WriteRequest(conn, rpc.Request{
+	defer func() { _ = conn.Close() }()
+	if werr := rpc.WriteRequest(conn, rpc.Request{
 		Task: s.cap.TaskID, Secret: s.cap.TaskSecret,
 		ID: callID, Tool: name, Args: args,
-	}); err != nil {
-		s.mcpToolError(id, fmt.Sprintf("send: %v", err))
+	}); werr != nil {
+		s.mcpToolError(id, fmt.Sprintf("send: %v", werr))
 		return
 	}
-	_ = conn.(interface{ SetReadDeadline(time.Time) error }).SetReadDeadline(time.Now().Add(150 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(150 * time.Second))
 	res, err := rpc.ReadResponse(bufio.NewReader(conn))
 	if err != nil {
-		if err == io.EOF || os.IsTimeout(err) {
+		if errors.Is(err, io.EOF) || os.IsTimeout(err) {
 			s.mcpToolError(id, fmt.Sprintf("gateway read: %v", err))
 			return
 		}
@@ -216,8 +216,15 @@ func (s *Server) callTool(id any, name string, args json.RawMessage) {
 		return
 	}
 	var v any
-	_ = json.Unmarshal(res.Result, &v)
-	pretty, _ := json.MarshalIndent(v, "", "  ")
+	if uerr := json.Unmarshal(res.Result, &v); uerr != nil {
+		s.mcpToolError(id, fmt.Sprintf("result decoding failed: %v", uerr))
+		return
+	}
+	pretty, merr := json.MarshalIndent(v, "", "  ")
+	if merr != nil {
+		s.mcpToolError(id, fmt.Sprintf("result encoding failed: %v", merr))
+		return
+	}
 	s.respond(id, map[string]any{
 		"content": []map[string]any{{"type": "text", "text": string(pretty)}},
 	}, nil)
@@ -233,7 +240,12 @@ func (s *Server) mcpToolError(id any, msg string) {
 func (s *Server) respond(id any, result any, _ error) {
 	<-s.mu
 	defer func() { s.mu <- struct{}{} }()
-	raw, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
+	// id/result round-tripped through JSON decode, so encoding cannot fail
+	// in practice; dropping the response on failure is fail-closed.
+	raw, merr := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
+	if merr != nil {
+		return
+	}
 	raw = append(raw, '\n')
 	_, _ = s.stdout.Write(raw)
 	_ = s.stdout.Flush()
@@ -242,10 +254,13 @@ func (s *Server) respond(id any, result any, _ error) {
 func (s *Server) respondErr(id any, code int, msg string) {
 	<-s.mu
 	defer func() { s.mu <- struct{}{} }()
-	raw, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: id, Error: &struct {
+	raw, merr := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: id, Error: &struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	}{Code: code, Message: msg}})
+	if merr != nil {
+		return
+	}
 	raw = append(raw, '\n')
 	_, _ = s.stdout.Write(raw)
 	_ = s.stdout.Flush()

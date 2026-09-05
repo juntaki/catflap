@@ -56,10 +56,10 @@ func testStoreWithPolicy(t *testing.T, p *policy.Policy, ttl time.Duration) (*St
 func call(t *testing.T, s *Store, tool string, args any) rpc.Response {
 	t.Helper()
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 	go s.Handler()(c2)
-	raw, _ := json.Marshal(args)
+	raw := mustJSON(t, args)
 	if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: tool, Args: raw}); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +68,15 @@ func call(t *testing.T, s *Store, tool string, args any) rpc.Response {
 		t.Fatal(err)
 	}
 	return res
+}
+
+func mustJSON(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func execResult(t *testing.T, res rpc.Response) rpc.ExecResult {
@@ -100,15 +109,15 @@ func TestExecAllowDeny(t *testing.T) {
 // escape must arrive as inert argv, never execute.
 func TestShellMetacharsInert(t *testing.T) {
 	s, _ := testStore(t, time.Minute)
-	pwnPath := "testdata/pwned-c0"
-	_ = os.Remove(pwnPath)
+	probePath := "testdata/probe-c0"
+	_ = os.Remove(probePath)
 	payloads := []string{
-		"hi; touch " + pwnPath,
-		"hi && touch " + pwnPath,
-		"hi | touch " + pwnPath,
-		"$(touch " + pwnPath + ")",
-		"`touch " + pwnPath + "`",
-		"hi\ntouch " + pwnPath,
+		"hi; touch " + probePath,
+		"hi && touch " + probePath,
+		"hi | touch " + probePath,
+		"$(touch " + probePath + ")",
+		"`touch " + probePath + "`",
+		"hi\ntouch " + probePath,
 	}
 	for _, p := range payloads {
 		res := call(t, s, rpc.ToolExec, rpc.ExecArgs{Command: "echo", Args: []string{p}})
@@ -117,8 +126,8 @@ func TestShellMetacharsInert(t *testing.T) {
 			t.Errorf("payload should echo literally, got %q", out.Stdout)
 		}
 	}
-	if _, err := os.Stat(pwnPath); !os.IsNotExist(err) {
-		_ = os.Remove(pwnPath)
+	if _, err := os.Stat(probePath); !os.IsNotExist(err) {
+		_ = os.Remove(probePath)
 		t.Fatal("shell escape executed: payload file was created")
 	}
 }
@@ -152,10 +161,10 @@ tools:
 func TestBadSecretAndExpiry(t *testing.T) {
 	s, task := testStore(t, time.Minute)
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 	go s.Handler()(c2)
-	raw, _ := json.Marshal(rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+	raw := mustJSON(t, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
 	_ = rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "wrong", ID: 1, Tool: rpc.ToolExec, Args: raw})
 	res, err := rpc.ReadResponse(bufio.NewReader(c1))
 	if err != nil {
@@ -181,7 +190,7 @@ func TestEndpointTaskBinding(t *testing.T) {
 		}
 		tk := &Task{ID: id, Secret: secret, Policy: policy.Default(),
 			ExpiresAt: time.Now().Add(time.Minute), Audit: alog}
-		tk.InitContext()
+		tk.InitContext(context.Background())
 		return tk
 	}
 	s := &Store{}
@@ -192,12 +201,12 @@ func TestEndpointTaskBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srvA.Close()
+	defer func() { _ = srvA.Close() }()
 	srvB, err := local.Serve(s.HandlerFor("agt_b"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srvB.Close()
+	defer func() { _ = srvB.Close() }()
 	taskA.OnStopFunc(func() { _ = srvA.Close() })
 	taskB.OnStopFunc(func() { _ = srvB.Close() })
 	defer taskA.Stop("shutdown")
@@ -215,8 +224,11 @@ func TestEndpointTaskBinding(t *testing.T) {
 	}
 	try := func(addr, taskID, secret string) rpc.Response {
 		c := dial(addr)
-		defer c.Close()
-		raw, _ := json.Marshal(rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+		defer func() { _ = c.Close() }()
+		raw, merr := json.Marshal(rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+		if merr != nil {
+			t.Fatal(merr)
+		}
 		if err := rpc.WriteRequest(c, rpc.Request{Task: taskID, Secret: secret, ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
 			t.Fatal(err)
 		}
@@ -265,7 +277,7 @@ tools:
 		t.Fatal(err)
 	}
 	s, task := testStoreWithPolicy(t, p, time.Minute)
-	task.InitContext()
+	task.InitContext(context.Background())
 
 	type outcome struct {
 		res rpc.Response
@@ -274,10 +286,10 @@ tools:
 	done := make(chan outcome, 1)
 	go func() {
 		c1, c2 := net.Pipe()
-		defer c1.Close()
-		defer c2.Close()
+		defer func() { _ = c1.Close() }()
+		defer func() { _ = c2.Close() }()
 		go s.Handler()(c2)
-		raw, _ := json.Marshal(rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
+		raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
 		if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
 			done <- outcome{err: err}
 			return
@@ -300,15 +312,73 @@ tools:
 		t.Errorf("exec survived Stop by %s (should die immediately)", elapsed)
 	}
 }
+
+// TestStopCauseReporting: the kill reason reaches the in-flight caller.
+// Expired → "capability expired"; revoked/shutdown carry their own message
+// so future revoke cannot masquerade as expiry.
+func TestStopCauseReporting(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("no /bin/sleep on this machine")
+	}
+	p, err := policy.Parse([]byte(`
+name: sleeper
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: /bin/sleep
+        args: [{ integer: { max: 60 } }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(reason, wantErr string) {
+		t.Helper()
+		s, task := testStoreWithPolicy(t, p, time.Minute)
+		task.InitContext(context.Background())
+		type outcome struct {
+			res rpc.Response
+			err error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			c1, c2 := net.Pipe()
+			defer func() { _ = c1.Close() }()
+			defer func() { _ = c2.Close() }()
+			go s.Handler()(c2)
+			raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
+			if werr := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); werr != nil {
+				done <- outcome{err: werr}
+				return
+			}
+			res, rerr := rpc.ReadResponse(bufio.NewReader(c1))
+			done <- outcome{res: res, err: rerr}
+		}()
+		time.Sleep(500 * time.Millisecond)
+		task.Stop(reason)
+		s.Delete(task.ID)
+		out := <-done
+		if out.err != nil {
+			t.Fatalf("rpc failed: %v", out.err)
+		}
+		if out.res.OK || out.res.Error != wantErr {
+			t.Errorf("Stop(%q): got %+v, want error %q", reason, out.res, wantErr)
+		}
+	}
+	run("expired", "capability expired")
+	run("revoked", "task revoked")
+	run("shutdown", "task shutdown")
+}
+
 func TestUnknownTask(t *testing.T) {
 	s, task := testStore(t, time.Minute)
 	task.Stop("shutdown")
 	s.Delete(task.ID)
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
 	go s.Handler()(c2)
-	raw, _ := json.Marshal(rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+	raw := mustJSON(t, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
 	_ = rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw})
 	res, err := rpc.ReadResponse(bufio.NewReader(c1))
 	if err != nil {
@@ -351,7 +421,7 @@ tools:
 		t.Fatal(err)
 	}
 	s, task := testStoreWithPolicy(t, p, time.Minute)
-	task.InitContext()
+	task.InitContext(context.Background())
 
 	type outcome struct {
 		res rpc.Response
@@ -360,11 +430,11 @@ tools:
 	done := make(chan outcome, 1)
 	go func() {
 		c1, c2 := net.Pipe()
-		defer c1.Close()
-		defer c2.Close()
+		defer func() { _ = c1.Close() }()
+		defer func() { _ = c2.Close() }()
 		go s.Handler()(c2)
 		// sh spawns a grandchild sleep; both must die on Stop.
-		raw, _ := json.Marshal(rpc.ExecArgs{
+		raw := mustJSON(t, rpc.ExecArgs{
 			Command: "/bin/sh", Args: []string{"-c", "sleep 45"}, TimeoutMs: 60000,
 		})
 		if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
@@ -376,10 +446,7 @@ tools:
 	}()
 	// Wait until the grandchild is observable, then stop the task.
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if procExists("sleep 45") {
-			break
-		}
+	for !procExists("sleep 45") {
 		if time.Now().After(deadline) {
 			t.Fatal("grandchild sleep never appeared")
 		}
@@ -408,7 +475,10 @@ tools:
 // procExists reports whether a process matching pattern exists, via pgrep.
 // Test-only helper (unix).
 func procExists(pattern string) bool {
-	cmd := exec.Command("pgrep", "-f", pattern)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	//nolint:gosec // reason: fixed test binary with a constant pattern; no agent input reaches exec here.
+	cmd := exec.CommandContext(ctx, "pgrep", "-f", pattern)
 	return cmd.Run() == nil
 }
 
@@ -416,11 +486,11 @@ func procExists(pattern string) bool {
 func TestSymlinkEscapeGate(t *testing.T) {
 	base := "testdata/symlink-gw"
 	_ = os.RemoveAll(base)
-	if err := os.MkdirAll(base+"/root", 0o755); err != nil {
+	if err := os.MkdirAll(base+"/root", 0o750); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
-	if err := os.WriteFile(base+"/secret.txt", []byte("secret"), 0o644); err != nil {
+	if err := os.WriteFile(base+"/secret.txt", []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("..", base+"/root/escape"); err != nil {
