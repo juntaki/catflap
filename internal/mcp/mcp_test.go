@@ -16,6 +16,7 @@ import (
 	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/policy"
 	"github.com/juntaki/catflap/internal/rpc"
+	"github.com/juntaki/catflap/internal/transport"
 	"github.com/juntaki/catflap/internal/transport/local"
 )
 
@@ -121,6 +122,35 @@ func liveLocalTask(t *testing.T, tools []string) (*capability.Capability, func()
 		Policy: "readonly-debug", Tools: tools,
 	}
 	return cp, func() { task.Stop("revoked") }
+}
+
+// liveLocalTaskWithServer is liveLocalTask but also returns the raw
+// transport server, for tests that need to simulate the endpoint itself
+// going unreachable (closing the listener), as distinct from the task
+// merely being stopped (which still answers with a normal deny/expired
+// response, not a dial failure).
+func liveLocalTaskWithServer(t *testing.T, tools []string) (*capability.Capability, *gateway.Task, transport.Server) {
+	t.Helper()
+	alog, err := audit.Open("", "agt_test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &gateway.Task{ID: "agt_test", Secret: "s3cret", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Hour), Audit: alog}
+	task.InitContext(context.Background())
+	store := &gateway.Store{}
+	store.Add(task)
+	task.TryActivate()
+	srv, err := local.Serve(store.HandlerFor(task.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := &capability.Capability{
+		Version: 1, TaskID: task.ID, Name: "calm-panda",
+		Transport: "local", Endpoint: srv.Addr(),
+		TaskSecret: task.Secret, ExpiresAt: task.ExpiresAt,
+		Policy: "readonly-debug", Tools: tools,
+	}
+	return cp, task, srv
 }
 
 // publishPairingCode seals cp behind a fresh pairing code on a throwaway
@@ -273,5 +303,161 @@ func TestServeUsesUnpairedToolsUntilCapGiven(t *testing.T) {
 	}
 	if status["paired"] != false {
 		t.Errorf("status = %v, want paired:false", status)
+	}
+}
+
+// pairServer builds a Server already paired against a live local task,
+// via the real pair flow (Mint/Seal/Publish/Fetch/pair tool) — not by
+// poking s.cap directly — so these tests exercise the same commit path
+// TestPairEndToEnd does.
+func pairServer(t *testing.T, tools []string) (*Server, *capability.Capability) {
+	t.Helper()
+	cp, _ := liveLocalTask(t, tools)
+	code, rendezvousURL := publishPairingCode(t, cp)
+	s := newServer(false)
+	s.rendezvousURL = rendezvousURL
+	res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("setup: pair failed: %+v", res.Content)
+	}
+	return s, cp
+}
+
+// TestDisconnectConfirmedRevokeClearsState covers disconnect's
+// confirmed-revoke path: the gateway answers revoke_self successfully,
+// so local pairing is discarded and every tool pairing added
+// (disconnect, remote_read) disappears again — only pair/status remain,
+// and a fresh pair call succeeds.
+func TestDisconnectConfirmedRevokeClearsState(t *testing.T) {
+	s, _ := pairServer(t, []string{rpc.ToolRead})
+	if !s.exposed(rpc.ToolRead) {
+		t.Fatal("setup: expected remote_read to be exposed after pairing")
+	}
+
+	res, err := s.handleDisconnect(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("disconnect against a live task must succeed: %+v", res.Content)
+	}
+	var body map[string]any
+	if uerr := json.Unmarshal([]byte(resultText(t, res)), &body); uerr != nil {
+		t.Fatal(uerr)
+	}
+	if body["disconnected"] != true || body["status"] != "revoked" {
+		t.Errorf("disconnect result = %v", body)
+	}
+
+	if cp, cl := s.snapshot(); cp != nil || cl != nil {
+		t.Error("local pairing state must be cleared after a confirmed disconnect")
+	}
+	if s.exposed(rpc.ToolRead) {
+		t.Error("granted tools must disappear after disconnect")
+	}
+
+	// A fresh pair must be possible again.
+	cp2, _ := liveLocalTask(t, []string{rpc.ToolStat})
+	code2, rendezvousURL2 := publishPairingCode(t, cp2)
+	s.rendezvousURL = rendezvousURL2
+	res2, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code2}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.IsError {
+		t.Errorf("re-pairing after disconnect must succeed: %+v", res2.Content)
+	}
+}
+
+// TestDisconnectAlreadyGoneClearsState covers the "already gone" branch:
+// the task was already stopped by something else (expiry, admin revoke)
+// before disconnect ever runs. The gateway is still reachable and
+// answers with a deny that specifically means "this task no longer
+// exists", not an arbitrary denial — disconnect must still treat that
+// as confirmed and clear local state, not leave the agent stuck thinking
+// it's paired with a task that can never respond again.
+func TestDisconnectAlreadyGoneClearsState(t *testing.T) {
+	cp, task, srv := liveLocalTaskWithServer(t, []string{rpc.ToolRead})
+	defer func() { _ = srv.Close() }()
+	code, rendezvousURL := publishPairingCode(t, cp)
+	s := newServer(false)
+	s.rendezvousURL = rendezvousURL
+	if res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code})); err != nil {
+		t.Fatal(err)
+	} else if res.IsError {
+		t.Fatalf("setup: pair failed: %+v", res.Content)
+	}
+
+	// Stop the task server-side (simulating an admin revoke or TTL
+	// expiry that landed first) without closing the transport: the
+	// gateway is still reachable and will deny with "task stopping",
+	// which means "already gone", not "network trouble".
+	task.Stop("revoked")
+
+	res, err := s.handleDisconnect(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("disconnect against an already-expired task must still confirm, got: %+v", res.Content)
+	}
+	var body map[string]any
+	if uerr := json.Unmarshal([]byte(resultText(t, res)), &body); uerr != nil {
+		t.Fatal(uerr)
+	}
+	if body["disconnected"] != true || body["status"] != "already gone" {
+		t.Errorf("disconnect result = %v, want status \"already gone\"", body)
+	}
+	if cp, cl := s.snapshot(); cp != nil || cl != nil {
+		t.Error("local pairing state must be cleared once the task is confirmed already gone")
+	}
+}
+
+// TestDisconnectAmbiguousKeepsState covers the core disconnect
+// contract: if the remote task can't be reached AT ALL (here: the
+// transport endpoint itself is gone, so the dial fails), disconnect
+// must NOT claim the task was revoked — it may still be fully live and
+// reachable a moment later — so local pairing state is kept.
+func TestDisconnectAmbiguousKeepsState(t *testing.T) {
+	s, _ := pairServer(t, []string{rpc.ToolRead})
+	cp, _ := s.snapshot()
+
+	// Simulate the endpoint becoming completely unreachable by swapping
+	// in a client that dials a definitely-closed port. Mutating
+	// s.cap.Endpoint alone wouldn't do it — s.client already captured
+	// its dial target when pairing committed.
+	s.mu.Lock()
+	oldClient := s.client
+	s.client = local.Dialer("127.0.0.1:1")
+	s.mu.Unlock()
+	_ = oldClient.Close()
+
+	res, err := s.handleDisconnect(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Error("disconnect must not report success when the task can't be reached at all")
+	}
+	if got, _ := s.snapshot(); got == nil || got.TaskID != cp.TaskID {
+		t.Error("local pairing state must be KEPT when the remote revoke can't be confirmed")
+	}
+	if !s.exposed(rpc.ToolRead) {
+		t.Error("granted tools must still be exposed: pairing was never actually torn down")
+	}
+}
+
+// TestDisconnectNotPaired covers disconnect's precondition check.
+func TestDisconnectNotPaired(t *testing.T) {
+	s := newServer(false)
+	res, err := s.handleDisconnect(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Error("disconnect with nothing paired must be an error")
 	}
 }

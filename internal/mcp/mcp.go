@@ -135,6 +135,11 @@ func (s *Server) commitPaired(cap *capability.Capability, client transport.Clien
 	s.client = client
 	s.pairing = false
 	s.mu.Unlock()
+	s.sdk.AddTool(&mcpsdk.Tool{
+		Name:        "disconnect",
+		Description: "Disconnect from the currently paired task: asks it to revoke itself, then forgets local pairing state once that's confirmed (either the revoke succeeded, or the task was already gone). If the remote task can't be reached at all, does NOT claim it was revoked — the task may still be live.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+	}, s.handleDisconnect)
 	for _, def := range toolDefs() {
 		name, _ := def["name"].(string)
 		if !s.exposed(name) {
@@ -147,6 +152,94 @@ func (s *Server) commitPaired(cap *capability.Capability, client transport.Clien
 			Description: desc,
 			InputSchema: schema,
 		}, s.handleTool(name))
+	}
+}
+
+// clearPaired forgets local pairing state and removes every tool that
+// pairing added (disconnect, plus whatever remote_* tools were granted).
+// Called only once a disconnect attempt is CONFIRMED — see
+// handleDisconnect — never on an ambiguous outcome.
+func (s *Server) clearPaired() {
+	s.mu.Lock()
+	client := s.client
+	s.cap = nil
+	s.client = nil
+	s.mu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+	names := []string{"disconnect"}
+	for _, def := range toolDefs() {
+		if name, _ := def["name"].(string); name != "" {
+			names = append(names, name)
+		}
+	}
+	s.sdk.RemoveTools(names...) // not an error to remove tools that were never added
+}
+
+// handleDisconnect implements the disconnect tool. Its outcome is
+// exactly one of three things, deliberately not collapsed into a
+// binary success/failure:
+//
+//   - CONFIRMED revoked (the gateway answered revoke_self successfully,
+//     or reported a reason that only makes sense for an already-dead
+//     task — expired, unknown task/secret, or already stopping): local
+//     pairing is discarded.
+//   - AMBIGUOUS (couldn't dial, couldn't send, couldn't read a
+//     response, or the gateway denied for some other reason): local
+//     pairing is KEPT. A network hiccup must never be reported as
+//     "revoked" — the task could still be fully live and reachable a
+//     moment later.
+func (s *Server) handleDisconnect(ctx context.Context, _ *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+	cap, client := s.snapshot()
+	if cap == nil || client == nil {
+		return toolError("not paired"), nil
+	}
+	confirmed, status, err := revokeSelf(ctx, client, cap)
+	if !confirmed {
+		msg := "remote revoke could not be confirmed; keeping local pairing"
+		if err != nil {
+			msg = fmt.Sprintf("%s (%v)", msg, err)
+		}
+		return toolError(msg), nil
+	}
+	s.clearPaired()
+	return textResult(map[string]any{"disconnected": true, "status": status})
+}
+
+// revokeSelf asks cap's task to revoke itself and classifies the
+// outcome as confirmed-gone or ambiguous. confirmed is true only when
+// the task is provably no longer usable under this capability, whether
+// this call caused that or it already was.
+func revokeSelf(ctx context.Context, client transport.Client, cap *capability.Capability) (confirmed bool, status string, err error) {
+	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, derr := client.Dial(dctx)
+	if derr != nil {
+		return false, "", fmt.Errorf("dial: %w", derr)
+	}
+	defer func() { _ = conn.Close() }()
+	if werr := rpc.WriteRequest(conn, rpc.Request{Task: cap.TaskID, Secret: cap.TaskSecret, ID: 1, Tool: rpc.ToolRevokeSelf}); werr != nil {
+		return false, "", fmt.Errorf("send: %w", werr)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	res, rerr := rpc.ReadResponse(bufio.NewReader(conn))
+	if rerr != nil {
+		return false, "", fmt.Errorf("read: %w", rerr)
+	}
+	if res.OK {
+		return true, "revoked", nil
+	}
+	// These are the only deny reasons that mean "already gone", not
+	// "denied but possibly still alive": handleRPC returns them for a
+	// task that has already expired, was deleted (unknown/bad secret —
+	// e.g. a previous disconnect's revoke landed but the response was
+	// lost), or is already mid-teardown for some other reason.
+	switch res.Error {
+	case "capability expired", "unknown task or bad secret", "task stopping":
+		return true, "already gone", nil
+	default:
+		return false, "", errors.New(res.Error)
 	}
 }
 
