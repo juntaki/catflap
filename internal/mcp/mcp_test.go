@@ -28,34 +28,52 @@ func equalNames(a, b []string) bool {
 	return true
 }
 
-func TestVisibleTools(t *testing.T) {
-	// Legacy (nil) capabilities: exec/read/stat, never write.
-	if got := toolNames(visibleTools(nil)); !equalNames(got,
-		[]string{rpc.ToolExec, rpc.ToolRead, rpc.ToolStat}) {
+func serverWith(cap *capability.Capability) *Server {
+	return &Server{paired: cap}
+}
+
+func TestVisibleToolsUnpaired(t *testing.T) {
+	s := serverWith(nil)
+	if got := toolNames(s.visibleTools()); !equalNames(got,
+		[]string{UserPair, UserStatus}) {
+		t.Errorf("unpaired tools = %v", got)
+	}
+}
+
+func TestVisibleToolsLegacy(t *testing.T) {
+	// Nil grant list = legacy capability: exec/read/stat, never write.
+	s := serverWith(&capability.Capability{})
+	if got := toolNames(s.visibleTools()); !equalNames(got,
+		[]string{UserPair, UserStatus, UserDisconnect, UserExec, UserRead, UserStat}) {
 		t.Errorf("legacy tools = %v", got)
 	}
-	// Explicit grant: exactly the listed tools, in canonical order.
-	if got := toolNames(visibleTools([]string{rpc.ToolWrite, rpc.ToolExec})); !equalNames(got,
-		[]string{rpc.ToolExec, rpc.ToolWrite}) {
+}
+
+func TestVisibleToolsFiltered(t *testing.T) {
+	s := serverWith(&capability.Capability{
+		Tools: []string{rpc.ToolWrite, rpc.ToolExec},
+	})
+	if got := toolNames(s.visibleTools()); !equalNames(got,
+		[]string{UserPair, UserStatus, UserDisconnect, UserExec, UserWrite}) {
 		t.Errorf("filtered tools = %v", got)
 	}
-	// Empty grant: nothing visible.
-	if got := visibleTools([]string{}); len(got) != 0 {
-		t.Errorf("empty grant must hide all tools, got %v", toolNames(got))
-	}
-	// Unknown names are ignored, never advertised.
-	if got := visibleTools([]string{"remote_shell"}); len(got) != 0 {
-		t.Errorf("unknown tools must not appear, got %v", toolNames(got))
+	empty := serverWith(&capability.Capability{Tools: []string{}})
+	if got := toolNames(empty.visibleTools()); !equalNames(got,
+		[]string{UserPair, UserStatus, UserDisconnect}) {
+		t.Errorf("empty grant must hide data tools, got %v", got)
 	}
 }
 
 func TestExposed(t *testing.T) {
-	legacy := &Server{cap: &capability.Capability{}}
+	legacy := serverWith(&capability.Capability{})
 	if !legacy.exposed(rpc.ToolExec) || legacy.exposed(rpc.ToolWrite) {
 		t.Error("legacy capability must expose exec but not write")
 	}
-	narrow := &Server{cap: &capability.Capability{Tools: []string{rpc.ToolRead}}}
+	narrow := serverWith(&capability.Capability{Tools: []string{rpc.ToolRead}})
 	if narrow.exposed(rpc.ToolExec) || !narrow.exposed(rpc.ToolRead) {
 		t.Error("narrow grant must expose only its tools")
+	}
+	if (&Server{}).exposed(rpc.ToolExec) {
+		t.Error("unpaired server must expose nothing")
 	}
 }

@@ -1,0 +1,3 @@
+catflap share: task agt_44ee0532be96da9f (patient-wren); Ctrl-C destroys all keys
+catflap serve: task agt_44ee0532be96da9f (patient-wren) live for 5m0s on its own address; Ctrl-C destroys all keys
+catflap serve: shutting down, destroying all task keys

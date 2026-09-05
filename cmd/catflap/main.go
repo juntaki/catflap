@@ -23,12 +23,20 @@ func run(args []string) int {
 		return 2
 	}
 	switch args[0] {
+	case "share":
+		return cli.Share(args[1:])
 	case "serve":
 		return cli.Serve(args[1:])
 	case "grant":
 		return cli.Grant(args[1:])
 	case "revoke":
 		return cli.Revoke(args[1:])
+	case "tasks":
+		return cli.Tasks(args[1:])
+	case "setup":
+		return cli.Setup(args[1:])
+	case "rendezvous":
+		return cli.Rendezvous(args[1:])
 	case "audit":
 		return cli.Audit(args[1:])
 	case "mcp":

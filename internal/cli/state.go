@@ -77,6 +77,43 @@ type RevokeRequest struct {
 	Task string `json:"task"`
 }
 
+// TaskListItem is one row of the admin task list.
+type TaskListItem struct {
+	Task    string `json:"task"`
+	Name    string `json:"name"`
+	Policy  string `json:"policy"`
+	Expires string `json:"expires_at"`
+	State   string `json:"state"`
+}
+
+// ListTasks calls the admin API to list live tasks.
+func ListTasks(adminAddr, token string) ([]TaskListItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", "http://"+adminAddr+"/tasks", nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("tasks request: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("tasks failed (%d): %s", res.StatusCode, string(raw))
+	}
+	var out []TaskListItem
+	if out == nil {
+		out = []TaskListItem{}
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parse tasks response: %w", err)
+	}
+	return out, nil
+}
+
 // RevokeResponse reports the outcome. Status is "revoked" or "unknown"
 // (already gone); both are idempotent success.
 type RevokeResponse struct {

@@ -1,0 +1,19 @@
+Catflap access ready.
+
+Pairing code:
+  CAT-6GF2-4UTV-MM6K-YPUX-4FZD-UR7V-Z3H2-SOVY-VDFQ
+
+Access:
+  readonly-debug
+
+Expires:
+  5m0s
+
+Read:
+  .
+
+Write:
+  disabled
+
+Network:
+  disabled

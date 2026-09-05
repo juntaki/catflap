@@ -21,6 +21,7 @@ const Prefix = "agc1_"
 type Capability struct {
 	Version    int       `json:"v"`
 	TaskID     string    `json:"task"`
+	Name       string    `json:"name,omitempty"`
 	Transport  string    `json:"transport"` // "tailcat" or "local"
 	Endpoint   string    `json:"endpoint"`  // tailcat addr, or host:port for local
 	ClientPriv string    `json:"client_priv,omitempty"`

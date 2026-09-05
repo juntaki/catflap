@@ -12,13 +12,14 @@ Claude Code / Codex / Cursor
           │  MCP stdio
           ▼
 ┌──────────────────────────────┐
-│ catflap mcp --cap-file t.cap │  agent-side adapter (ephemeral client key)
+│ catflap mcp (paired via      │  agent-side adapter (ephemeral client key)
+│ pair: code or pasted token)  │
 └──────────────┬───────────────┘
                │ Tailcat / WireGuard (no account, no root, userspace only)
                ▼
 ┌──────────────────────────────┐
 │ task A: own Tailcat server   │  server key A + PSK A + address A
-│  policy snapshot: lab-gpu   │  remote_exec / remote_read / remote_stat
+│  policy snapshot: lab-gpu   │  run_command / read_file / stat_file
 │  expires +15m → server.Close │
 └──────────────┬───────────────┘
                │  localhost/LAN
@@ -47,67 +48,101 @@ accept operations, and every termination path funnels through one ordered
 teardown (stop-accepting → cancel with cause → bounded drain → terminal
 `task.stop` audit event → server close → audit close).
 
-## Status: v0.1.2 (security semantics)
+## Status
 
 - [x] 1 task = 1 Tailcat server (per-task key, PSK, address; expiry = Close)
-- [x] Endpoint↔task binding: a secret stolen from task B is useless at A's endpoint
-- [x] Expiry cancels in-flight execs, killing whole process trees (unix pgid,
-  SIGKILL lands at cancel time via `Cmd.Cancel` — no reap window);
-  ordered teardown: stop-accepting → cancel(cause) → bounded drain →
-  terminal `task.stop` audit event → server close → audit close.
-  Kill reasons propagate (`expired`/`revoked`/`shutdown`), ready for
-  structured error codes.
-- [x] Structured argv exec — no shell anywhere (`;`, `&&`, `$()` are inert)
-- [x] Symlink/root-escape rejection on file tools
-- [x] Ephemeral capabilities (`agc1_…`), TTL, `serve` / `grant` / `mcp`
-- [x] `--cap-file` / `--out` flows: no symlinks, no silent overwrite
-  (`--force`), atomic 0600 writes — tokens avoid argv and shell history
-- [x] Hash-chained JSONL audit incl. terminal lifecycle events
-- [x] CI: golangci-lint (correctness/security/context/resource boundary,
-  Tailcat quarantine via depguard) + `go test -race` + `go build` + govulncheck
+- [x] Endpoint↔task binding, TTL cancels trees, ordered teardown
+- [x] Structured argv exec (no shell), SafeFS, `remote_write` split grant
+- [x] Policy schema v1 + canonical hash, limits, revoke, lifecycle states
+- [x] Audit schema v1, `audit verify`, head anchors
+- [x] Agent UX: `share` → pairing code → `pair` in normal Claude session
+- [x] Pairing rendezvous (one-time encrypted envelopes, rate-limited)
+- [x] CI: golangci-lint + `go test -race` + `go build` + govulncheck
 - [ ] Human approval, network restrictions, specialized adapters (roadmap)
 
-## Quickstart
+## Quickstart (golden path)
+
+On the machine you want Claude to access:
 
 ```bash
-go build -o bin/catflap ./cmd/catflap
-
-# 1. target: each task gets its OWN Tailcat address
-./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m \
-  --out ./task.cap
-# Task: agt_…
-# Capability: (written to ./task.cap)
-
-# 2. (optional) mint more tasks while serve runs — each a new address
-./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml \
-  --ttl 15m --out ./task2.cap
-
-# 2b. (optional) revoke a task early: same teardown as expiry —
-# in-flight ops cancelled, endpoint closed, secrets deleted (idempotent)
-./bin/catflap revoke --state <state-file> agt_…
-
-# 3. agent side: register as an MCP server (file, not argv)
-./bin/catflap mcp --cap-file ./task.cap
+go install github.com/juntaki/catflap/cmd/catflap@latest
+catflap share
 ```
 
-Claude Code (`claude mcp add`):
+```text
+Catflap access ready.
 
-```json
-{
-  "mcpServers": {
-    "target": {
-      "command": "/path/to/catflap",
-      "args": ["mcp", "--cap-file", "/home/you/.catflap/tasks/xxx.cap"]
-    }
-  }
-}
+Pairing code:
+  CAT-7KQ9-M2PV-…
+
+Access:
+  readonly-debug
+
+Expires:
+  15m
 ```
 
-After the TTL, the task's server is closed: handshakes fail and calls fail
-with `capability expired` (or `task revoked` / `task shutdown` when killed
-that way). The agent sees at most four tools: `remote_exec` (command +
-argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
-`file.write` grant — `remote_write`.
+One-time setup on your own machine, then never again:
+
+```bash
+catflap setup claude
+```
+
+Afterwards, just start Claude normally and give it the code:
+
+```text
+> Connect with Catflap. CAT-7KQ9-M2PV-…
+```
+
+The agent pairs over an ephemeral P2P connection, sees only the granted
+tools (`run_command`, `read_file`, `stat_file`), and the access disappears
+when the task expires or is revoked. Say `disconnect`, or run
+`catflap revoke <name>`, to kill it early.
+
+Manage tasks on the target:
+
+```bash
+catflap tasks
+# NAME              ACCESS           EXPIRES   STATE
+# calm-panda        readonly-debug   11m       active
+
+catflap revoke calm-panda
+catflap revoke --all
+```
+
+`share` profiles and shortcuts (all compile to Policy v1 — there is no
+second authorization implementation):
+
+```bash
+catflap share --profile workspace-edit
+catflap share --read /var/log/myapp --ttl 20m
+catflap share --write ./src --name investigate-prod
+```
+
+## Pairing security
+
+The short code carries a random id plus a random wrap key — never the task
+secret, which travels only inside the sealed envelope. Envelopes are
+XChaCha20-Poly1305 sealed, single-use (fetch burns), short-lived (default
+5 minutes, server-enforced), and the rendezvous sees ciphertext only. Ids
+are rate-limited per IP; pairing a revoked task fails closed at connect;
+every pair is audited on the target. The rendezvous relays introductions
+only — task traffic is always P2P over Tailcat.
+
+Without a rendezvous, `share` prints a paste-ready capability instead, and
+`pair` accepts pasted `agc1_…` tokens directly.
+
+## Advanced (automation)
+
+```bash
+catflap serve --policy p.yaml --ttl 15m --out task.cap  # raw gateway
+catflap grant --policy p.yaml --ttl 15m                 # extra tasks
+catflap mcp --cap-file task.cap                         # pre-paired adapter
+catflap mcp                                             # unpaired adapter
+catflap audit verify <task>.jsonl                       # chain check
+catflap audit anchor [--out anchor.log] <task>.jsonl    # head attestation
+catflap rendezvous --listen 127.0.0.1:8471              # pairing server
+```
 
 `--transport local` runs the same stack over loopback (tests, LAN demos).
 
@@ -298,7 +333,11 @@ v0.2-C SafeFS (dirfd walk, Linux openat2) ✓
 v0.2-D remote_write on SafeFS (read/write split, default deny) ✓
 v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tools/list ✓
 v0.2-F adversarial E2E (25 checks green), 0.2.0 ✓
-v0.3   human approval, audit verify + external anchor, specialized adapters
+v0.3-A audit schema v1, verify, anchors, task.create ✓
+UX agent path: share/profiles, pair/status/disconnect, renamed tools,
+rendezvous, setup claude, tasks, golden E2E ✓
+v0.3-B human approval (never/once/always)
+v0.4   specialized adapters: PostgreSQL, Docker, GPU, serial/robot
 ```
 
 ## License
