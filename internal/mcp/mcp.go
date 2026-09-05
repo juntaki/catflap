@@ -219,6 +219,16 @@ func revokeSelf(ctx context.Context, client transport.Client, cap *capability.Ca
 		return false, "", fmt.Errorf("dial: %w", derr)
 	}
 	defer func() { _ = conn.Close() }()
+	// rpc.WriteRequest/ReadResponse each carry their own fixed deadline
+	// (30s write, 15s read via SetReadDeadline below), but neither is
+	// tied to dctx: a caller-driven cancellation (e.g. the MCP request
+	// itself being cancelled) would otherwise still have to wait out
+	// those fixed windows before this returns. Force the connection
+	// closed the moment dctx expires or is cancelled, same as
+	// handleTool's stop := context.AfterFunc(...) — a write or read
+	// already in flight then fails immediately instead of blocking.
+	stop := context.AfterFunc(dctx, func() { _ = conn.Close() })
+	defer stop()
 	if werr := rpc.WriteRequest(conn, rpc.Request{Task: cap.TaskID, Secret: cap.TaskSecret, ID: 1, Tool: rpc.ToolRevokeSelf}); werr != nil {
 		return false, "", fmt.Errorf("send: %w", werr)
 	}
@@ -363,6 +373,11 @@ func pingGateway(ctx context.Context, client transport.Client, cap *capability.C
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
+	// Same reasoning as revokeSelf: force-close on dctx expiry/cancel so
+	// a write or read already in flight can't outlive the caller's
+	// cancellation.
+	stop := context.AfterFunc(dctx, func() { _ = conn.Close() })
+	defer stop()
 	if werr := rpc.WriteRequest(conn, rpc.Request{Task: cap.TaskID, Secret: cap.TaskSecret, ID: 1, Tool: rpc.ToolPing}); werr != nil {
 		return fmt.Errorf("send: %w", werr)
 	}

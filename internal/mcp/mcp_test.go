@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -459,5 +460,46 @@ func TestDisconnectNotPaired(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Error("disconnect with nothing paired must be an error")
+	}
+}
+
+// stubDialer is a transport.Client that always hands out the same
+// pre-built connection, for tests that need to control exactly what's on
+// the other end.
+type stubDialer struct{ conn net.Conn }
+
+func (d stubDialer) Dial(context.Context) (net.Conn, error) { return d.conn, nil }
+func (d stubDialer) Close() error                           { return nil }
+
+// TestRevokeSelfRespectsCallerCancellation covers the P1 codex's Phase 3
+// review caught: revokeSelf (and pingGateway, same fix) used to bound
+// only the dial and read with fixed internal deadlines (15s query
+// context, plus rpc.WriteRequest's own fixed 30s write deadline) with
+// nothing tying an in-flight write/read to the CALLER's context — so a
+// stalled write (peer accepted the connection but never reads) could
+// outlive a caller cancellation that arrives well before those fixed
+// windows elapse, delaying the ambiguous-outcome report. Both now force
+// the connection closed via context.AfterFunc the moment their internal
+// deadline (or an earlier caller cancellation) fires.
+func TestRevokeSelfRespectsCallerCancellation(t *testing.T) {
+	// net.Pipe is unbuffered and synchronous: a Write on c1 blocks until
+	// something reads c2, or c1/c2 is closed. Nothing here ever reads
+	// c2, simulating a peer that accepted the connection but stalled.
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close() }()
+	defer func() { _ = c2.Close() }()
+
+	cp := &capability.Capability{TaskID: "agt_test", TaskSecret: "s3cret"}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := revokeSelf(ctx, stubDialer{conn: c1}, cp)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error when the write stalls past the caller's context deadline")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("revokeSelf took %s to return after a 200ms context deadline — the stalled write outlived caller cancellation", elapsed)
 	}
 }
