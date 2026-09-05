@@ -298,6 +298,9 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 	s.live[taskID] = lt
 	s.mu.Unlock()
 	t.Activate() // ACTIVE only now: server, binding, audit, expiry all armed
+	// Creation event first in the chain, binding the canonical policy
+	// snapshot hash into the audit trail (args = canonical policy bytes).
+	t.Audit.Log("task.create", p.Canonical(), "active", nil, 0)
 
 	cap := &capability.Capability{
 		Version: 1, TaskID: taskID,

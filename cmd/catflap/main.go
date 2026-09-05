@@ -29,6 +29,8 @@ func run(args []string) int {
 		return cli.Grant(args[1:])
 	case "revoke":
 		return cli.Revoke(args[1:])
+	case "audit":
+		return cli.Audit(args[1:])
 	case "mcp":
 		return cli.MCP(args[1:])
 	case "version", "--version", "-V":

@@ -19,6 +19,23 @@ func dirOf(p string) string {
 	return d
 }
 
+// openAnchorLog opens an anchor log for appending: created 0600, never
+// following a symlink, never truncating.
+func openAnchorLog(path string) (*os.File, error) {
+	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
+		return nil, err
+	}
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlink anchor log %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	//nolint:gosec // reason: operator-supplied anchor path, append-only, 0600; symlinks rejected by Lstat above.
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+}
+
 // writeCapFile stores a bearer token so it never appears in argv/history.
 // Secure file semantics (§10):
 //

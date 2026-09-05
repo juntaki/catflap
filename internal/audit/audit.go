@@ -11,16 +11,26 @@ import (
 	"time"
 )
 
+// AuditVersion is the audit record schema version. Every record carries
+// it, and the chain hash covers it, so a version downgrade/upgrade inside
+// a file is detectable by verify.
+const AuditVersion = 1
+
+// Genesis is the expected Prev of the first record.
+const Genesis = "genesis"
+
 // Entry is one structured audit line. Prev chains to the previous entry's
-// hash, forming a tamper-evident hash chain per task.
+// hash, forming a hash-chained log per task. A hash chain alone is NOT
+// proof against whole-file replacement — see verify and external anchors.
 type Entry struct {
+	V          int    `json:"v"`
 	Task       string `json:"task"`
 	Seq        int64  `json:"seq"`
 	Time       string `json:"time"`
 	AgentKey   string `json:"agent_key,omitempty"`
 	Tool       string `json:"tool"`
 	ArgsHash   string `json:"args_hash"`
-	Decision   string `json:"decision"` // allow | deny | expired | error
+	Decision   string `json:"decision"` // allow | deny | expired | error | active | revoked | shutdown | requested | granted | denied
 	ResultHash string `json:"result_hash,omitempty"`
 	DurationMs int64  `json:"duration_ms"`
 	Prev       string `json:"prev"`
@@ -71,6 +81,7 @@ func (l *Logger) Log(tool string, args []byte, decision string, result []byte, d
 	defer l.mu.Unlock()
 	l.seq++
 	e := Entry{
+		V:          AuditVersion,
 		Task:       l.task,
 		Seq:        l.seq,
 		Time:       time.Now().UTC().Format(time.RFC3339Nano),
@@ -82,8 +93,7 @@ func (l *Logger) Log(tool string, args []byte, decision string, result []byte, d
 		DurationMs: dur.Milliseconds(),
 		Prev:       l.prev,
 	}
-	e.Hash = hashOf([]byte(fmt.Sprintf("%s|%d|%s|%s|%s|%s|%s|%s|%d",
-		e.Task, e.Seq, e.Time, e.AgentKey, e.Tool, e.ArgsHash, e.Decision, e.ResultHash, e.DurationMs) + "|" + e.Prev))
+	e.Hash = HashEntry(e)
 	l.prev = e.Hash
 	if l.f != nil {
 		// Entry is strings/ints only and cannot fail to marshal; a
@@ -102,6 +112,13 @@ func (l *Logger) Close() error {
 		return l.f.Close()
 	}
 	return nil
+}
+
+// HashEntry computes the chain hash of an entry. The schema version is
+// part of the preimage, so version tampering breaks the chain.
+func HashEntry(e Entry) string {
+	return hashOf([]byte(fmt.Sprintf("%d|%s|%d|%s|%s|%s|%s|%s|%s|%d",
+		e.V, e.Task, e.Seq, e.Time, e.AgentKey, e.Tool, e.ArgsHash, e.Decision, e.ResultHash, e.DurationMs) + "|" + e.Prev))
 }
 
 func hashOf(b []byte) string {
