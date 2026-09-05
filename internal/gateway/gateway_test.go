@@ -31,6 +31,7 @@ func testStore(t *testing.T, ttl time.Duration) (*Store, *Task) {
 		ExpiresAt: time.Now().Add(ttl),
 		Audit:     alog,
 	}
+	task.InitContext(context.Background())
 	s := &Store{}
 	s.Add(task)
 	task.Activate()
@@ -49,6 +50,7 @@ func testStoreWithPolicy(t *testing.T, p *policy.Policy, ttl time.Duration) (*St
 		ExpiresAt: time.Now().Add(ttl),
 		Audit:     alog,
 	}
+	task.InitContext(context.Background())
 	s := &Store{}
 	s.Add(task)
 	task.Activate()
@@ -393,7 +395,7 @@ func TestLifecycleStates(t *testing.T) {
 	if task.StateOf() != StateCreating {
 		t.Errorf("new task state = %s, want creating", task.StateOf())
 	}
-	if task.beginOp() {
+	if reason := task.beginOp(); reason == "" {
 		t.Error("creating task must reject operations")
 		task.endOp()
 	}
@@ -402,19 +404,77 @@ func TestLifecycleStates(t *testing.T) {
 	if task.StateOf() != StateActive {
 		t.Errorf("after Activate state = %s, want active", task.StateOf())
 	}
-	if !task.beginOp() {
-		t.Fatal("active task must accept operations")
+	if reason := task.beginOp(); reason != "" {
+		t.Fatalf("active task must accept operations: %s", reason)
 	}
 	task.endOp()
 	task.Stop("revoked")
 	if task.StateOf() != StateStopped {
 		t.Errorf("after Stop state = %s, want stopped", task.StateOf())
 	}
-	if task.beginOp() {
+	if reason := task.beginOp(); reason == "" {
 		t.Error("stopped task must reject operations")
 		task.endOp()
 	}
 	task.Stop("revoked") // idempotent: no panic, no second terminal event
+}
+
+// TestConcurrencyLimit: the second concurrent operation fails fast with a
+// limit error instead of queueing unboundedly.
+func TestConcurrencyLimit(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("no /bin/sleep on this machine")
+	}
+	p, err := policy.Parse([]byte(`
+version: 1
+name: limited
+ttl: 15m
+limits:
+  max_concurrent_calls: 1
+tools:
+  exec:
+    allow:
+      - command: /bin/sleep
+        args: [{ integer: { max: 60 } }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, task := testStoreWithPolicy(t, p, time.Minute)
+	defer task.Stop("shutdown")
+	defer s.Delete(task.ID)
+
+	first := make(chan rpc.Response, 1)
+	go func() {
+		c1, c2 := net.Pipe()
+		defer func() { _ = c1.Close() }()
+		defer func() { _ = c2.Close() }()
+		go s.Handler()(c2)
+		raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"5"}, TimeoutMs: 30000})
+		if werr := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); werr != nil {
+			t.Error(werr)
+			return
+		}
+		res, rerr := rpc.ReadResponse(bufio.NewReader(c1))
+		if rerr != nil {
+			t.Error(rerr)
+			return
+		}
+		first <- res
+	}()
+	time.Sleep(500 * time.Millisecond) // let sleep(5) occupy the single slot
+	res := call(t, s, rpc.ToolExec, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"1"}})
+	if res.OK || res.Error != "concurrency limit exceeded" {
+		t.Errorf("second concurrent op must fail fast, got %+v", res)
+	}
+	select {
+	case out := <-first:
+		if !out.OK {
+			t.Errorf("first op must succeed, got %+v", out)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("first op never finished")
+	}
 }
 
 func TestUnknownTask(t *testing.T) {

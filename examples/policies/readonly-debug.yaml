@@ -2,6 +2,13 @@ version: 1
 name: readonly-debug
 ttl: 15m
 
+limits:
+  max_concurrent_calls: 4
+  max_exec_duration: 60s
+  max_stdout_bytes: 262144
+  max_stderr_bytes: 65536
+  max_read_bytes: 1048576
+
 tools:
   exec:
     allow:

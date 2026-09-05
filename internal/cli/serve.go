@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -41,6 +42,9 @@ type server struct {
 	store     *gateway.Store
 	mu        sync.Mutex
 	live      map[string]*liveTask
+	// maxTasks bounds live tasks; exhaustion fails the grant, never an
+	// unbounded allocation (§18).
+	maxTasks int
 }
 
 // Serve runs the target gateway. Each task (the initial one and every
@@ -56,6 +60,7 @@ func Serve(args []string) int {
 	adminAddr := fs.String("admin", "127.0.0.1:0", "loopback admin API listen address")
 	outPath := fs.String("out", "", "write the initial capability to this file (0600) instead of stdout")
 	outForce := fs.Bool("force", false, "allow --out to overwrite an existing file")
+	maxTasks := fs.Int("max-tasks", 16, "maximum live tasks (grants beyond this fail)")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -78,6 +83,11 @@ func Serve(args []string) int {
 	s := &server{
 		transport: *transportFlag, verbose: *verbose,
 		auditDir: *auditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
+		maxTasks: *maxTasks,
+	}
+	if s.maxTasks < 1 {
+		fmt.Fprintf(os.Stderr, "invalid --max-tasks %d\n", s.maxTasks)
+		return 1
 	}
 
 	// Root context for the process: every task context derives from it, so
@@ -132,7 +142,11 @@ func Serve(args []string) int {
 		}
 		cap, _, err := s.mkTask(ctx, p)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			if errors.Is(err, errTooManyTasks) {
+				http.Error(w, err.Error(), http.StatusTooManyRequests)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 		_ = json.NewEncoder(w).Encode(GrantResponse{
@@ -224,9 +238,19 @@ func Serve(args []string) int {
 	return 0
 }
 
+// errTooManyTasks fails grants beyond --max-tasks. The admin handler maps
+// it to 429; anything else is a 500.
+var errTooManyTasks = errors.New("too many live tasks")
+
 // mkTask creates one task with its own ephemeral network server and arms
 // its expiry: timer → server.Close + audit.Close + store.Delete.
 func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capability, *gateway.Task, error) {
+	s.mu.Lock()
+	full := len(s.live) >= s.maxTasks
+	s.mu.Unlock()
+	if full {
+		return nil, nil, fmt.Errorf("%w (max %d)", errTooManyTasks, s.maxTasks)
+	}
 	taskID := capability.NewTaskID()
 	secret := capability.NewSecret()
 	expires := time.Now().Add(p.TTL)
@@ -283,8 +307,28 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		// Short prefix of the canonical policy hash: the task's exact
 		// authorization semantics, independent of YAML formatting.
 		PolicyHash: p.CanonicalHash()[:12],
+		Tools:      toolsForPolicy(p),
 	}
 	return cap, t, nil
+}
+
+// toolsForPolicy normalizes the policy into the MCP tool list the task
+// exposes. A task MUST NOT expose a tool its policy cannot authorize;
+// the gateway re-enforces every call regardless (list is a hint).
+func toolsForPolicy(p *policy.Policy) []string {
+	var out []string
+	if p.Tools.Exec != nil && len(p.Tools.Exec.Allow) > 0 {
+		out = append(out, "remote_exec")
+	}
+	if p.Tools.File != nil {
+		if len(p.Tools.File.Read) > 0 {
+			out = append(out, "remote_read", "remote_stat")
+		}
+		if p.Tools.File.Write != nil && len(p.Tools.File.Write.Roots) > 0 {
+			out = append(out, "remote_write")
+		}
+	}
+	return out
 }
 
 // takeLive removes a live task from the registry and returns it.

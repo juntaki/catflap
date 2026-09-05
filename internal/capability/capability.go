@@ -28,6 +28,9 @@ type Capability struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 	Policy     string    `json:"policy"`
 	PolicyHash string    `json:"policy_hash,omitempty"` // short prefix of the policy CanonicalHash
+	// Tools lists the MCP tools this task exposes (policy-normalized).
+	// Nil means a legacy capability: exec/read/stat, never write.
+	Tools []string `json:"tools,omitempty"`
 }
 
 // NewTaskID returns a task id like "agt_01K..." (random, unique).

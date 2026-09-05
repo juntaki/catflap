@@ -144,6 +144,26 @@ exact otherwise. Commands resolve via `PATH` at call time (operator's PATH,
 never the agent's) or as absolute paths. The v0.1 shell-string allowlist
 (`exec.commands`) is rejected at load: it cannot be made shell-safe.
 
+Resource bounds live in `limits:` and always apply — omitted fields take
+hard built-in defaults, never zero:
+
+```yaml
+limits:
+  max_concurrent_calls: 4   # per-task concurrent operations (fail fast)
+  max_exec_duration: 60s    # clamps per-call timeouts
+  max_stdout_bytes: 262144
+  max_stderr_bytes: 65536
+  max_read_bytes: 1048576
+```
+
+`serve` additionally caps live tasks (`--max-tasks`, default 16): further
+grants fail instead of allocating unboundedly.
+
+`tools/list` exposes only the tools the task's policy can authorize
+(`remote_exec` iff exec rules exist, `remote_read`/`remote_stat` iff read
+roots exist, `remote_write` iff a write grant exists); the gateway
+re-enforces every call regardless.
+
 File access is confined to roots **after** symlink resolution: final-component
 symlinks are denied, intermediate-symlink escapes (`root/outside -> /etc`)
 are denied, files open with `O_NOFOLLOW`. Anything else is denied **and**

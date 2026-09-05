@@ -120,7 +120,7 @@ func (s *Server) handle(req rpcRequest) {
 	case "ping":
 		s.respond(req.ID, map[string]any{}, nil)
 	case "tools/list":
-		s.respond(req.ID, map[string]any{"tools": toolDefs()}, nil)
+		s.respond(req.ID, map[string]any{"tools": visibleTools(s.cap.Tools)}, nil)
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
@@ -134,6 +134,44 @@ func (s *Server) handle(req rpcRequest) {
 	default:
 		s.respondErr(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}
+}
+
+// legacyTools is the tool set implied by a capability that predates the
+// tools field (v0.1.x): exec/read/stat, never write.
+var legacyTools = []string{rpc.ToolExec, rpc.ToolRead, rpc.ToolStat}
+
+// visibleTools filters the full tool definitions to the task's normalized
+// set. A nil capability list means a legacy capability.
+func visibleTools(granted []string) []map[string]any {
+	if granted == nil {
+		granted = legacyTools
+	}
+	allow := map[string]bool{}
+	for _, name := range granted {
+		allow[name] = true
+	}
+	var out []map[string]any
+	for _, def := range toolDefs() {
+		name, _ := def["name"].(string)
+		if allow[name] {
+			out = append(out, def)
+		}
+	}
+	return out
+}
+
+// exposed reports whether name is in the task's normalized tool set.
+func (s *Server) exposed(name string) bool {
+	granted := s.cap.Tools
+	if granted == nil {
+		granted = legacyTools
+	}
+	for _, n := range granted {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func toolDefs() []map[string]any {
@@ -185,8 +223,10 @@ func toolDefs() []map[string]any {
 }
 
 func (s *Server) callTool(id any, name string, args json.RawMessage) {
-	if name != rpc.ToolExec && name != rpc.ToolRead && name != rpc.ToolStat && name != rpc.ToolWrite {
-		s.respondErr(id, -32602, fmt.Sprintf("unknown tool %q", name))
+	// Normalized exposure: tools outside the task's grant fail here, and
+	// the gateway would deny them anyway (defense in depth).
+	if !s.exposed(name) {
+		s.mcpToolError(id, fmt.Sprintf("tool %q is not granted to this task", name))
 		return
 	}
 	if len(args) == 0 {

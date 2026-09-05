@@ -93,6 +93,9 @@ type Task struct {
 	opMu  sync.Mutex
 	state atomic.Int32 // State
 	wg    sync.WaitGroup
+	// sem bounds concurrent operations per task (limits.max_concurrent_calls).
+	// Sized in InitContext; admission is non-blocking (fail fast on exhaustion).
+	sem chan struct{}
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
@@ -107,10 +110,16 @@ func (t *Task) StateOf() State { return State(t.state.Load()) }
 func (t *Task) Activate() { t.state.Store(int32(StateActive)) }
 
 // InitContext arms the task's cancellation scope under a non-nil parent
-// (the serve root context in production, Background in tests). Idempotent.
+// (the serve root context in production, Background in tests) and sizes
+// the concurrency semaphore from the effective limits. Idempotent.
 func (t *Task) InitContext(parent context.Context) {
 	if t.ctx == nil {
 		t.ctx, t.cancel = context.WithCancelCause(parent)
+		n := t.Policy.EffectiveLimits().MaxConcurrentCalls
+		if n < 1 {
+			n = 1
+		}
+		t.sem = make(chan struct{}, n)
 	}
 }
 
@@ -160,19 +169,32 @@ func (t *Task) Stop(reason string) {
 	})
 }
 
-// beginOp registers an in-flight operation. False means the task is not
-// ACTIVE (creating, stopping, stopped) and the call MUST be rejected.
-func (t *Task) beginOp() bool {
+// beginOp registers an in-flight operation, enforcing the ACTIVE state and
+// the per-task concurrency bound. A non-empty return is the denial reason
+// ("task stopping" or "concurrency limit exceeded"); "" means admitted and
+// the caller MUST defer endOp.
+func (t *Task) beginOp() string {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
 	if State(t.state.Load()) != StateActive {
-		return false
+		return "task stopping"
+	}
+	if t.sem == nil {
+		return "task stopping"
+	}
+	select {
+	case t.sem <- struct{}{}:
+	default:
+		return "concurrency limit exceeded"
 	}
 	t.wg.Add(1)
-	return true
+	return ""
 }
 
-func (t *Task) endOp() { t.wg.Done() }
+func (t *Task) endOp() {
+	<-t.sem
+	t.wg.Done()
+}
 
 // Store holds live tasks. The zero value is ready.
 type Store struct {
@@ -297,8 +319,11 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
 	}
-	if !t.beginOp() {
-		return rpc.Response{ID: req.ID, OK: false, Error: "task stopping"}
+	if reason := t.beginOp(); reason != "" {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: reason}
 	}
 	defer t.endOp()
 	switch req.Tool {
@@ -331,12 +356,13 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "command not allowed by policy"}
 	}
+	lim := t.Policy.EffectiveLimits()
 	timeout := time.Duration(args.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	if timeout > 2*time.Minute {
-		timeout = 2 * time.Minute
+	if timeout > lim.MaxExecDuration {
+		timeout = lim.MaxExecDuration
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	defer cancel()
@@ -346,7 +372,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	startDetached(cmd) // own process group: expiry kills the whole tree
 	// Narrow environment: no passthrough of caller env.
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "LC_ALL=C"}
-	stdout, stderr := boundedBuffer(256<<10), boundedBuffer(64<<10)
+	stdout, stderr := boundedBuffer(lim.MaxStdoutBytes), boundedBuffer(lim.MaxStderrBytes)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	err := cmd.Run()
 	res := rpc.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
@@ -425,8 +451,7 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "stat: " + err.Error()}
 	}
-	const maxRead = 1 << 20
-	data, truncated, err := safefs.ReadAllCapped(f, maxRead)
+	data, truncated, err := safefs.ReadAllCapped(f, t.Policy.EffectiveLimits().MaxReadBytes)
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))

@@ -335,3 +335,59 @@ func TestCanonicalHashStable(t *testing.T) {
 		t.Error("different TTL must hash differently")
 	}
 }
+
+func TestLimitsParseAndDefaults(t *testing.T) {
+	p := mustParse(t, `
+version: 1
+name: demo
+ttl: 15m
+limits:
+  max_concurrent_calls: 2
+  max_exec_duration: 60s
+  max_stdout_bytes: 1024
+  max_stderr_bytes: 512
+  max_read_bytes: 2048
+tools:
+  exec:
+    allow:
+      - command: echo
+`)
+	lim := p.EffectiveLimits()
+	if lim.MaxConcurrentCalls != 2 || lim.MaxExecDuration != 60_000_000_000 ||
+		lim.MaxStdoutBytes != 1024 || lim.MaxStderrBytes != 512 || lim.MaxReadBytes != 2048 {
+		t.Errorf("bad effective limits: %+v", lim)
+	}
+
+	// Omitted limits take built-in defaults.
+	bare := mustParse(t, "version: 1\nname: x\nttl: 15m\n")
+	if bare.EffectiveLimits() != DefaultLimits() {
+		t.Errorf("omitted limits must equal defaults: %+v", bare.EffectiveLimits())
+	}
+	// Omitted vs explicit-defaults hash equal (same enforcement semantics).
+	explicit := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 4\n  max_exec_duration: 120s\n  max_stdout_bytes: 262144\n  max_stderr_bytes: 65536\n  max_read_bytes: 1048576\n")
+	if bare.CanonicalHash() != explicit.CanonicalHash() {
+		t.Error("omitted limits must hash like explicit defaults")
+	}
+	// Distinct limits hash distinctly.
+	other := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 1\n")
+	if bare.CanonicalHash() == other.CanonicalHash() {
+		t.Error("distinct limits must hash distinctly")
+	}
+
+	// Out-of-range limits fail closed.
+	for _, y := range []string{
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 0\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_concurrent_calls: 65\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_exec_duration: 500ms\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_exec_duration: 31m\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_exec_duration: soon\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 0\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 99999999\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: big\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  warp_drive: 9\n",
+	} {
+		if _, err := Parse([]byte(y)); err == nil {
+			t.Errorf("bad limits must be rejected: %q", y)
+		}
+	}
+}

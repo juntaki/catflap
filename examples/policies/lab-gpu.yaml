@@ -2,6 +2,10 @@ version: 1
 name: lab-gpu
 ttl: 30m
 
+limits:
+  max_concurrent_calls: 2
+  max_exec_duration: 120s
+
 tools:
   exec:
     allow:
@@ -21,6 +25,3 @@ tools:
       create: true
       overwrite: true
       atomic: true
-
-limits:
-  ttl: 30m

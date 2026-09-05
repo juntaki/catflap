@@ -30,9 +30,10 @@ const SchemaVersion = 1
 // shell anywhere in the execution path, so shell metacharacters in arguments
 // are inert data. File access goes through SafeFS (see ReadFS/WriteFS).
 type Policy struct {
-	Name  string        `yaml:"-"`
-	TTL   time.Duration `yaml:"-"`
-	Tools Tools         `yaml:"-"`
+	Name   string        `yaml:"-"`
+	TTL    time.Duration `yaml:"-"`
+	Tools  Tools         `yaml:"-"`
+	Limits *Limits       `yaml:"-"`
 }
 
 type Tools struct {
@@ -149,9 +150,7 @@ func Parse(data []byte) (*Policy, error) {
 			} `yaml:"exec"`
 			File rawFilePolicy `yaml:"file"`
 		} `yaml:"tools"`
-		Limits *struct {
-			TTL string `yaml:"ttl"`
-		} `yaml:"limits"`
+		Limits *rawLimits `yaml:"limits"`
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -163,9 +162,6 @@ func Parse(data []byte) (*Policy, error) {
 	}
 	if *raw.Version != SchemaVersion {
 		return nil, fmt.Errorf("unsupported policy version %d (expected %d)", *raw.Version, SchemaVersion)
-	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse policy: %w", err)
 	}
 	p := &Policy{Name: raw.Name}
 	ttlRaw := raw.TTL
@@ -181,6 +177,13 @@ func Parse(data []byte) (*Policy, error) {
 	}
 	if p.TTL == 0 {
 		p.TTL = 15 * time.Minute
+	}
+	if raw.Limits != nil {
+		lim, err := compileLimits(raw.Limits)
+		if err != nil {
+			return nil, err
+		}
+		p.Limits = lim
 	}
 	if raw.Tools.Exec != nil {
 		if raw.Tools.Exec.Commands != nil {
@@ -220,6 +223,104 @@ func Parse(data []byte) (*Policy, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+type rawLimits struct {
+	TTL string `yaml:"ttl"`
+	// All limits below are optional; omitted fields take hard built-in
+	// defaults (DefaultLimits), never zero.
+	MaxConcurrentCalls *int   `yaml:"max_concurrent_calls"`
+	MaxExecDuration    string `yaml:"max_exec_duration"`
+	MaxStdoutBytes     *int64 `yaml:"max_stdout_bytes"`
+	MaxStderrBytes     *int64 `yaml:"max_stderr_bytes"`
+	MaxReadBytes       *int64 `yaml:"max_read_bytes"`
+}
+
+// Limits bounds per-task resource use. Every field has a hard built-in
+// ceiling even when the policy omits it (see DefaultLimits).
+type Limits struct {
+	MaxConcurrentCalls int
+	MaxExecDuration    time.Duration
+	MaxStdoutBytes     int64
+	MaxStderrBytes     int64
+	MaxReadBytes       int64
+}
+
+// DefaultLimits returns the hard built-in bounds applied when the policy
+// omits a limit. Resource exhaustion fails the operation; allocation is
+// never unbounded.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxConcurrentCalls: 4,
+		MaxExecDuration:    2 * time.Minute,
+		MaxStdoutBytes:     256 << 10,
+		MaxStderrBytes:     64 << 10,
+		MaxReadBytes:       1 << 20,
+	}
+}
+
+// EffectiveLimits overlays the policy's limits on the built-in defaults.
+// Nil policy or nil Limits yields the defaults.
+func (p *Policy) EffectiveLimits() Limits {
+	lim := DefaultLimits()
+	if p == nil || p.Limits == nil {
+		return lim
+	}
+	l := p.Limits
+	if l.MaxConcurrentCalls > 0 {
+		lim.MaxConcurrentCalls = l.MaxConcurrentCalls
+	}
+	if l.MaxExecDuration > 0 {
+		lim.MaxExecDuration = l.MaxExecDuration
+	}
+	if l.MaxStdoutBytes > 0 {
+		lim.MaxStdoutBytes = l.MaxStdoutBytes
+	}
+	if l.MaxStderrBytes > 0 {
+		lim.MaxStderrBytes = l.MaxStderrBytes
+	}
+	if l.MaxReadBytes > 0 {
+		lim.MaxReadBytes = l.MaxReadBytes
+	}
+	return lim
+}
+
+// compileLimits validates a limits section. Every bound has a hard range;
+// omitted fields take built-in defaults at use time (EffectiveLimits).
+func compileLimits(raw *rawLimits) (*Limits, error) {
+	lim := &Limits{}
+	if raw.MaxConcurrentCalls != nil {
+		n := *raw.MaxConcurrentCalls
+		if n < 1 || n > 64 {
+			return nil, fmt.Errorf("limits.max_concurrent_calls must be within [1, 64]")
+		}
+		lim.MaxConcurrentCalls = n
+	}
+	if raw.MaxExecDuration != "" {
+		d, err := time.ParseDuration(raw.MaxExecDuration)
+		if err != nil || d < time.Second || d > 30*time.Minute {
+			return nil, fmt.Errorf("limits.max_exec_duration must be a duration within [1s, 30m]")
+		}
+		lim.MaxExecDuration = d
+	}
+	for _, field := range []struct {
+		name string
+		v    *int64
+		dst  *int64
+	}{
+		{"max_stdout_bytes", raw.MaxStdoutBytes, &lim.MaxStdoutBytes},
+		{"max_stderr_bytes", raw.MaxStderrBytes, &lim.MaxStderrBytes},
+		{"max_read_bytes", raw.MaxReadBytes, &lim.MaxReadBytes},
+	} {
+		if field.v == nil {
+			continue
+		}
+		if *field.v <= 0 || *field.v > 16<<20 {
+			return nil, fmt.Errorf("limits.%s must be within (0, 16MiB]", field.name)
+		}
+		*field.dst = *field.v
+	}
+	return lim, nil
 }
 
 type rawExecRule struct {
@@ -502,9 +603,18 @@ type canonicalPolicy struct {
 	Version int             `json:"version"`
 	Name    string          `json:"name"`
 	TTLns   int64           `json:"ttl_ns"`
+	Limits  canonicalLimits `json:"limits"`
 	Exec    []canonicalRule `json:"exec,omitempty"`
 	Read    []string        `json:"read,omitempty"`
 	Write   *canonicalWrite `json:"write,omitempty"`
+}
+
+type canonicalLimits struct {
+	MaxConcurrentCalls int   `json:"max_concurrent_calls"`
+	MaxExecDurationNs  int64 `json:"max_exec_duration_ns"`
+	MaxStdoutBytes     int64 `json:"max_stdout_bytes"`
+	MaxStderrBytes     int64 `json:"max_stderr_bytes"`
+	MaxReadBytes       int64 `json:"max_read_bytes"`
 }
 
 type canonicalWrite struct {
@@ -533,7 +643,17 @@ type canonicalMatcher struct {
 // authorization semantics: cleaned roots, compiled-equivalent matchers,
 // TTL in nanoseconds. Formatting-independent by construction.
 func (p *Policy) Canonical() []byte {
-	cp := canonicalPolicy{Version: SchemaVersion, Name: p.Name, TTLns: int64(p.TTL)}
+	lim := p.EffectiveLimits()
+	cp := canonicalPolicy{
+		Version: SchemaVersion, Name: p.Name, TTLns: int64(p.TTL),
+		Limits: canonicalLimits{
+			MaxConcurrentCalls: lim.MaxConcurrentCalls,
+			MaxExecDurationNs:  int64(lim.MaxExecDuration),
+			MaxStdoutBytes:     lim.MaxStdoutBytes,
+			MaxStderrBytes:     lim.MaxStderrBytes,
+			MaxReadBytes:       lim.MaxReadBytes,
+		},
+	}
 	if p.Tools.Exec != nil {
 		for _, r := range p.Tools.Exec.Allow {
 			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest)}
