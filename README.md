@@ -296,7 +296,8 @@ v0.2-A policy schema v1 (version required, strict decode, canonical hash) ✓
 v0.2-B revoke + lifecycle CREATING/ACTIVE/STOPPING/STOPPED ✓
 v0.2-C SafeFS (dirfd walk, Linux openat2) ✓
 v0.2-D remote_write on SafeFS (read/write split, default deny) ✓
-v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tools/list
+v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tools/list ✓
+v0.2-F adversarial E2E (25 checks green), 0.2.0 ✓
 v0.3   human approval, audit verify + external anchor, specialized adapters
 ```
 

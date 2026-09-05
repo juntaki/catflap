@@ -12,6 +12,13 @@ testdata/e2e/mcptest.err
 testdata/e2e/state.json
 testdata/e2e/audit/
 testdata/e2e/work/n.txt
+testdata/e2e/work/adv.txt
+testdata/e2e/work/big.txt
+testdata/e2e/work/dbg.txt
+testdata/e2e/adv-state.json
+testdata/e2e/adv.cap
+testdata/e2e/adv-audit/
+testdata/e2e/work/n.txt
 testdata/e2e/w.cap
 testdata/e2e/wserve.out
 testdata/e2e/wserve.err

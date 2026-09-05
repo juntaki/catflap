@@ -115,7 +115,7 @@ func (s *Server) handle(req rpcRequest) {
 		s.respond(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "catflap", "version": "0.1.2"},
+			"serverInfo":      map[string]any{"name": "catflap", "version": "0.2.0"},
 		}, nil)
 	case "ping":
 		s.respond(req.ID, map[string]any{}, nil)
