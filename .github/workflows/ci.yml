@@ -59,7 +59,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - run: go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./...
+      - name: deadcode
+        # deadcode prints unreachable funcs but always exits 0:
+        # fail the job when it reports anything.
+        run: |
+          out="$(go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./...)"
+          if [ -n "$out" ]; then
+            printf '%s\n' "$out"
+            exit 1
+          fi
 
   e2e:
     runs-on: ubuntu-latest

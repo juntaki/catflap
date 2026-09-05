@@ -176,10 +176,10 @@ func atomicReplace(f *FS, rootIdx int, comps []string, data []byte, mode uint32,
 			}
 			return fmt.Errorf("link: %w", err)
 		}
-		if err := unlinkAt(dirFd, tmpName); err != nil {
-			return fmt.Errorf("temp cleanup: %w", err)
-		}
+		// Published: the operation succeeds from here. Temp cleanup is
+		// best-effort housekeeping and must not fail the call.
 		failed = false
+		_ = unlinkAt(dirFd, tmpName)
 		return nil
 	}
 	if err := unix.Renameat(dirFd, tmpName, dirFd, base); err != nil {

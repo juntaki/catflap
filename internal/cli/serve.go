@@ -388,12 +388,14 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 // commit registers a reserved task: live entry, Activate, and timer arming
 // happen under one lock, in that order, and refuse work racing shutdown.
 // Activate is CAS (Creating→Active only): a task that already left Creating
-// can never be reactivated.
+// can never be reactivated. A task whose context already died (shutdown
+// cancel won the lock race) is refused too: no capability is ever emitted
+// from a cancelled parent.
 func (s *server) commit(taskID string, t *gateway.Task, srv transport.Server) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending--
-	if s.closing {
+	if s.closing || t.Context().Err() != nil {
 		_ = srv.Close()
 		return errShuttingDown
 	}
