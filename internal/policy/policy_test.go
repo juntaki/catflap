@@ -18,6 +18,7 @@ func mustParse(t *testing.T, y string) *Policy {
 
 func TestLegacyCommandsRejected(t *testing.T) {
 	_, err := Parse([]byte(`
+version: 1
 name: old
 ttl: 15m
 tools:
@@ -43,6 +44,7 @@ func have(cmd string) bool {
 
 func TestStructuredExec(t *testing.T) {
 	p := mustParse(t, `
+version: 1
 name: demo
 ttl: 15m
 tools:
@@ -103,6 +105,7 @@ tools:
 
 func TestExecutablePinning(t *testing.T) {
 	p := mustParse(t, `
+version: 1
 name: demo
 ttl: 15m
 tools:
@@ -153,6 +156,7 @@ func TestResolveReadSymlinkEscape(t *testing.T) {
 	}
 
 	p := mustParse(t, `
+version: 1
 name: demo
 ttl: 15m
 tools:
@@ -179,6 +183,7 @@ tools:
 
 func TestParseNestedRoots(t *testing.T) {
 	p := mustParse(t, `
+version: 1
 name: demo
 ttl: 15m
 tools:
@@ -208,5 +213,55 @@ tools:
 	}
 	if _, ok := p.MatchExec("rm", []string{"-rf", "/"}); ok {
 		t.Error("expected rm denied")
+	}
+}
+
+func TestSchemaVersionEnforced(t *testing.T) {
+	base := `
+name: demo
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: echo
+`
+	if _, err := Parse([]byte(base)); err == nil {
+		t.Error("missing version must be rejected")
+	}
+	if _, err := Parse([]byte("version: 2\n" + base)); err == nil {
+		t.Error("unknown version must be rejected")
+	}
+	if _, err := Parse([]byte("version: 1\n" + base)); err != nil {
+		t.Errorf("version 1 must parse: %v", err)
+	}
+}
+
+func TestUnknownFieldsRejected(t *testing.T) {
+	cases := []string{
+		"version: 1\nname: x\nttl: 15m\nbogus: 1\n",
+		"version: 1\nname: x\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        frobnicate: true\n",
+		"version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    read: [/.]\n    teleport: true\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  warp: 9\n",
+	}
+	for i, y := range cases {
+		if _, err := Parse([]byte(y)); err == nil {
+			t.Errorf("case %d: unknown field must be rejected", i)
+		}
+	}
+}
+
+func TestCanonicalHashStable(t *testing.T) {
+	a := mustParse(t, "version: 1\nname: demo\nttl: 15m\ntools:\n  exec:\n    allow:\n      - command: echo\n        rest: any\n")
+	// Same semantics, different formatting/comments/key order.
+	b := mustParse(t, "# a comment\nversion:   1\nname: demo\nttl: 15m\ntools:\n  exec:\n    allow:\n      - rest: any\n        command: echo\n")
+	if string(a.Canonical()) != string(b.Canonical()) {
+		t.Errorf("canonical bytes differ:\n%s\n%s", a.Canonical(), b.Canonical())
+	}
+	if a.CanonicalHash() != b.CanonicalHash() {
+		t.Error("canonical hash must be formatting-independent")
+	}
+	c := mustParse(t, "version: 1\nname: demo\nttl: 30m\ntools:\n  exec:\n    allow:\n      - command: echo\n        rest: any\n")
+	if a.CanonicalHash() == c.CanonicalHash() {
+		t.Error("different TTL must hash differently")
 	}
 }

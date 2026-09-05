@@ -1,6 +1,10 @@
 package policy
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +16,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// SchemaVersion is the only policy schema version Catflap v0.2-A accepts.
+// Every policy document MUST declare `version: 1`; unknown versions and
+// unknown fields fail closed (INV-5).
+const SchemaVersion = 1
 
 // Policy is a task-scoped capability policy snapshot.
 //
@@ -111,14 +120,16 @@ func Load(path string) (*Policy, error) {
 	return Parse(data)
 }
 
-// Parse parses YAML policy bytes. The legacy v0.1 string	shell allowlist
-// (`exec.commands`) is rejected: it cannot be made safe (metacharacters
-// reach `sh`), so it must be migrated to structured `exec.allow`.
+// Parse parses YAML policy bytes under schema v1. Decoding is strict:
+// unknown fields anywhere in the document fail closed (INV-5), as do
+// missing or unknown schema versions. The legacy v0.1 shell-string
+// allowlist (`exec.commands`) is rejected outright.
 func Parse(data []byte) (*Policy, error) {
 	var raw struct {
-		Name  string `yaml:"name"`
-		TTL   string `yaml:"ttl"`
-		Tools struct {
+		Version *int   `yaml:"version"`
+		Name    string `yaml:"name"`
+		TTL     string `yaml:"ttl"`
+		Tools   struct {
 			Exec *struct {
 				Commands any           `yaml:"commands"`
 				Allow    []rawExecRule `yaml:"allow"`
@@ -128,6 +139,17 @@ func Parse(data []byte) (*Policy, error) {
 		Limits *struct {
 			TTL string `yaml:"ttl"`
 		} `yaml:"limits"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("parse policy: %w", err)
+	}
+	if raw.Version == nil {
+		return nil, fmt.Errorf("policy version is required (expected `version: %d`)", SchemaVersion)
+	}
+	if *raw.Version != SchemaVersion {
+		return nil, fmt.Errorf("unsupported policy version %d (expected %d)", *raw.Version, SchemaVersion)
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse policy: %w", err)
@@ -396,6 +418,73 @@ func (p *Policy) Validate() error {
 		}
 	}
 	return nil
+}
+
+// canonicalPolicy is the deterministic JSON envelope for Canonical.
+// Field order is fixed by the struct; maps are never used. This envelope is
+// part of the v1 contract: the same authorization semantics MUST produce
+// the same bytes regardless of YAML formatting, comments, or key order.
+type canonicalPolicy struct {
+	Version int             `json:"version"`
+	Name    string          `json:"name"`
+	TTLns   int64           `json:"ttl_ns"`
+	Exec    []canonicalRule `json:"exec,omitempty"`
+	Read    []string        `json:"read,omitempty"`
+	Write   []string        `json:"write,omitempty"`
+}
+
+type canonicalRule struct {
+	Command string             `json:"command"`
+	Args    []canonicalMatcher `json:"args,omitempty"`
+	Rest    string             `json:"rest,omitempty"`
+}
+
+type canonicalMatcher struct {
+	Literal *string   `json:"literal,omitempty"`
+	Any     bool      `json:"any,omitempty"`
+	Integer *IntRange `json:"integer,omitempty"`
+	Choice  []string  `json:"choice,omitempty"`
+	Match   string    `json:"match,omitempty"`
+}
+
+// Canonical returns the deterministic byte identity of the policy's
+// authorization semantics: cleaned roots, compiled-equivalent matchers,
+// TTL in nanoseconds. Formatting-independent by construction.
+func (p *Policy) Canonical() []byte {
+	cp := canonicalPolicy{Version: SchemaVersion, Name: p.Name, TTLns: int64(p.TTL)}
+	if p.Tools.Exec != nil {
+		for _, r := range p.Tools.Exec.Allow {
+			cr := canonicalRule{Command: strings.TrimSpace(r.Command), Rest: strings.TrimSpace(r.Rest)}
+			for _, m := range r.Args {
+				cm := canonicalMatcher{Any: m.Any, Integer: m.Integer, Choice: m.Choice}
+				if m.Literal != nil {
+					s := *m.Literal
+					cm.Literal = &s
+				}
+				if m.HasGlob {
+					cm.Match = m.Glob
+				}
+				cr.Args = append(cr.Args, cm)
+			}
+			cp.Exec = append(cp.Exec, cr)
+		}
+	}
+	if p.Tools.File != nil {
+		for _, root := range p.Tools.File.Read {
+			cp.Read = append(cp.Read, filepath.Clean(root))
+		}
+		cp.Write = append(cp.Write, p.Tools.File.WriteRoots...)
+	}
+	raw, _ := json.Marshal(cp) //nolint:errchkjson // reason: struct of strings/ints/slices only — no maps, interfaces, or Marshalers — so encoding cannot fail.
+	return raw
+}
+
+// CanonicalHash is the full hex SHA-256 over Canonical. Capabilities and
+// audit records carry a short prefix of this hash as the policy identity:
+// equal semantics hash equal, whatever the YAML looked like.
+func (p *Policy) CanonicalHash() string {
+	sum := sha256.Sum256(p.Canonical())
+	return hex.EncodeToString(sum[:])
 }
 
 // MatchExec checks command+argv against the structured allowlist and returns

@@ -2,7 +2,6 @@ package capability
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -28,7 +27,7 @@ type Capability struct {
 	TaskSecret string    `json:"task_secret"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Policy     string    `json:"policy"`
-	PolicyHash string    `json:"policy_hash,omitempty"`
+	PolicyHash string    `json:"policy_hash,omitempty"` // short prefix of the policy CanonicalHash
 }
 
 // NewTaskID returns a task id like "agt_01K..." (random, unique).
@@ -43,12 +42,6 @@ func NewSecret() string {
 	var b [24]byte
 	_, _ = rand.Read(b[:])
 	return base64.RawURLEncoding.EncodeToString(b[:])
-}
-
-// PolicyHashOf returns a short hash identifying a policy snapshot.
-func PolicyHashOf(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])[:12]
 }
 
 // Encode serializes the capability to its bearer string form.

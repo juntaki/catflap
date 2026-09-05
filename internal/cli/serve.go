@@ -61,7 +61,7 @@ func Serve(args []string) int {
 		return 2
 	}
 
-	pol, policyYAML, err := loadPolicy(*policyPath)
+	pol, err := loadPolicy(*policyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "policy: %v\n", err)
 		return 1
@@ -85,7 +85,7 @@ func Serve(args []string) int {
 	ctx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSig()
 
-	firstCap, firstTask, err := s.mkTask(ctx, pol, policyYAML)
+	firstCap, firstTask, err := s.mkTask(ctx, pol)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mint task: %v\n", err)
 		return 1
@@ -113,14 +113,13 @@ func Serve(args []string) int {
 		body, _ := io_ReadAll(r.Body, 1<<20)
 		_ = json.Unmarshal(body, &greq)
 		p := pol // default: same policy snapshot family
-		pYAML := policyYAML
 		if greq.PolicyYAML != "" {
 			pp, err := policy.Parse([]byte(greq.PolicyYAML))
 			if err != nil {
 				http.Error(w, "bad policy: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			p, pYAML = pp, []byte(greq.PolicyYAML)
+			p = pp
 		}
 		if greq.TTLOverrideMs > 0 {
 			cp := *p
@@ -131,7 +130,7 @@ func Serve(args []string) int {
 			}
 			p = &cp
 		}
-		cap, _, err := s.mkTask(ctx, p, pYAML)
+		cap, _, err := s.mkTask(ctx, p)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -199,7 +198,7 @@ func Serve(args []string) int {
 
 // mkTask creates one task with its own ephemeral network server and arms
 // its expiry: timer → server.Close + audit.Close + store.Delete.
-func (s *server) mkTask(ctx context.Context, p *policy.Policy, pYAML []byte) (*capability.Capability, *gateway.Task, error) {
+func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capability, *gateway.Task, error) {
 	taskID := capability.NewTaskID()
 	secret := capability.NewSecret()
 	expires := time.Now().Add(p.TTL)
@@ -250,7 +249,9 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, pYAML []byte) (*c
 		Transport: s.transport, Endpoint: srv.Addr(),
 		ClientPriv: clientPriv, TaskSecret: secret,
 		ExpiresAt: expires, Policy: p.Name,
-		PolicyHash: capability.PolicyHashOf(pYAML),
+		// Short prefix of the canonical policy hash: the task's exact
+		// authorization semantics, independent of YAML formatting.
+		PolicyHash: p.CanonicalHash()[:12],
 	}
 	return cap, t, nil
 }
@@ -285,20 +286,15 @@ func (s *server) shutdown() {
 	}
 }
 
-func loadPolicy(path string) (*policy.Policy, []byte, error) {
+func loadPolicy(path string) (*policy.Policy, error) {
 	if path == "" {
-		return policy.Default(), []byte("# built-in default"), nil
+		return policy.Default(), nil
 	}
-	//nolint:gosec // reason: path is the operator's --policy CLI flag, never agent input.
-	raw, err := os.ReadFile(path)
+	p, err := policy.Load(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	p, err := policy.Parse(raw)
-	if err != nil {
-		return nil, nil, err
-	}
-	return p, raw, nil
+	return p, nil
 }
 
 func writeState(path string, st StateFile) error {

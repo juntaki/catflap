@@ -135,6 +135,7 @@ func TestShellMetacharsInert(t *testing.T) {
 // TestArgSmuggling: extra argv beyond the rule shape is denied.
 func TestArgSmuggling(t *testing.T) {
 	p, err := policy.Parse([]byte(`
+version: 1
 name: strict
 ttl: 15m
 tools:
@@ -265,6 +266,7 @@ func TestExpiryKillsInflightExec(t *testing.T) {
 		t.Skip("no /bin/sleep on this machine")
 	}
 	p, err := policy.Parse([]byte(`
+version: 1
 name: sleeper
 ttl: 15m
 tools:
@@ -321,6 +323,7 @@ func TestStopCauseReporting(t *testing.T) {
 		t.Skip("no /bin/sleep on this machine")
 	}
 	p, err := policy.Parse([]byte(`
+version: 1
 name: sleeper
 ttl: 15m
 tools:
@@ -409,6 +412,7 @@ func TestProcessTreeKill(t *testing.T) {
 		}
 	}
 	p, err := policy.Parse([]byte(`
+version: 1
 name: treekill
 ttl: 15m
 tools:
@@ -500,6 +504,7 @@ func TestSymlinkEscapeGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := policy.Parse([]byte(`
+version: 1
 name: confined
 ttl: 15m
 tools:

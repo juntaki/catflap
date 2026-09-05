@@ -102,7 +102,13 @@ with `capability expired`. The agent sees only three tools: `remote_exec`
 
 ## Policy
 
+Policies are schema v1 (`version: 1` required; unknown versions and unknown
+fields fail closed). The capability carries a short prefix of the policy's
+canonical hash — equal authorization semantics hash equal, regardless of
+YAML formatting.
+
 ```yaml
+version: 1
 name: staging-db-debug
 ttl: 15m
 tools:
