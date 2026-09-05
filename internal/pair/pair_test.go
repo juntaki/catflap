@@ -171,6 +171,46 @@ func TestConcurrentFetchExactlyOnce(t *testing.T) {
 	}
 }
 
+// TestPublishRejectsUnackedOrMismatchedSuccess covers the P1 the final
+// merge-gate review caught: a bare HTTP 200 was treated as proof the
+// envelope was stored, with the response body never checked. A
+// misbehaving or malicious rendezvous (a custom --rendezvous URL is
+// operator-configurable — not necessarily our own pair.Server) could
+// answer 200 with an empty or wrong-id body while never persisting
+// anything, and share would still print a pairing code for an envelope
+// nobody could ever fetch, instead of erroring (which is what makes
+// RunGateway tear the just-minted task back down).
+func TestPublishRejectsUnackedOrMismatchedSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty body", ""},
+		{"empty JSON object", "{}"},
+		{"wrong id", `{"id":"deadbeefcafe"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(c.body))
+			}))
+			defer srv.Close()
+			id, key, _, err := Mint()
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := Seal(id, []byte("x"), key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Publish(context.Background(), srv.URL, env, time.Minute); err == nil {
+				t.Errorf("Publish must not treat a bare 200 with %s as success", c.name)
+			}
+		})
+	}
+}
+
 func TestPublishConflict(t *testing.T) {
 	srv := testServer()
 	defer srv.Close()

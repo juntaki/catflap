@@ -47,6 +47,21 @@ func Publish(ctx context.Context, rendezvousURL string, env *Envelope, ttl time.
 	if res.StatusCode != 200 {
 		return fmt.Errorf("rendezvous publish failed (%d): %s", res.StatusCode, strings.TrimSpace(string(raw)))
 	}
+	// A 200 status alone isn't proof the envelope was actually stored: a
+	// misbehaving or malicious rendezvous (a custom --rendezvous URL is
+	// operator-configurable, not always our own pair.Server) could answer
+	// 200 with an empty or wrong-id body while never persisting anything.
+	// share's failure-cleanup invariant — a publish that didn't really
+	// happen must tear the task down, never print a code for an envelope
+	// nobody can fetch — depends on this being a real error, not a
+	// silent false-success.
+	var ack PublishResponse
+	if jerr := json.Unmarshal(raw, &ack); jerr != nil {
+		return fmt.Errorf("rendezvous publish: malformed acknowledgement: %w", jerr)
+	}
+	if ack.ID != env.ID {
+		return fmt.Errorf("rendezvous publish: acknowledgement id %q does not match %q", ack.ID, env.ID)
+	}
 	return nil
 }
 
