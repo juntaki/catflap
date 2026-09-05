@@ -11,23 +11,23 @@ open ports, no reachable network left behind.
 Claude Code / Codex / Cursor
           │  MCP stdio
           ▼
-┌─────────────────────┐
-│ catflap mcp agc1_…  │  agent-side adapter (ephemeral client key)
-└──────────┬──────────┘
-           │ Tailcat / WireGuard (no account, no root, userspace only)
-           ▼
-┌──────────────────────────┐
-│ catflap serve (target)   │
-│  task: agt_…  expires +15m
-│  policy snapshot: lab-gpu│
-│  MCP tools: remote_exec / remote_read / remote_stat
-└───────────┬──────────────┘
-            │  localhost/LAN
-            ▼  GPU / DB / Robot
+┌──────────────────────────────┐
+│ catflap mcp --cap-file t.cap │  agent-side adapter (ephemeral client key)
+└──────────────┬───────────────┘
+               │ Tailcat / WireGuard (no account, no root, userspace only)
+               ▼
+┌──────────────────────────────┐
+│ task A: own Tailcat server   │  server key A + PSK A + address A
+│  policy snapshot: lab-gpu   │  remote_exec / remote_read / remote_stat
+│  expires +15m → server.Close │
+└──────────────┬───────────────┘
+               │  localhost/LAN
+               ▼  GPU / DB / Robot
 ```
 
-One task = one ephemeral identity + one policy snapshot + one network
-capability + one audit chain.
+One task = one ephemeral network identity + one policy snapshot + one audit
+chain. Expiry closes the task's own server, so the WireGuard identity, the
+PSK, the address, and the RPC authorization all die together.
 
 ## Why not "SSH over MCP"?
 
@@ -37,37 +37,38 @@ reachable network*, it mints a **single-task encrypted route and permission
 together**, and both vanish on expiry:
 
 ```text
-CREATE (task id, ephemeral server+client keys, frozen policy)
+CREATE (task id, ephemeral server+client keys, frozen policy, own address)
   → ACTIVE (MCP calls, each allow/deny audited)
-    → EXPIRE / CLOSE (keys destroyed, capability dead)
+    → EXPIRE (server.Close: identity, PSK, address, and auth die together)
 ```
 
-## Status: v0.1
+## Status: v0.1.1 (security semantics)
 
-- [x] Tailcat transport (ephemeral server key + PSK, `AllowedClients` per grant)
+- [x] 1 task = 1 Tailcat server (per-task key, PSK, address; expiry = Close)
+- [x] Structured argv exec — no shell anywhere (`;`, `&&`, `$()` are inert)
+- [x] Symlink/root-escape rejection on file tools
 - [x] Ephemeral capabilities (`agc1_…`), TTL, `serve` / `grant` / `mcp`
-- [x] `remote_exec` / `remote_read` / `remote_stat` with policy enforcement
-- [x] JSONL audit with hash chain
-- [ ] YAML policy allowlists/roots are minimal (v0.2 hardens them)
-- [ ] Human approval, read/write split, specialized adapters (roadmap below)
+- [x] `--cap-file` / `--out` flows so tokens avoid argv and shell history
+- [x] Hash-chained JSONL audit
+- [ ] Human approval, network restrictions, specialized adapters (roadmap)
 
 ## Quickstart
 
 ```bash
 go build -o bin/catflap ./cmd/catflap
 
-# 1. target: serve (prints one capability immediately)
-./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m
+# 1. target: each task gets its OWN Tailcat address
+./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m \
+  --out ./task.cap
 # Task: agt_…
-# Capability:
-# agc1_xxxxxxxxxxxxxxxxx
-# Expires: …
+# Capability: (written to ./task.cap)
 
-# 2. (optional) mint more tasks while serve runs
-./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml --ttl 15m
+# 2. (optional) mint more tasks while serve runs — each a new address
+./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml \
+  --ttl 15m --out ./task2.cap
 
-# 3. agent side: register as an MCP server
-./bin/catflap mcp agc1_xxxxxxxxxxxxxxxxx
+# 3. agent side: register as an MCP server (file, not argv)
+./bin/catflap mcp --cap-file ./task.cap
 ```
 
 Claude Code (`claude mcp add`):
@@ -77,15 +78,15 @@ Claude Code (`claude mcp add`):
   "mcpServers": {
     "target": {
       "command": "/path/to/catflap",
-      "args": ["mcp", "agc1_xxxxxxxxxxxxxxxxx"]
+      "args": ["mcp", "--cap-file", "/home/you/.catflap/tasks/xxx.cap"]
     }
   }
 }
 ```
 
-After the TTL, every call fails with `capability expired` — the server key,
-client key, and policy binding are gone. The agent sees only three tools:
-`remote_exec`, `remote_read`, `remote_stat`.
+After the TTL, the task's server is closed: handshakes fail and calls fail
+with `capability expired`. The agent sees only three tools: `remote_exec`
+(command + argv, no shell), `remote_read`, `remote_stat`.
 
 `--transport local` runs the same stack over loopback (tests, LAN demos).
 
@@ -96,23 +97,34 @@ name: staging-db-debug
 ttl: 15m
 tools:
   exec:
-    commands:
-      - systemctl status '*'
-      - journalctl '*'
-      - docker ps
+    allow:
+      - command: systemctl
+        args: [status, { match: "*" }]
+      - command: journalctl
+        args: ["-u", { any: true }, "-n", { integer: { max: 1000 } }]
+      - command: docker
+        args: [ps]
   file:
     read:
       roots:
         - /var/log/myapp
 ```
 
-Command patterns match the whole command line (quote-insensitive glob, `*`
-spans `/`). File access is confined to the listed roots. Anything else is
-denied **and** logged as denied. See [`examples/policies/`](examples/policies/).
+Arg matchers: exact string, `{any:true}`, `{integer:{min,max}}`,
+`{choice:[…]}`, `{match:"glob"}`; `rest: any` permits trailing argv (only
+for commands that cannot reach files — never for `cat`-likes). Arity is
+exact otherwise. Commands resolve via `PATH` at call time (operator's PATH,
+never the agent's) or as absolute paths. The v0.1 shell-string allowlist
+(`exec.commands`) is rejected at load: it cannot be made shell-safe.
+
+File access is confined to roots **after** symlink resolution: final-component
+symlinks are denied, intermediate-symlink escapes (`root/outside -> /etc`)
+are denied, files open with `O_NOFOLLOW`. Anything else is denied **and**
+logged as denied. See [`examples/policies/`](examples/policies/).
 
 ## Audit
 
-One JSONL file per task (`~/.catflap/audit/<task>.jsonl`, `--audit` to change):
+One hash-chained JSONL file per task (`~/.catflap/audit/<task>.jsonl`):
 
 ```json
 {"task":"agt_…","seq":17,"time":"…","agent_key":"nodekey:abc…",
@@ -120,7 +132,9 @@ One JSONL file per task (`~/.catflap/audit/<task>.jsonl`, `--audit` to change):
  "result_hash":"sha256:…","duration_ms":83,"prev":"sha256:…","hash":"sha256:…"}
 ```
 
-`prev` chains entries; args/results are stored as hashes only.
+`prev` links entries and args/results are stored as hashes only. This is a
+hash-chained log, not tamper-proof against whole-file rewrites — a
+`catflap audit verify` command plus an external head anchor is roadmap work.
 
 ## Security model — read this
 
@@ -138,20 +152,45 @@ catflap = identity lifecycle + capability policy + TTL
           + process containment + resource restrictions + audit
 ```
 
-Concretely, v0.1 assumes the **agent is untrusted but the operator running
-`serve` is trusted**, and still:
+Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
+`serve` is trusted**, and enforces:
 
-- `exec` is never a general shell: default-deny allowlist, `sh -c` with a
-  narrowed environment, timeouts, and output caps.
-- File access is root-confined; directories can't be exfiltrated via `read`.
-- Tailcat layer is locked down: fresh ephemeral server key + PSK per `serve`
-  run, `AllowedClients` limited to granted client keys, single RPC port in
-  `ServedTCPPorts`.
+```text
+                 Catflap capability
+                         │
+            ┌────────────┴────────────┐
+            │                         │
+       network identity          application policy
+       Tailcat node key          structured argv tools
+       PSK                       filesystem roots
+       unique address            TTL
+            │                         │
+            └────────────┬────────────┘
+                         │
+                      Task
+                         │
+                       expire
+                         │
+             ┌───────────┴───────────┐
+             ↓                       ↓
+        server.Close()          policy deleted
+             ↓                       ↓
+       unreachable               unauthorized
+```
+
+- `exec` is structured argv with no shell in the path: exact arity, typed
+  matchers, narrowed environment, timeouts, output caps.
+- File tools reject symlinks and resolve-then-contain every path.
+- Every task owns a Tailcat server: fresh key + PSK, `AllowedClients`
+  containing only that task's client key, single RPC port in
+  `ServedTCPPorts`, `Close()` on expiry deleting the address itself.
 - Every decision (allow/deny/expired/error) is hash-chained to JSONL.
+- Bearer tokens travel via files (`--out` / `--cap-file`), not argv.
 
-Known gaps for later milestones: no human approval yet, no write/network
-policy enforcement yet, command allowlists are glob-based (v0.2+ moves toward
-structured argv matching), no resource limits (v0.2+).
+Known gaps: no human approval yet, no network egress policy yet, no resource
+limits yet, symlink defense is check-then-open rather than `openat`-chained
+(the residual window needs a concurrent local writer, which the agent is
+not), audit chain has no external anchor yet.
 
 ## Layout (Tailcat is quarantined)
 
@@ -163,24 +202,24 @@ internal/
     tailcat/            ONLY package that imports github.com/tailscale/tailcat
     local/              loopback transport (tests/demos)
   capability/           agc1_… bearer tokens (task, endpoint, client key, secret, expiry)
-  policy/               YAML policy: exec allowlist, file roots
-  gateway/              per-task auth, TTL, enforcement, dispatch
+  policy/               structured argv policy + symlink-aware file roots
+  gateway/              per-task auth, TTL, enforcement (no shell), Stop/GC
   rpc/                  JSONL request/response frames
   audit/                hash-chained JSONL logger
   mcp/                  MCP stdio bridge (initialize/tools/list/tools/call)
-  cli/                  serve (gateway+admin API) / grant / mcp wiring
+  cli/                  serve (per-task servers+admin API) / grant / mcp wiring
 examples/policies/      readonly-debug, lab-gpu
-testdata/               e2e drivers (local + live-Tailcat probes)
+testdata/               e2e drivers (local + live-Tailcat probes) + adversarial tests
 ```
 
 ## Roadmap
 
 ```text
-v0.1  Tailcat transport, ephemeral credentials, TTL, exec/read/stat, JSONL audit ✓
-v0.2  YAML policy hardening, command argv matching, filesystem roots, network restrictions
-v0.3  human approval, read/write distinction, audit hash-chain verification cmd
-v0.4  specialized adapters: PostgreSQL, Docker, GPU, serial/robot
-v0.5  remote task issuance: GitHub Actions / Claude Code / Codex integration
+v0.1   Tailcat transport, ephemeral credentials, TTL, exec/read/stat, JSONL audit ✓
+v0.1.1 security semantics: structured argv, symlink封じ, 1 task = 1 server, Close, cap-file ✓
+v0.2   human approval, read/write distinction, network restrictions, resource limits
+v0.3   audit verify + external anchor, specialized adapters: PostgreSQL, Docker, GPU, serial/robot
+v0.4   remote task issuance: GitHub Actions / Claude Code / Codex integration
 ```
 
 ## License

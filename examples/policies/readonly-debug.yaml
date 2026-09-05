@@ -3,13 +3,25 @@ ttl: 15m
 
 tools:
   exec:
-    commands:
-      - systemctl status '*'
-      - journalctl '*'
-      - docker ps
-      - echo '*'
-      - uname '*'
-      - ls '*'
+    allow:
+      - command: systemctl
+        args:
+          - status
+          - { match: "*" }
+      - command: journalctl
+        args:
+          - "-u"
+          - { any: true }
+          - "-n"
+          - { integer: { max: 1000 } }
+      - command: docker
+        args: [ps]
+      - command: echo
+        rest: any
+      - command: uname
+        rest: any
+      - command: ls
+        rest: any
   file:
     read:
       roots:

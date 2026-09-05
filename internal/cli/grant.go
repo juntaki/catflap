@@ -13,6 +13,7 @@ func Grant(args []string) int {
 	policyPath := fs.String("policy", "", "YAML policy file (default: server's policy)")
 	ttlFlag := fs.String("ttl", "", "TTL override, e.g. 15m")
 	statePath := fs.String("state", DefaultStatePath(), "state file written by `serve`")
+	outPath := fs.String("out", "", "write the capability to this file (0600) instead of stdout")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -42,6 +43,15 @@ func Grant(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "grant: %v\n", err)
 		return 1
+	}
+	if *outPath != "" {
+		if err := os.WriteFile(*outPath, []byte(res.Capability+"\n"), 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "grant: write --out: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Task: %s\nCapability: (written to %s)\nExpires: %s\nPolicy: %s\n",
+			res.Task, *outPath, res.ExpiresAt, res.Policy)
+		return 0
 	}
 	fmt.Printf("Task: %s\nCapability:\n%s\nExpires: %s\nPolicy: %s\n",
 		res.Task, res.Capability, res.ExpiresAt, res.Policy)

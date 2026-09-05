@@ -6,12 +6,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/policy"
@@ -19,6 +21,7 @@ import (
 )
 
 // Task is one live ephemeral grant: policy snapshot + expiry + audit chain.
+// Stop tears the whole task down; expiry and shutdown both funnel through it.
 type Task struct {
 	ID        string
 	Secret    string
@@ -26,6 +29,24 @@ type Task struct {
 	ExpiresAt time.Time
 	Audit     *audit.Logger
 	AgentKey  string
+
+	stopOnce sync.Once
+	// onStop releases task-external resources (its Tailcat server).
+	// Set by the serve loop; nil in tests.
+	onStop func()
+}
+
+// Stop destroys the task: closes audit, releases the network server,
+// and must be followed by Store.Delete.
+func (t *Task) Stop() {
+	t.stopOnce.Do(func() {
+		if t.onStop != nil {
+			t.onStop()
+		}
+		if t.Audit != nil {
+			_ = t.Audit.Close()
+		}
+	})
 }
 
 // Store holds live tasks. The zero value is ready.
@@ -44,6 +65,14 @@ func (s *Store) Add(t *Task) {
 	s.tasks[t.ID] = t
 }
 
+// Delete removes a task so its id/secret can never authenticate again.
+// Call t.Stop() first to release its server and audit handle.
+func (s *Store) Delete(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tasks, id)
+}
+
 // Lookup returns the task if its secret matches (constant-time).
 func (s *Store) Lookup(id, secret string) (*Task, bool) {
 	s.mu.RLock()
@@ -58,13 +87,29 @@ func (s *Store) Lookup(id, secret string) (*Task, bool) {
 	return t, true
 }
 
+// OnStopFunc sets the external-release hook. Used by the serve loop to bind
+// each task to its own network server (1 task = 1 server).
+func (t *Task) OnStopFunc(f func()) { t.onStop = f }
+
+// TaskInfo is a lock-free snapshot for the admin API.
+type TaskInfo struct {
+	ID        string
+	Policy    string
+	ExpiresAt time.Time
+	AgentKey  string
+}
+
 // List returns task snapshots for the admin API.
-func (s *Store) List() []Task {
+func (s *Store) List() []TaskInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]Task, 0, len(s.tasks))
+	out := make([]TaskInfo, 0, len(s.tasks))
 	for _, t := range s.tasks {
-		out = append(out, Task{ID: t.ID, Policy: t.Policy, ExpiresAt: t.ExpiresAt, AgentKey: t.AgentKey})
+		name := ""
+		if t.Policy != nil {
+			name = t.Policy.Name
+		}
+		out = append(out, TaskInfo{ID: t.ID, Policy: name, ExpiresAt: t.ExpiresAt, AgentKey: t.AgentKey})
 	}
 	return out
 }
@@ -128,7 +173,8 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad exec args"}
 	}
-	if !t.Policy.AllowExec(args.Command) {
+	exe, ok := t.Policy.MatchExec(args.Command, args.Args)
+	if !ok {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
 		}
@@ -143,9 +189,8 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	// Intentionally `sh -c` (not direct argv): allowlist patterns match the
-	// whole command string, and denial is enforced before we get here.
-	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
+	// No shell, ever: argv goes straight to the pinned executable.
+	cmd := exec.CommandContext(ctx, exe, args.Args...)
 	// Narrow environment: no passthrough of caller env.
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "LC_ALL=C"}
 	stdout, stderr := boundedBuffer(256 << 10), boundedBuffer(64 << 10)
@@ -178,14 +223,24 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad read args"}
 	}
-	if args.Path == "" || !t.Policy.AllowRead(args.Path) {
+	if args.Path == "" {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
-	clean := filepath.Clean(args.Path)
-	info, err := os.Stat(clean)
+	real, err := t.Policy.ResolveRead(args.Path)
+	if err != nil {
+		decision := "deny"
+		if isStatError(err) {
+			decision = "error"
+		}
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
+	}
+	info, err := os.Stat(real)
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
@@ -199,7 +254,16 @@ func (s *Store) doRead(t *Task, req rpc.Request) rpc.Response {
 		return rpc.Response{ID: req.ID, OK: false, Error: "is a directory (use remote_stat)"}
 	}
 	const maxRead = 1 << 20
-	data, err := os.ReadFile(clean)
+	// O_NOFOLLOW: the final component must not be a symlink at open time.
+	f, err := os.OpenFile(real, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: "open: " + err.Error()}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxRead+1))
+	_ = f.Close()
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
@@ -225,13 +289,24 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 	if err := json.Unmarshal(req.Args, &args); err != nil {
 		return rpc.Response{ID: req.ID, OK: false, Error: "bad stat args"}
 	}
-	if args.Path == "" || !t.Policy.AllowRead(args.Path) {
+	if args.Path == "" {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "deny", nil, time.Since(start))
 		}
 		return rpc.Response{ID: req.ID, OK: false, Error: "path not allowed by policy"}
 	}
-	info, err := os.Stat(filepath.Clean(args.Path))
+	real, err := t.Policy.ResolveRead(args.Path)
+	if err != nil {
+		decision := "deny"
+		if isStatError(err) {
+			decision = "error"
+		}
+		if t.Audit != nil {
+			t.Audit.Log(req.Tool, req.Args, decision, nil, time.Since(start))
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: err.Error()}
+	}
+	info, err := os.Stat(real)
 	if err != nil {
 		if t.Audit != nil {
 			t.Audit.Log(req.Tool, req.Args, "error", nil, time.Since(start))
@@ -249,6 +324,11 @@ func (s *Store) doStat(t *Task, req rpc.Request) rpc.Response {
 		t.Audit.Log(req.Tool, req.Args, "allow", raw, time.Since(start))
 	}
 	return rpc.Response{ID: req.ID, OK: true, Result: raw}
+}
+
+func isStatError(err error) bool {
+	msg := err.Error()
+	return len(msg) >= 6 && msg[:6] == "stat: "
 }
 
 // RequestAlias / ResponseAlias keep the transport seam free of refactors:

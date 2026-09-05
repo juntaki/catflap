@@ -4,15 +4,21 @@ bin/
 # Generated e2e artifacts (may contain bearer capabilities — never commit)
 testdata/e2e/serve.out
 testdata/e2e/serve.err
+testdata/e2e/serve.cap
 testdata/e2e/grant.out
 testdata/e2e/grant.err
+testdata/e2e/grant.cap
 testdata/e2e/mcptest.err
 testdata/e2e/state.json
 testdata/e2e/audit/
+testdata/e2e/PWNED
+testdata/e2e/pwned-c0
 testdata/e2e-expire.out
 testdata/e2e-expire.err
+testdata/e2e-expire.cap
 testdata/e2e-expire/
 testdata/e2e-tc/serve.out
 testdata/e2e-tc/serve.err
+testdata/e2e-tc/serve.cap
 testdata/e2e-tc/state.json
 testdata/e2e-tc/audit/

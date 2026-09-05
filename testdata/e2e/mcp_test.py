@@ -1,21 +1,15 @@
-"""E2E driver: speaks MCP stdio to `catflap mcp` and prints results."""
+"""E2E driver: speaks MCP stdio to `catflap mcp --cap-file` and prints results.
+
+Usage: python3 mcp_test.py <cap-file>
+The cap file may be a bare token or `grant --out` output.
+"""
 import json
 import subprocess
 import sys
 
-cap_path = sys.argv[1]
-with open(cap_path) as f:
-    text = f.read()
-cap = None
-for line in text.splitlines():
-    line = line.strip()
-    if line.startswith("agc1_"):
-        cap = line
-        break
-assert cap, "no capability found"
-
+cap_file = sys.argv[1]
 p = subprocess.Popen(
-    ["./bin/catflap", "mcp", cap],
+    ["./bin/catflap", "mcp", "--cap-file", cap_file],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -26,8 +20,7 @@ p = subprocess.Popen(
 
 
 def send(obj):
-    line = json.dumps(obj)
-    p.stdin.write(line + "\n")
+    p.stdin.write(json.dumps(obj) + "\n")
     p.stdin.flush()
 
 
@@ -50,27 +43,33 @@ def call(method, params=None):
     return recv()
 
 
+def tool(name, args):
+    return call("tools/call", {"name": name, "arguments": args})
+
+
 print("== initialize ==")
-print(json.dumps(call("initialize", {"protocolVersion": "2024-11-05"}))[:200])
+print(json.dumps(call("initialize", {"protocolVersion": "2024-11-05"}))[:160])
 print("== tools/list ==")
-res = call("tools/list")
-print(json.dumps(res)[:400])
-print("== remote_exec allowed (echo) ==")
-res = call("tools/call", {"name": "remote_exec", "arguments": {"command": "echo hello-catflap"}})
-print(json.dumps(res)[:500])
-print("== remote_exec denied (rm) ==")
-res = call("tools/call", {"name": "remote_exec", "arguments": {"command": "rm -rf /"}})
-print(json.dumps(res)[:500])
-print("== remote_read allowed ==")
-res = call("tools/call", {"name": "remote_read", "arguments": {"path": "./testdata/hello.txt"}})
-print(json.dumps(res)[:500])
-print("== remote_read denied (/etc/passwd) ==")
-res = call("tools/call", {"name": "remote_read", "arguments": {"path": "/etc/passwd"}})
-print(json.dumps(res)[:500])
-print("== remote_stat allowed ==")
-res = call("tools/call", {"name": "remote_stat", "arguments": {"path": "./testdata/hello.txt"}})
-print(json.dumps(res)[:500])
+print(json.dumps(call("tools/list"))[:260])
+print("== exec allowed (echo) ==")
+print(json.dumps(tool("remote_exec", {"command": "echo", "args": ["hello-catflap"]}))[:300])
+print("== exec denied (rm) ==")
+print(json.dumps(tool("remote_exec", {"command": "rm", "args": ["-rf", "/"]}))[:200])
+print("== exec denied (absolute /bin/rm) ==")
+print(json.dumps(tool("remote_exec", {"command": "/bin/rm", "args": ["x"]}))[:200])
+print("== exec inert: metachars as argv ==")
+r = tool("remote_exec", {"command": "echo", "args": ["x; touch testdata/e2e/PWNED"]})
+print(json.dumps(r)[:300])
+print("== read allowed ==")
+print(json.dumps(tool("remote_read", {"path": "./testdata/hello.txt"}))[:260])
+print("== read denied (/etc/passwd) ==")
+print(json.dumps(tool("remote_read", {"path": "/etc/passwd"}))[:200])
+print("== stat allowed ==")
+print(json.dumps(tool("remote_stat", {"path": "./testdata/hello.txt"}))[:260])
 
 p.stdin.close()
 p.wait(timeout=10)
 print("MCP_EXIT:", p.returncode)
+
+import os
+print("PWNED_EXISTS:", os.path.exists("testdata/e2e/PWNED"))

@@ -69,7 +69,7 @@ func (s *server) AddAllowedClient(identity string) error {
 	return nil
 }
 
-func (s *server) Close() error { return nil } // ephemeral keys die with the process; nothing to scrub on disk
+func (s *server) Close() error { return s.s.Close() }
 
 // GenerateClientKey mints a fresh ephemeral client identity and returns
 // its private (keep in the capability) and public (give to AddAllowedClient) halves.

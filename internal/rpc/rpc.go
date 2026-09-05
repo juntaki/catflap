@@ -37,8 +37,11 @@ type Response struct {
 }
 
 type ExecArgs struct {
-	Command   string `json:"command"`
-	TimeoutMs int    `json:"timeout_ms,omitempty"`
+	// Command is a bare executable name or absolute path; Args are passed
+	// directly to it with no shell. Shell metacharacters are inert data.
+	Command   string   `json:"command"`
+	Args      []string `json:"args,omitempty"`
+	TimeoutMs int      `json:"timeout_ms,omitempty"`
 }
 
 type ExecResult struct {

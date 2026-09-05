@@ -13,9 +13,9 @@ import (
 )
 
 // StateFile is written by `serve` so `grant` can find the admin API.
+// Per-task endpoints live in the capabilities themselves (1 task = 1 server).
 type StateFile struct {
 	Transport  string `json:"transport"`
-	Endpoint   string `json:"endpoint"`
 	AdminAddr  string `json:"admin_addr"`
 	AdminToken string `json:"admin_token"`
 }

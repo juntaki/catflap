@@ -3,10 +3,13 @@ ttl: 30m
 
 tools:
   exec:
-    commands:
-      - nvidia-smi
-      - python /opt/jobs/*
-      - echo '*'
+    allow:
+      - command: nvidia-smi
+      - command: python
+        args:
+          - { match: "/opt/jobs/*" }
+      - command: echo
+        rest: any
   file:
     read:
       - /datasets/**

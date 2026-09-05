@@ -48,6 +48,12 @@ type rpcResponse struct {
 
 // Serve runs the MCP stdio loop until stdin closes.
 func Serve(capStr string, verbose bool) error {
+	return ServeReader(capStr, os.Stdin, verbose)
+}
+
+// ServeReader is Serve with an injectable input stream (for --cap-stdin,
+// where the first line is the token and the rest is MCP traffic).
+func ServeReader(capStr string, r io.Reader, verbose bool) error {
 	cap, err := capability.Decode(capStr)
 	if err != nil {
 		return err
@@ -78,7 +84,7 @@ func Serve(capStr string, verbose bool) error {
 	s := &Server{cap: cap, client: client, stdout: bufio.NewWriter(os.Stdout)}
 	s.mu = make(chan struct{}, 1)
 	s.mu <- struct{}{}
-	return s.loop(os.Stdin)
+	return s.loop(r)
 }
 
 func (s *Server) loop(r io.Reader) error {
@@ -134,11 +140,12 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        rpc.ToolExec,
-			"description": "Run an allowlisted command on the target machine. Anything outside the task policy is denied.",
+			"description": "Run an allowlisted executable on the target machine with explicit argv (no shell; metacharacters are inert). Anything outside the task policy is denied.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"command":    map[string]any{"type": "string", "description": "Full command line, e.g. \"systemctl status myapp\""},
+					"command":    map[string]any{"type": "string", "description": "Executable name or absolute path, e.g. \"journalctl\""},
+					"args":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Arguments passed directly (no shell)"},
 					"timeout_ms": map[string]any{"type": "integer"},
 				},
 				"required": []string{"command"},

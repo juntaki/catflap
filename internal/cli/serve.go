@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,17 +24,36 @@ import (
 	tct "github.com/juntaki/catflap/internal/transport/tailcat"
 )
 
-// Serve runs the target gateway. It mints one initial task immediately
-// (single-task demo works with serve alone) and keeps an admin API on
-// loopback for `grant` to mint more tasks until SIGINT/SIGTERM.
+// liveTask binds one task to its own network server: 1 task = 1 Tailcat
+// server = 1 WireGuard identity + 1 PSK + 1 address. Expiry closes the
+// server, so reachability itself dies with the task — not just the RPC auth.
+type liveTask struct {
+	task  *gateway.Task
+	srv   transport.Server
+	timer *time.Timer
+}
+
+type server struct {
+	transport string
+	verbose   bool
+	auditDir  string
+	store     *gateway.Store
+	mu        sync.Mutex
+	live      map[string]*liveTask
+}
+
+// Serve runs the target gateway. Each task (the initial one and every
+// `grant`) gets its own ephemeral network server. The process lives until
+// SIGINT/SIGTERM; per-task expiry tears down that task's server alone.
 func Serve(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	policyPath := fs.String("policy", "", "YAML policy file (default: built-in readonly-debug)")
-	ttlFlag := fs.String("ttl", "", "TTL override, e.g. 15m (default: policy ttl)")
+	ttlFlag := fs.String("ttl", "", "TTL override for the initial task, e.g. 15m (default: policy ttl)")
 	transportFlag := fs.String("transport", "tailcat", "transport: tailcat | local")
 	auditDir := fs.String("audit", DefaultAuditDir(), "audit JSONL directory (empty disables file audit)")
 	statePath := fs.String("state", DefaultStatePath(), "state file for `grant` coordination")
 	adminAddr := fs.String("admin", "127.0.0.1:0", "loopback admin API listen address")
+	outPath := fs.String("out", "", "write the initial capability to this file (0600) instead of stdout")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -53,70 +73,25 @@ func Serve(args []string) int {
 		pol.TTL = d
 	}
 
-	store := &gateway.Store{}
-	mkTask := func(p *policy.Policy) (*gateway.Task, string, error) {
-		taskID := capability.NewTaskID()
-		secret := capability.NewSecret()
-		expires := time.Now().Add(p.TTL)
-		agentKey := ""
-		var clientPriv string
-		if *transportFlag == "tailcat" {
-			priv, pub, err := tct.GenerateClientKey()
-			if err != nil {
-				return nil, "", err
-			}
-			clientPriv, agentKey = priv, pub
-			_ = clientPriv
-		}
-		alog, err := audit.Open(*auditDir, taskID, agentKey)
-		if err != nil {
-			return nil, "", fmt.Errorf("audit: %w", err)
-		}
-		t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, ExpiresAt: expires, Audit: alog, AgentKey: agentKey}
-		store.Add(t)
-		return t, clientPriv, nil
+	s := &server{
+		transport: *transportFlag, verbose: *verbose,
+		auditDir: *auditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
 	}
 
-	firstTask, firstPriv, err := mkTask(pol)
+	firstCap, firstTask, err := s.mkTask(pol, policyYAML)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mint task: %v\n", err)
 		return 1
 	}
-
-	var srv transport.Server
-	var firstAllowed string
-	if *transportFlag == "tailcat" {
-		firstAllowed = firstTask.AgentKey
-		srv, err = tct.Serve(store.Handler(), []string{firstAllowed}, *verbose)
-	} else if *transportFlag == "local" {
-		srv, err = local.Serve(store.Handler())
-	} else {
-		fmt.Fprintf(os.Stderr, "unknown --transport %q (tailcat|local)\n", *transportFlag)
-		return 1
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "start server: %v\n", err)
-		return 1
-	}
-	defer srv.Close()
-
-	cap := &capability.Capability{
-		Version: 1, TaskID: firstTask.ID,
-		Transport: *transportFlag, Endpoint: srv.Addr(),
-		ClientPriv: firstPriv, TaskSecret: firstTask.Secret,
-		ExpiresAt: firstTask.ExpiresAt, Policy: pol.Name,
-		PolicyHash: capability.PolicyHashOf(policyYAML),
-	}
-	capStr := cap.Encode()
 
 	// Admin API for `grant`.
 	adminToken := randomToken()
 	ln, err := net.Listen("tcp", *adminAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "admin listen: %v\n", err)
+		s.shutdown()
 		return 1
 	}
-	defer ln.Close()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/grant", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -149,26 +124,14 @@ func Serve(args []string) int {
 			}
 			p = &cp
 		}
-		t, priv, err := mkTask(p)
+		cap, _, err := s.mkTask(p, pYAML)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if *transportFlag == "tailcat" {
-			if err := srv.AddAllowedClient(t.AgentKey); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		c := &capability.Capability{
-			Version: 1, TaskID: t.ID, Transport: *transportFlag, Endpoint: srv.Addr(),
-			ClientPriv: priv, TaskSecret: t.Secret,
-			ExpiresAt: t.ExpiresAt, Policy: p.Name,
-			PolicyHash: capability.PolicyHashOf(pYAML),
-		}
 		_ = json.NewEncoder(w).Encode(GrantResponse{
-			Task: t.ID, Capability: c.Encode(),
-			ExpiresAt: t.ExpiresAt.Format(time.RFC3339), Policy: p.Name,
+			Task: cap.TaskID, Capability: cap.Encode(),
+			ExpiresAt: cap.ExpiresAt.Format(time.RFC3339), Policy: cap.Policy,
 		})
 	})
 	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
@@ -177,40 +140,130 @@ func Serve(args []string) int {
 			return
 		}
 		type item struct {
-			Task string `json:"task"`
-			Policy string `json:"policy"`
+			Task    string `json:"task"`
+			Policy  string `json:"policy"`
 			Expires string `json:"expires_at"`
 		}
 		var out []item
-		for _, t := range store.List() {
-			out = append(out, item{Task: t.ID, Policy: t.Policy.Name, Expires: t.ExpiresAt.Format(time.RFC3339)})
+		for _, t := range s.store.List() {
+			out = append(out, item{Task: t.ID, Policy: t.Policy, Expires: t.ExpiresAt.Format(time.RFC3339)})
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	})
 	go func() { _ = http.Serve(ln, mux) }()
 
-	st := StateFile{Transport: *transportFlag, Endpoint: srv.Addr(), AdminAddr: ln.Addr().String(), AdminToken: adminToken}
+	st := StateFile{Transport: *transportFlag, AdminAddr: ln.Addr().String(), AdminToken: adminToken}
 	if err := writeState(*statePath, st); err != nil {
 		fmt.Fprintf(os.Stderr, "write state: %v\n", err)
+		s.shutdown()
 		return 1
 	}
-	defer os.Remove(*statePath)
 
-	fmt.Printf("Task: %s\nCapability:\n%s\nExpires: %s\nPolicy: %s\nTransport: %s\n",
-		firstTask.ID, capStr, firstTask.ExpiresAt.Format(time.RFC3339), pol.Name, *transportFlag)
-	fmt.Fprintf(os.Stderr, "catflap serve: task %s live for %s; Ctrl-C to destroy keys\n", firstTask.ID, pol.TTL.Round(time.Second))
+	if *outPath != "" {
+		if err := os.WriteFile(*outPath, []byte(firstCap.Encode()+"\n"), 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "write --out: %v\n", err)
+			s.shutdown()
+			return 1
+		}
+		fmt.Printf("Task: %s\nCapability: (written to %s)\nExpires: %s\nPolicy: %s\nTransport: %s\n",
+			firstTask.ID, *outPath, firstTask.ExpiresAt.Format(time.RFC3339), pol.Name, *transportFlag)
+	} else {
+		fmt.Printf("Task: %s\nCapability:\n%s\nExpires: %s\nPolicy: %s\nTransport: %s\n",
+			firstTask.ID, firstCap.Encode(), firstTask.ExpiresAt.Format(time.RFC3339), pol.Name, *transportFlag)
+	}
+	fmt.Fprintf(os.Stderr, "catflap serve: task %s live for %s on its own address; Ctrl-C destroys all keys\n",
+		firstTask.ID, pol.TTL.Round(time.Second))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	// Also wake at first-task expiry so single-task servers don't linger forever.
-	timer := time.NewTimer(time.Until(firstTask.ExpiresAt))
-	defer timer.Stop()
-	select {
-	case <-sig:
-	case <-timer.C:
-		fmt.Fprintf(os.Stderr, "catflap serve: task expired, shutting down\n")
-	}
+	<-sig
+	fmt.Fprintf(os.Stderr, "catflap serve: shutting down, destroying all task keys\n")
+	_ = ln.Close()
+	_ = os.Remove(*statePath)
+	s.shutdown()
 	return 0
+}
+
+// mkTask creates one task with its own ephemeral network server and arms
+// its expiry: timer → server.Close + audit.Close + store.Delete.
+func (s *server) mkTask(p *policy.Policy, pYAML []byte) (*capability.Capability, *gateway.Task, error) {
+	taskID := capability.NewTaskID()
+	secret := capability.NewSecret()
+	expires := time.Now().Add(p.TTL)
+	agentKey := ""
+	var clientPriv string
+	if s.transport == "tailcat" {
+		priv, pub, err := tct.GenerateClientKey()
+		if err != nil {
+			return nil, nil, err
+		}
+		clientPriv, agentKey = priv, pub
+	}
+	alog, err := audit.Open(s.auditDir, taskID, agentKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("audit: %w", err)
+	}
+	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, ExpiresAt: expires, Audit: alog, AgentKey: agentKey}
+	s.store.Add(t)
+
+	var srv transport.Server
+	if s.transport == "tailcat" {
+		srv, err = tct.Serve(s.store.Handler(), []string{agentKey}, s.verbose)
+	} else if s.transport == "local" {
+		srv, err = local.Serve(s.store.Handler())
+	} else {
+		err = fmt.Errorf("unknown transport %q (tailcat|local)", s.transport)
+	}
+	if err != nil {
+		s.store.Delete(taskID)
+		_ = alog.Close()
+		return nil, nil, fmt.Errorf("start task server: %w", err)
+	}
+	lt := &liveTask{task: t, srv: srv}
+	t.OnStopFunc(func() { _ = srv.Close() })
+	lt.timer = time.AfterFunc(time.Until(expires), func() { s.expire(taskID) })
+	s.mu.Lock()
+	s.live[taskID] = lt
+	s.mu.Unlock()
+
+	cap := &capability.Capability{
+		Version: 1, TaskID: taskID,
+		Transport: s.transport, Endpoint: srv.Addr(),
+		ClientPriv: clientPriv, TaskSecret: secret,
+		ExpiresAt: expires, Policy: p.Name,
+		PolicyHash: capability.PolicyHashOf(pYAML),
+	}
+	return cap, t, nil
+}
+
+// expire destroys one task: network identity dies here, not just RPC auth.
+func (s *server) expire(taskID string) {
+	s.mu.Lock()
+	lt, ok := s.live[taskID]
+	if ok {
+		delete(s.live, taskID)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	lt.timer.Stop()
+	lt.task.Stop() // closes this task's server + audit
+	s.store.Delete(taskID)
+	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
+}
+
+// shutdown destroys every live task.
+func (s *server) shutdown() {
+	s.mu.Lock()
+	live := s.live
+	s.live = map[string]*liveTask{}
+	s.mu.Unlock()
+	for id, lt := range live {
+		lt.timer.Stop()
+		lt.task.Stop()
+		s.store.Delete(id)
+	}
 }
 
 func loadPolicy(path string) (*policy.Policy, []byte, error) {
