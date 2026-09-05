@@ -72,6 +72,18 @@ type GrantResponse struct {
 	Policy     string `json:"policy"`
 }
 
+// RevokeRequest asks the running server to destroy one task.
+type RevokeRequest struct {
+	Task string `json:"task"`
+}
+
+// RevokeResponse reports the outcome. Status is "revoked" or "unknown"
+// (already gone); both are idempotent success.
+type RevokeResponse struct {
+	Task   string `json:"task"`
+	Status string `json:"status"`
+}
+
 // PostGrant calls the admin API.
 func PostGrant(adminAddr, token string, req GrantRequest) (*GrantResponse, error) {
 	body, merr := json.Marshal(req)
@@ -101,6 +113,37 @@ func PostGrant(adminAddr, token string, req GrantRequest) (*GrantResponse, error
 	}
 	if _, err := capability.Decode(out.Capability); err != nil {
 		return nil, fmt.Errorf("server returned invalid capability: %w", err)
+	}
+	return &out, nil
+}
+
+// PostRevoke calls the admin API to destroy one task. Unknown tasks are
+// idempotent success (status "unknown"), not errors.
+func PostRevoke(adminAddr, token, taskID string) (*RevokeResponse, error) {
+	body, merr := json.Marshal(RevokeRequest{Task: taskID})
+	if merr != nil {
+		return nil, fmt.Errorf("encode revoke request: %w", merr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "http://"+adminAddr+"/revoke", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("revoke request: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("revoke failed (%d): %s", res.StatusCode, string(raw))
+	}
+	var out RevokeResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parse revoke response: %w", err)
 	}
 	return &out, nil
 }

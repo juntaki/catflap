@@ -27,6 +27,8 @@ func run(args []string) int {
 		return cli.Serve(args[1:])
 	case "grant":
 		return cli.Grant(args[1:])
+	case "revoke":
+		return cli.Revoke(args[1:])
 	case "mcp":
 		return cli.MCP(args[1:])
 	case "version", "--version", "-V":
@@ -48,7 +50,8 @@ func usage() {
 Usage:
   catflap serve [--policy p.yaml] [--ttl 15m] [--transport tailcat|local]
   catflap grant [--policy p.yaml] [--ttl 15m]
-  catflap mcp <capability>
+  catflap revoke <task>
+  catflap mcp --cap-file <cap>
 
 Give an AI agent access to a machine, not a credential.
 The access dies with the task.

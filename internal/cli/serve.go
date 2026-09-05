@@ -140,6 +140,34 @@ func Serve(args []string) int {
 			ExpiresAt: cap.ExpiresAt.Format(time.RFC3339), Policy: cap.Policy,
 		})
 	})
+	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if "Bearer "+adminToken != strings.TrimSpace(r.Header.Get("Authorization")) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var rreq RevokeRequest
+		body, _ := io_ReadAll(r.Body, 1<<20)
+		_ = json.Unmarshal(body, &rreq)
+		if strings.TrimSpace(rreq.Task) == "" {
+			http.Error(w, "missing task", http.StatusBadRequest)
+			return
+		}
+		// Idempotent: revoking an unknown (already gone) task succeeds
+		// with status "unknown" — repeated revoke is not an error.
+		status := "unknown"
+		if lt := s.takeLive(rreq.Task); lt != nil {
+			lt.timer.Stop()
+			lt.task.Stop("revoked") // same teardown as expiry
+			s.store.Delete(rreq.Task)
+			status = "revoked"
+			fmt.Fprintf(os.Stderr, "catflap serve: task %s revoked — server closed, address dead\n", rreq.Task)
+		}
+		_ = json.NewEncoder(w).Encode(RevokeResponse{Task: rreq.Task, Status: status})
+	})
 	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
 		if "Bearer "+adminToken != strings.TrimSpace(r.Header.Get("Authorization")) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -233,8 +261,10 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		err = fmt.Errorf("unknown transport %q (tailcat|local)", s.transport)
 	}
 	if err != nil {
+		// Creation failed: run the same teardown (terminal event + close)
+		// so a half-created task never lingers. No capability is emitted.
+		t.Stop("failed")
 		s.store.Delete(taskID)
-		_ = alog.Close()
 		return nil, nil, fmt.Errorf("start task server: %w", err)
 	}
 	lt := &liveTask{task: t, srv: srv}
@@ -243,6 +273,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 	s.mu.Lock()
 	s.live[taskID] = lt
 	s.mu.Unlock()
+	t.Activate() // ACTIVE only now: server, binding, audit, expiry all armed
 
 	cap := &capability.Capability{
 		Version: 1, TaskID: taskID,
@@ -254,6 +285,18 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		PolicyHash: p.CanonicalHash()[:12],
 	}
 	return cap, t, nil
+}
+
+// takeLive removes a live task from the registry and returns it.
+// Used by revoke; expiry uses its own path via expire().
+func (s *server) takeLive(taskID string) *liveTask {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lt, ok := s.live[taskID]
+	if ok {
+		delete(s.live, taskID)
+	}
+	return lt
 }
 
 // expire destroys one task: network identity dies here, not just RPC auth.

@@ -33,6 +33,7 @@ func testStore(t *testing.T, ttl time.Duration) (*Store, *Task) {
 	}
 	s := &Store{}
 	s.Add(task)
+	task.Activate()
 	return s, task
 }
 
@@ -50,6 +51,7 @@ func testStoreWithPolicy(t *testing.T, p *policy.Policy, ttl time.Duration) (*St
 	}
 	s := &Store{}
 	s.Add(task)
+	task.Activate()
 	return s, task
 }
 
@@ -198,6 +200,8 @@ func TestEndpointTaskBinding(t *testing.T) {
 	taskA, taskB := mkTask("agt_a", "secret-a"), mkTask("agt_b", "secret-b")
 	s.Add(taskA)
 	s.Add(taskB)
+	taskA.Activate()
+	taskB.Activate()
 	srvA, err := local.Serve(s.HandlerFor("agt_a"))
 	if err != nil {
 		t.Fatal(err)
@@ -371,6 +375,46 @@ tools:
 	run("expired", "capability expired")
 	run("revoked", "task revoked")
 	run("shutdown", "task shutdown")
+}
+
+// TestLifecycleStates walks CREATING → ACTIVE → STOPPING → STOPPED and
+// checks the operation gate at each step. Stop is idempotent.
+func TestLifecycleStates(t *testing.T) {
+	alog, err := audit.Open("", "agt_life", "nodekey:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{
+		ID: "agt_life", Secret: "s3cret",
+		Policy:    policy.Default(),
+		ExpiresAt: time.Now().Add(time.Minute),
+		Audit:     alog,
+	}
+	if task.StateOf() != StateCreating {
+		t.Errorf("new task state = %s, want creating", task.StateOf())
+	}
+	if task.beginOp() {
+		t.Error("creating task must reject operations")
+		task.endOp()
+	}
+	task.InitContext(context.Background())
+	task.Activate()
+	if task.StateOf() != StateActive {
+		t.Errorf("after Activate state = %s, want active", task.StateOf())
+	}
+	if !task.beginOp() {
+		t.Fatal("active task must accept operations")
+	}
+	task.endOp()
+	task.Stop("revoked")
+	if task.StateOf() != StateStopped {
+		t.Errorf("after Stop state = %s, want stopped", task.StateOf())
+	}
+	if task.beginOp() {
+		t.Error("stopped task must reject operations")
+		task.endOp()
+	}
+	task.Stop("revoked") // idempotent: no panic, no second terminal event
 }
 
 func TestUnknownTask(t *testing.T) {

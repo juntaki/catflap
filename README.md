@@ -39,8 +39,13 @@ together**, and both vanish on expiry:
 ```text
 CREATE (task id, ephemeral server+client keys, frozen policy, own address)
   → ACTIVE (MCP calls, each allow/deny audited)
-    → EXPIRE (server.Close: identity, PSK, address, and auth die together)
+    → EXPIRE / REVOKE / SHUTDOWN (server.Close: identity, PSK, address, and auth die together)
 ```
+
+Tasks move CREATING → ACTIVE → STOPPING → STOPPED; only ACTIVE tasks
+accept operations, and every termination path funnels through one ordered
+teardown (stop-accepting → cancel with cause → bounded drain → terminal
+`task.stop` audit event → server close → audit close).
 
 ## Status: v0.1.2 (security semantics)
 
@@ -76,6 +81,10 @@ go build -o bin/catflap ./cmd/catflap
 # 2. (optional) mint more tasks while serve runs — each a new address
 ./bin/catflap grant --policy ./examples/policies/readonly-debug.yaml \
   --ttl 15m --out ./task2.cap
+
+# 2b. (optional) revoke a task early: same teardown as expiry —
+# in-flight ops cancelled, endpoint closed, secrets deleted (idempotent)
+./bin/catflap revoke --state <state-file> agt_…
 
 # 3. agent side: register as an MCP server (file, not argv)
 ./bin/catflap mcp --cap-file ./task.cap

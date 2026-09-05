@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -42,11 +43,40 @@ func causeForReason(reason string) error {
 	}
 }
 
+// State is the task lifecycle state (§8). The zero value is StateCreating;
+// a task becomes usable only after Activate, and Stop drives it through
+// StateStopping to StateStopped exactly once.
+type State int32
+
+const (
+	StateCreating State = iota
+	StateActive
+	StateStopping
+	StateStopped
+)
+
+// String reports the lifecycle state for logs and diagnostics.
+func (s State) String() string {
+	switch s {
+	case StateCreating:
+		return "creating"
+	case StateActive:
+		return "active"
+	case StateStopping:
+		return "stopping"
+	case StateStopped:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
 // Task is one live ephemeral grant: policy snapshot + expiry + audit chain.
-// Stop tears the whole task down; expiry and shutdown both funnel through it.
+// Stop tears the whole task down; expiry, revoke, and shutdown all funnel
+// through it.
 //
 // The task owns a context: every in-flight operation derives from it, so
-// expiry cancels running execs instead of orphaning them past the TTL.
+// termination cancels running execs instead of orphaning them past the TTL.
 // "The access dies with the task" includes already-started processes.
 type Task struct {
 	ID        string
@@ -59,16 +89,24 @@ type Task struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 	stopOnce sync.Once
-	// opMu + stopping + wg form the operation registry: Stop flips stopping
+	// opMu + state + wg form the operation registry: Stop flips the state
 	// (new ops fail), cancels the context (running ops die), then drains
 	// in-flight ops boundedly before the terminal audit event and close.
-	opMu     sync.Mutex
-	stopping bool
-	wg       sync.WaitGroup
+	opMu  sync.Mutex
+	state atomic.Int32 // State
+	wg    sync.WaitGroup
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
 }
+
+// StateOf returns the current lifecycle state.
+func (t *Task) StateOf() State { return State(t.state.Load()) }
+
+// Activate moves a created task to ACTIVE. Called once the task's server,
+// handler binding, audit, and expiry are all armed — capabilities MUST NOT
+// be emitted before this point (§8.1).
+func (t *Task) Activate() { t.state.Store(int32(StateActive)) }
 
 // InitContext arms the task's cancellation scope under a non-nil parent
 // (the serve root context in production, Background in tests). Idempotent.
@@ -100,7 +138,7 @@ func (t *Task) Stop(reason string) {
 			reason = "shutdown"
 		}
 		t.opMu.Lock()
-		t.stopping = true
+		t.state.Store(int32(StateStopping))
 		t.opMu.Unlock()
 		if t.cancel != nil {
 			t.cancel(causeForReason(reason)) // kill running trees with cause
@@ -120,15 +158,16 @@ func (t *Task) Stop(reason string) {
 		if t.Audit != nil {
 			_ = t.Audit.Close()
 		}
+		t.state.Store(int32(StateStopped))
 	})
 }
 
-// beginOp registers an in-flight operation. False means the task is
-// STOPPING/STOPPED and the call MUST be rejected.
+// beginOp registers an in-flight operation. False means the task is not
+// ACTIVE (creating, stopping, stopped) and the call MUST be rejected.
 func (t *Task) beginOp() bool {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
-	if t.stopping {
+	if State(t.state.Load()) != StateActive {
 		return false
 	}
 	t.wg.Add(1)
