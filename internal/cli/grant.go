@@ -45,7 +45,7 @@ func Grant(args []string) int {
 		return 1
 	}
 	if *outPath != "" {
-		if err := os.WriteFile(*outPath, []byte(res.Capability+"\n"), 0o600); err != nil {
+		if err := writeCapFile(*outPath, res.Capability); err != nil {
 			fmt.Fprintf(os.Stderr, "grant: write --out: %v\n", err)
 			return 1
 		}

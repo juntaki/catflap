@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/policy"
 	"github.com/juntaki/catflap/internal/rpc"
+	"github.com/juntaki/catflap/internal/transport/local"
 )
 
 func testStore(t *testing.T, ttl time.Duration) (*Store, *Task) {
@@ -167,7 +169,135 @@ func TestBadSecretAndExpiry(t *testing.T) {
 	}
 }
 
-// TestUnknownTask: deleted (GC'd) tasks authenticate as unknown.
+// TestEndpointTaskBinding is the cross-credential quadrant test: each task
+// owns an endpoint, and a valid secret for task B is useless at A's endpoint.
+func TestEndpointTaskBinding(t *testing.T) {
+	mkTask := func(id, secret string) *Task {
+		alog, err := audit.Open("", id, "nodekey:test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tk := &Task{ID: id, Secret: secret, Policy: policy.Default(),
+			ExpiresAt: time.Now().Add(time.Minute), Audit: alog}
+		tk.InitContext()
+		return tk
+	}
+	s := &Store{}
+	taskA, taskB := mkTask("agt_a", "secret-a"), mkTask("agt_b", "secret-b")
+	s.Add(taskA)
+	s.Add(taskB)
+	srvA, err := local.Serve(s.HandlerFor("agt_a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srvA.Close()
+	srvB, err := local.Serve(s.HandlerFor("agt_b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srvB.Close()
+	taskA.OnStopFunc(func() { _ = srvA.Close() })
+	taskB.OnStopFunc(func() { _ = srvB.Close() })
+	defer taskA.Stop()
+	defer taskB.Stop()
+
+	dial := func(addr string) net.Conn {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	try := func(addr, taskID, secret string) rpc.Response {
+		c := dial(addr)
+		defer c.Close()
+		raw, _ := json.Marshal(rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
+		if err := rpc.WriteRequest(c, rpc.Request{Task: taskID, Secret: secret, ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
+			t.Fatal(err)
+		}
+		res, err := rpc.ReadResponse(bufio.NewReader(c))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	if res := try(srvA.Addr(), "agt_a", "secret-a"); !res.OK {
+		t.Errorf("A endpoint + A secret should allow: %s", res.Error)
+	}
+	if res := try(srvB.Addr(), "agt_b", "secret-b"); !res.OK {
+		t.Errorf("B endpoint + B secret should allow: %s", res.Error)
+	}
+	// Stolen-secret cross-use: valid B secret at A's endpoint must deny.
+	if res := try(srvA.Addr(), "agt_b", "secret-b"); res.OK {
+		t.Error("A endpoint + B secret (stolen) must be denied")
+	}
+	if res := try(srvB.Addr(), "agt_a", "secret-a"); res.OK {
+		t.Error("B endpoint + A secret (stolen) must be denied")
+	}
+	// Wrong secret anywhere must deny.
+	if res := try(srvA.Addr(), "agt_a", "secret-b"); res.OK {
+		t.Error("A endpoint + wrong secret must be denied")
+	}
+}
+
+// TestExpiryKillsInflightExec (C7): stopping the task kills a running exec
+// instead of orphaning it past the TTL.
+func TestExpiryKillsInflightExec(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("no /bin/sleep on this machine")
+	}
+	p, err := policy.Parse([]byte(`
+name: sleeper
+ttl: 15m
+tools:
+  exec:
+    allow:
+      - command: /bin/sleep
+        args: [{ integer: { max: 60 } }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, task := testStoreWithPolicy(t, p, time.Minute)
+	task.InitContext()
+
+	type outcome struct {
+		res rpc.Response
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		go s.Handler()(c2)
+		raw, _ := json.Marshal(rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
+		if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
+			done <- outcome{err: err}
+			return
+		}
+		res, err := rpc.ReadResponse(bufio.NewReader(c1))
+		done <- outcome{res: res, err: err}
+	}()
+	time.Sleep(500 * time.Millisecond) // let sleep(30) start
+	start := time.Now()
+	task.Stop() // simulate TTL expiry
+	s.Delete(task.ID)
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("rpc failed: %v", out.err)
+	}
+	if out.res.OK || out.res.Error != "capability expired" {
+		t.Errorf("killed exec must report expiry, got %+v", out.res)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Errorf("exec survived Stop by %s (should die immediately)", elapsed)
+	}
+}
 func TestUnknownTask(t *testing.T) {
 	s, task := testStore(t, time.Minute)
 	task.Stop()

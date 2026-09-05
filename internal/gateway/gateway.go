@@ -22,6 +22,10 @@ import (
 
 // Task is one live ephemeral grant: policy snapshot + expiry + audit chain.
 // Stop tears the whole task down; expiry and shutdown both funnel through it.
+//
+// The task owns a context: every in-flight operation derives from it, so
+// expiry cancels running execs instead of orphaning them past the TTL.
+// "The access dies with the task" includes already-started processes.
 type Task struct {
 	ID        string
 	Secret    string
@@ -30,16 +34,37 @@ type Task struct {
 	Audit     *audit.Logger
 	AgentKey  string
 
+	ctx      context.Context
+	cancel   context.CancelFunc
 	stopOnce sync.Once
 	// onStop releases task-external resources (its Tailcat server).
 	// Set by the serve loop; nil in tests.
 	onStop func()
 }
 
-// Stop destroys the task: closes audit, releases the network server,
-// and must be followed by Store.Delete.
+// InitContext arms the task's cancellation scope. Idempotent; safe to call
+// on zero-value-derived tasks used in tests.
+func (t *Task) InitContext() {
+	if t.ctx == nil {
+		t.ctx, t.cancel = context.WithCancel(context.Background())
+	}
+}
+
+// Context returns the task scope, or Background for tasks that never armed it.
+func (t *Task) Context() context.Context {
+	if t.ctx == nil {
+		return context.Background()
+	}
+	return t.ctx
+}
+
+// Stop destroys the task: cancels in-flight operations first, then closes
+// audit and releases the network server. Must be followed by Store.Delete.
 func (t *Task) Stop() {
 	t.stopOnce.Do(func() {
+		if t.cancel != nil {
+			t.cancel() // kill running execs before releasing anything else
+		}
 		if t.onStop != nil {
 			t.onStop()
 		}
@@ -118,30 +143,54 @@ func (s *Store) List() []TaskInfo {
 func (t *Task) Expired(now time.Time) bool { return !t.ExpiresAt.IsZero() && now.After(t.ExpiresAt) }
 
 // Handler returns a transport.Handler dispatching JSONL RPC with per-task auth.
+// The handler is unbound: any task in the store may authenticate. Prefer
+// HandlerFor so a stolen secret cannot be replayed at another task's endpoint.
 func (s *Store) Handler() func(net.Conn) {
-	return func(conn net.Conn) {
-		defer conn.Close()
-		r := bufio.NewReaderSize(conn, 64<<10)
-		for {
-			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-			req, err := rpc.ReadRequest(r)
-			if err != nil {
-				return
-			}
-			res := s.handle(req)
-			if err := rpc.WriteResponse(conn, res); err != nil {
-				return
-			}
+	return func(conn net.Conn) { s.serveConn(conn, "") }
+}
+
+// HandlerFor returns a handler bound to one task: requests naming any other
+// task are denied BEFORE secret lookup, even when the secret is valid.
+// This binds network credential (which endpoint you reached) to RPC
+// credential (which task secret you present): A-endpoint + B-secret = DENY.
+func (s *Store) HandlerFor(taskID string) func(net.Conn) {
+	return func(conn net.Conn) { s.serveConn(conn, taskID) }
+}
+
+func (s *Store) serveConn(conn net.Conn, boundTaskID string) {
+	defer conn.Close()
+	r := bufio.NewReaderSize(conn, 64<<10)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		req, err := rpc.ReadRequest(r)
+		if err != nil {
+			return
+		}
+		res := s.handleRPC(req, boundTaskID)
+		if err := rpc.WriteResponse(conn, res); err != nil {
+			return
 		}
 	}
 }
 
 func (s *Store) handle(req RequestAlias) ResponseAlias {
-	return s.handleRPC(req)
+	return s.handleRPC(req, "")
 }
 
 // handleRPC authenticates then dispatches one call with auditing.
-func (s *Store) handleRPC(req rpc.Request) rpc.Response {
+// boundTaskID, when non-empty, pins this connection to one task: a request
+// for any other task is denied before its secret is even examined.
+func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
+	if boundTaskID != "" && req.Task != boundTaskID {
+		// Attribute the attempt to the endpoint owner for forensics.
+		s.mu.RLock()
+		owner := s.tasks[boundTaskID]
+		s.mu.RUnlock()
+		if owner != nil && owner.Audit != nil {
+			owner.Audit.Log(req.Tool, req.Args, "deny", nil, 0)
+		}
+		return rpc.Response{ID: req.ID, OK: false, Error: "task does not belong to this endpoint"}
+	}
 	t, ok := s.Lookup(req.Task, req.Secret)
 	if !ok {
 		return rpc.Response{ID: req.ID, OK: false, Error: "unknown task or bad secret"}
@@ -187,7 +236,7 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	if timeout > 2*time.Minute {
 		timeout = 2 * time.Minute
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	defer cancel()
 	// No shell, ever: argv goes straight to the pinned executable.
 	cmd := exec.CommandContext(ctx, exe, args.Args...)
@@ -198,6 +247,14 @@ func (s *Store) doExec(t *Task, req rpc.Request) rpc.Response {
 	err := cmd.Run()
 	res := rpc.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
+		// Task death outranks every other failure: an exec killed by
+		// expiry must report expiry, never a normal result.
+		if t.Context().Err() != nil {
+			if t.Audit != nil {
+				t.Audit.Log(req.Tool, req.Args, "expired", nil, time.Since(start))
+			}
+			return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
+		}
 		if ee, ok := err.(*exec.ExitError); ok {
 			res.ExitCode = ee.ExitCode()
 		} else {

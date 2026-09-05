@@ -42,14 +42,17 @@ CREATE (task id, ephemeral server+client keys, frozen policy, own address)
     → EXPIRE (server.Close: identity, PSK, address, and auth die together)
 ```
 
-## Status: v0.1.1 (security semantics)
+## Status: v0.1.2 (security semantics)
 
 - [x] 1 task = 1 Tailcat server (per-task key, PSK, address; expiry = Close)
+- [x] Endpoint↔task binding: a secret stolen from task B is useless at A's endpoint
+- [x] Expiry cancels in-flight execs (task-scoped context; nothing orphans past TTL)
 - [x] Structured argv exec — no shell anywhere (`;`, `&&`, `$()` are inert)
 - [x] Symlink/root-escape rejection on file tools
 - [x] Ephemeral capabilities (`agc1_…`), TTL, `serve` / `grant` / `mcp`
-- [x] `--cap-file` / `--out` flows so tokens avoid argv and shell history
+- [x] `--cap-file` / `--out` flows (atomic 0600 writes) so tokens avoid argv and shell history
 - [x] Hash-chained JSONL audit
+- [x] CI: `go vet` + `go test` + `go build` on push/PR
 - [ ] Human approval, network restrictions, specialized adapters (roadmap)
 
 ## Quickstart
@@ -184,6 +187,10 @@ Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
 - Every task owns a Tailcat server: fresh key + PSK, `AllowedClients`
   containing only that task's client key, single RPC port in
   `ServedTCPPorts`, `Close()` on expiry deleting the address itself.
+  The handler is bound to the task id, so network credential A +
+  RPC credential B denies: cross-endpoint secret replay fails.
+- Task expiry cancels in-flight operations first (task-scoped context),
+  then closes the server and audit: no process outlives its TTL.
 - Every decision (allow/deny/expired/error) is hash-chained to JSONL.
 - Bearer tokens travel via files (`--out` / `--cap-file`), not argv.
 
@@ -217,6 +224,7 @@ testdata/               e2e drivers (local + live-Tailcat probes) + adversarial 
 ```text
 v0.1   Tailcat transport, ephemeral credentials, TTL, exec/read/stat, JSONL audit ✓
 v0.1.1 security semantics: structured argv, symlink封じ, 1 task = 1 server, Close, cap-file ✓
+v0.1.2 endpoint↔task binding, TTL cancels in-flight exec, atomic --out, CI ✓
 v0.2   human approval, read/write distinction, network restrictions, resource limits
 v0.3   audit verify + external anchor, specialized adapters: PostgreSQL, Docker, GPU, serial/robot
 v0.4   remote task issuance: GitHub Actions / Claude Code / Codex integration

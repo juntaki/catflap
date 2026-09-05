@@ -11,7 +11,7 @@ import (
 	"github.com/juntaki/catflap/internal/cli"
 )
 
-const version = "0.1.0"
+const version = "0.1.2"
 
 func main() {
 	os.Exit(run(os.Args[1:]))

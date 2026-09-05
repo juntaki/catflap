@@ -160,7 +160,7 @@ func Serve(args []string) int {
 	}
 
 	if *outPath != "" {
-		if err := os.WriteFile(*outPath, []byte(firstCap.Encode()+"\n"), 0o600); err != nil {
+		if err := writeCapFile(*outPath, firstCap.Encode()); err != nil {
 			fmt.Fprintf(os.Stderr, "write --out: %v\n", err)
 			s.shutdown()
 			return 1
@@ -204,13 +204,16 @@ func (s *server) mkTask(p *policy.Policy, pYAML []byte) (*capability.Capability,
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
 	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, ExpiresAt: expires, Audit: alog, AgentKey: agentKey}
+	t.InitContext() // in-flight execs die with the task (C7)
 	s.store.Add(t)
 
 	var srv transport.Server
 	if s.transport == "tailcat" {
-		srv, err = tct.Serve(s.store.Handler(), []string{agentKey}, s.verbose)
+		// Bound handler: only this task authenticates at this endpoint,
+		// even with another task's valid secret.
+		srv, err = tct.Serve(s.store.HandlerFor(taskID), []string{agentKey}, s.verbose)
 	} else if s.transport == "local" {
-		srv, err = local.Serve(s.store.Handler())
+		srv, err = local.Serve(s.store.HandlerFor(taskID))
 	} else {
 		err = fmt.Errorf("unknown transport %q (tailcat|local)", s.transport)
 	}
