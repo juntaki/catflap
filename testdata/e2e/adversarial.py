@@ -144,12 +144,12 @@ def main():
         s = socket.create_connection((host, int(port)), timeout=10)
         try:
             s.sendall(b"z" * (4 * 1024 * 1024))  # no newline: must not balloon memory
-        except BrokenPipeError:
+        except OSError:
             pass  # server already hung up at the bound: ideal outcome
         s.settimeout(10)
         try:
             data = s.recv(4096)
-        except (socket.timeout, ConnectionResetError, BrokenPipeError):
+        except OSError:
             data = b""
         s.close()
         check("newline-less flood killed", data == b"", "got %d bytes" % len(data))

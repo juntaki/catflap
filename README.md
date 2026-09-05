@@ -123,10 +123,10 @@ in-flight remote operations from the MCP side is future work (expiry and
 revoke kill server-side meanwhile).
 
 Gateway RPC frames are bounded at 2MiB, enforced incrementally on receipt
-and checked before send. Every content-size grant (stdout/stderr/read/
-write) is capped so even fully-adversarial bytes (worst-case 6x JSON
-escaping) fit one frame — a valid policy is always executable. Larger
-payloads need chunked tools (future), not larger limits.
+and checked before send. All policy-controlled content limits are capped
+so even fully-adversarial bytes (worst-case 6x JSON escaping) fit one
+frame. Argument vectors are unbounded by policy (use tight argv shapes) —
+content limits, not argv, carry the frame guarantee.
 
 ## Policy
 

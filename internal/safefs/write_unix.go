@@ -60,13 +60,10 @@ func writeNewAt(f *FS, rootIdx int, comps []string, display string, data []byte,
 	if err != nil {
 		return err
 	}
-	if werr := writeSyncClose(fd, display, data); werr != nil {
-		// Best effort rollback of a half-created file; the path was
-		// verified absent above, so removal cannot delete user data.
-		_ = removeAt(f, rootIdx, comps)
-		return werr
-	}
-	return nil
+	// No rollback on failure: unlinking here could delete a file another
+	// writer created concurrently after our exclusive create. A partial
+	// 0600 file is owner-only and safe to leave for the operator.
+	return writeSyncClose(fd, display, data)
 }
 
 // existingMode returns the current file mode, or an error when absent.
@@ -190,16 +187,6 @@ func atomicReplace(f *FS, rootIdx int, comps []string, data []byte, mode uint32,
 	}
 	failed = false
 	return nil
-}
-
-// removeAt unlinks comps under the walked parent (rollback only).
-func removeAt(f *FS, rootIdx int, comps []string) error {
-	dirFd, err := walkParent(f.roots[rootIdx], comps[:len(comps)-1])
-	if err != nil {
-		return err
-	}
-	defer closeFd(dirFd)
-	return unlinkAt(dirFd, comps[len(comps)-1])
 }
 
 func randHex(n int) string {

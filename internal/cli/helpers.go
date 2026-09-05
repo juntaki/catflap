@@ -29,8 +29,7 @@ func openAnchorLog(path string) (*os.File, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	//nolint:gosec // reason: operator-supplied anchor path, append-only, 0600; symlinks rejected by Lstat above.
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	return openAppendNoFollow(path)
 }
 
 // writeCapFile stores a bearer token so it never appears in argv/history.

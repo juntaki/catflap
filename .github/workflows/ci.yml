@@ -48,6 +48,19 @@ jobs:
           go-version-file: go.mod
           go-package: ./...
 
+  deadcode:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./...
+
   e2e:
     runs-on: ubuntu-latest
 

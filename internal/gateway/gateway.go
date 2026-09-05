@@ -53,22 +53,6 @@ const (
 	StateStopped
 )
 
-// String reports the lifecycle state for logs and diagnostics.
-func (s State) String() string {
-	switch s {
-	case StateCreating:
-		return "creating"
-	case StateActive:
-		return "active"
-	case StateStopping:
-		return "stopping"
-	case StateStopped:
-		return "stopped"
-	default:
-		return "unknown"
-	}
-}
-
 // Task is one live ephemeral grant: policy snapshot + expiry + audit chain.
 // Stop tears the whole task down; expiry, revoke, and shutdown all funnel
 // through it.
@@ -103,11 +87,6 @@ type Task struct {
 
 // StateOf returns the current lifecycle state.
 func (t *Task) StateOf() State { return State(t.state.Load()) }
-
-// Activate moves a created task to ACTIVE. Called once the task's server,
-// handler binding, audit, and expiry are all armed — capabilities MUST NOT
-// be emitted before this point (§8.1).
-func (t *Task) Activate() { t.state.Store(int32(StateActive)) }
 
 // TryActivate moves a created task to ACTIVE, but only from CREATING.
 // Compare-and-swap: a task that already left Creating (stopping, stopped)
@@ -253,12 +232,17 @@ type TaskInfo struct {
 	AgentKey  string
 }
 
-// List returns task snapshots for the admin API.
+// List returns snapshots of ACTIVE tasks for the admin API. Tasks still
+// being admitted (CREATING) are invisible until commit: grant-in-flight
+// tasks must neither appear in `tasks` nor be revokable before they exist.
 func (s *Store) List() []TaskInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]TaskInfo, 0, len(s.tasks))
 	for _, t := range s.tasks {
+		if t.StateOf() != StateActive {
+			continue
+		}
 		name := ""
 		if t.Policy != nil {
 			name = t.Policy.Name
@@ -270,13 +254,6 @@ func (s *Store) List() []TaskInfo {
 
 // Expired reports whether the task is past its TTL.
 func (t *Task) Expired(now time.Time) bool { return !t.ExpiresAt.IsZero() && now.After(t.ExpiresAt) }
-
-// Handler returns a transport.Handler dispatching JSONL RPC with per-task auth.
-// The handler is unbound: any task in the store may authenticate. Prefer
-// HandlerFor so a stolen secret cannot be replayed at another task's endpoint.
-func (s *Store) Handler() func(net.Conn) {
-	return func(conn net.Conn) { s.serveConn(conn, "") }
-}
 
 // HandlerFor returns a handler bound to one task: requests naming any other
 // task are denied BEFORE secret lookup, even when the secret is valid.

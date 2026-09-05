@@ -88,19 +88,6 @@ func GenerateClientKey() (privText, pubText string, err error) {
 	return string(b), string(pb), nil
 }
 
-// ParseClientPublic derives the nodekey:... public half from a private half.
-func ParseClientPublic(privText string) (string, error) {
-	var priv key.NodePrivate
-	if err := priv.UnmarshalText([]byte(privText)); err != nil {
-		return "", err
-	}
-	b, err := priv.Public().MarshalText()
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
 // Dialer connects back to addr using the ephemeral client identity.
 func Dialer(addr, clientPrivText string, verbose bool) (transport.Client, error) {
 	var priv key.NodePrivate

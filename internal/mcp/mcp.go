@@ -121,6 +121,13 @@ func (s *Server) handleTool(name string) mcpsdk.ToolHandler {
 			return toolError(fmt.Sprintf("dial gateway: %v", err)), nil
 		}
 		defer func() { _ = conn.Close() }()
+		// Local cancellation only: if the MCP caller goes away, close the
+		// socket so this handler returns promptly instead of waiting out
+		// the full ceiling. The remote operation itself is NOT cancelled
+		// (future: request-scoped RPC cancel); expiry/revoke kills it
+		// server-side meanwhile.
+		stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stop()
 		if werr := rpc.WriteRequest(conn, rpc.Request{
 			Task: s.cap.TaskID, Secret: s.cap.TaskSecret,
 			ID: callID, Tool: name, Args: args,
@@ -159,26 +166,6 @@ func toolError(msg string) *mcpsdk.CallToolResult {
 // legacyTools is the tool set implied by a capability that predates the
 // tools field (v0.1.x): exec/read/stat, never write.
 var legacyTools = []string{rpc.ToolExec, rpc.ToolRead, rpc.ToolStat}
-
-// visibleTools filters the full tool definitions to the task's normalized
-// set. A nil capability list means a legacy capability.
-func visibleTools(granted []string) []map[string]any {
-	if granted == nil {
-		granted = legacyTools
-	}
-	allow := map[string]bool{}
-	for _, name := range granted {
-		allow[name] = true
-	}
-	var out []map[string]any
-	for _, def := range toolDefs() {
-		name, _ := def["name"].(string)
-		if allow[name] {
-			out = append(out, def)
-		}
-	}
-	return out
-}
 
 // exposed reports whether name is in the task's normalized tool set.
 func (s *Server) exposed(name string) bool {

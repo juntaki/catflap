@@ -34,7 +34,7 @@ func testStore(t *testing.T, ttl time.Duration) (*Store, *Task) {
 	task.InitContext(context.Background())
 	s := &Store{}
 	s.Add(task)
-	task.Activate()
+	task.TryActivate()
 	return s, task
 }
 
@@ -53,7 +53,7 @@ func testStoreWithPolicy(t *testing.T, p *policy.Policy, ttl time.Duration) (*St
 	task.InitContext(context.Background())
 	s := &Store{}
 	s.Add(task)
-	task.Activate()
+	task.TryActivate()
 	return s, task
 }
 
@@ -62,7 +62,7 @@ func call(t *testing.T, s *Store, tool string, args any) rpc.Response {
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()
 	defer func() { _ = c2.Close() }()
-	go s.Handler()(c2)
+	go s.HandlerFor("agt_test")(c2)
 	raw := mustJSON(t, args)
 	if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: tool, Args: raw}); err != nil {
 		t.Fatal(err)
@@ -168,7 +168,7 @@ func TestBadSecretAndExpiry(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()
 	defer func() { _ = c2.Close() }()
-	go s.Handler()(c2)
+	go s.HandlerFor("agt_test")(c2)
 	raw := mustJSON(t, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
 	_ = rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "wrong", ID: 1, Tool: rpc.ToolExec, Args: raw})
 	res, err := rpc.ReadResponse(bufio.NewReader(c1))
@@ -202,8 +202,8 @@ func TestEndpointTaskBinding(t *testing.T) {
 	taskA, taskB := mkTask("agt_a", "secret-a"), mkTask("agt_b", "secret-b")
 	s.Add(taskA)
 	s.Add(taskB)
-	taskA.Activate()
-	taskB.Activate()
+	taskA.TryActivate()
+	taskB.TryActivate()
 	srvA, err := local.Serve(s.HandlerFor("agt_a"))
 	if err != nil {
 		t.Fatal(err)
@@ -296,7 +296,7 @@ tools:
 		c1, c2 := net.Pipe()
 		defer func() { _ = c1.Close() }()
 		defer func() { _ = c2.Close() }()
-		go s.Handler()(c2)
+		go s.HandlerFor("agt_test")(c2)
 		raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
 		if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); err != nil {
 			done <- outcome{err: err}
@@ -354,7 +354,7 @@ tools:
 			c1, c2 := net.Pipe()
 			defer func() { _ = c1.Close() }()
 			defer func() { _ = c2.Close() }()
-			go s.Handler()(c2)
+			go s.HandlerFor("agt_test")(c2)
 			raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"30"}, TimeoutMs: 60000})
 			if werr := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); werr != nil {
 				done <- outcome{err: werr}
@@ -393,16 +393,16 @@ func TestLifecycleStates(t *testing.T) {
 		Audit:     alog,
 	}
 	if task.StateOf() != StateCreating {
-		t.Errorf("new task state = %s, want creating", task.StateOf())
+		t.Errorf("new task state = %d, want creating", task.StateOf())
 	}
 	if reason := task.beginOp(); reason == "" {
 		t.Error("creating task must reject operations")
 		task.endOp()
 	}
 	task.InitContext(context.Background())
-	task.Activate()
+	task.TryActivate()
 	if task.StateOf() != StateActive {
-		t.Errorf("after Activate state = %s, want active", task.StateOf())
+		t.Errorf("after Activate state = %d, want active", task.StateOf())
 	}
 	if reason := task.beginOp(); reason != "" {
 		t.Fatalf("active task must accept operations: %s", reason)
@@ -410,7 +410,7 @@ func TestLifecycleStates(t *testing.T) {
 	task.endOp()
 	task.Stop("revoked")
 	if task.StateOf() != StateStopped {
-		t.Errorf("after Stop state = %s, want stopped", task.StateOf())
+		t.Errorf("after Stop state = %d, want stopped", task.StateOf())
 	}
 	if reason := task.beginOp(); reason == "" {
 		t.Error("stopped task must reject operations")
@@ -452,7 +452,7 @@ tools:
 		c1, c2 := net.Pipe()
 		defer func() { _ = c1.Close() }()
 		defer func() { _ = c2.Close() }()
-		go s.Handler()(c2)
+		go s.HandlerFor("agt_test")(c2)
 		raw := mustJSON(t, rpc.ExecArgs{Command: "/bin/sleep", Args: []string{"5"}, TimeoutMs: 30000})
 		if werr := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw}); werr != nil {
 			t.Error(werr)
@@ -487,7 +487,7 @@ func TestUnknownTask(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer func() { _ = c1.Close() }()
 	defer func() { _ = c2.Close() }()
-	go s.Handler()(c2)
+	go s.HandlerFor("agt_test")(c2)
 	raw := mustJSON(t, rpc.ExecArgs{Command: "echo", Args: []string{"hi"}})
 	_ = rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: raw})
 	res, err := rpc.ReadResponse(bufio.NewReader(c1))
@@ -543,7 +543,7 @@ tools:
 		c1, c2 := net.Pipe()
 		defer func() { _ = c1.Close() }()
 		defer func() { _ = c2.Close() }()
-		go s.Handler()(c2)
+		go s.HandlerFor("agt_test")(c2)
 		// sh spawns a grandchild sleep; both must die on Stop.
 		raw := mustJSON(t, rpc.ExecArgs{
 			Command: "/bin/sh", Args: []string{"-c", "sleep 45"}, TimeoutMs: 60000,
