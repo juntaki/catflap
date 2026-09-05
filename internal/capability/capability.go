@@ -21,9 +21,12 @@ const Prefix = "agc1_"
 type Capability struct {
 	Version int    `json:"v"`
 	TaskID  string `json:"task"`
-	// Name is the task's human-readable name (unique per serve process),
-	// mirroring gateway.Task.Name; empty on legacy capabilities minted
-	// before task naming existed.
+	// Name is optional display metadata for humans (task lists, target
+	// selection), mirroring gateway.Task.Name. It is NEVER used for
+	// authorization or task binding — TaskID+TaskSecret alone govern
+	// access — and it is best-effort unique per serve process, not
+	// cryptographically guaranteed unique. Empty on legacy capabilities
+	// minted before task naming existed.
 	Name       string    `json:"name,omitempty"`
 	Transport  string    `json:"transport"` // "tailcat" or "local"
 	Endpoint   string    `json:"endpoint"`  // tailcat addr, or host:port for local

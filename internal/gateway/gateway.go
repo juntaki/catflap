@@ -104,6 +104,8 @@ func (t *Task) StateName() string {
 		return "active"
 	case StateStopping:
 		return "stopping"
+	case StateStopped:
+		return "stopped"
 	default:
 		return "stopped"
 	}
@@ -237,6 +239,30 @@ func (t *Task) endOp() {
 	t.wg.Done()
 }
 
+// beginControlOp admits a lifecycle tool (ping, revoke_self): it requires
+// ACTIVE like beginOp, closing the window where a task mid-teardown (state
+// STOPPING, already detached from most bookkeeping but not yet STOPPED)
+// could still answer these calls successfully — a caller using ping as a
+// "the task is alive and paired" signal must not observe true for a task
+// that is already dying. Unlike beginOp it does not consume the
+// concurrency semaphore: lifecycle calls are cheap and must never be
+// denied by policy-tool concurrency pressure. The caller MUST call
+// endControlOp on a "" return, and MUST do so before any Stop call it
+// makes — Stop's drain waits on the same wg this adds to.
+func (t *Task) beginControlOp() string {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
+	if State(t.state.Load()) != StateActive {
+		return "task stopping"
+	}
+	t.wg.Add(1)
+	return ""
+}
+
+func (t *Task) endControlOp() {
+	t.wg.Done()
+}
+
 // auditLog appends one audit record and, if the sink is now failing, stops
 // the task fail-closed. Every audit write in this package — including
 // handleRPC's early-return deny/expired paths, not just the tool
@@ -266,10 +292,6 @@ func (t *Task) auditLog(tool string, args []byte, decision string, result []byte
 type Store struct {
 	mu    sync.RWMutex
 	tasks map[string]*Task
-	// OnRevoked, when set, runs after a task self-revokes (revoke_self):
-	// the serve loop uses it to drop its timer and live-server entry.
-	// It runs after Stop, before Delete.
-	OnRevoked func(taskID string)
 }
 
 // Add registers a task.
@@ -387,21 +409,27 @@ func (s *Store) handleRPC(req rpc.Request, boundTaskID string) rpc.Response {
 		t.auditLog(req.Tool, req.Args, "expired", nil, 0)
 		return rpc.Response{ID: req.ID, OK: false, Error: "capability expired"}
 	}
-	// Lifecycle tools bypass policy tools and the concurrency semaphore:
-	// ping proves reachability/identity (and audits the pair), revoke_self
-	// lets the task's own agent destroy it (agent-side disconnect).
+	// Lifecycle tools bypass policy tools and the concurrency semaphore,
+	// but still require ACTIVE via beginControlOp: ping proves
+	// reachability/identity (and audits the pair), revoke_self lets the
+	// task's own agent destroy it (agent-side disconnect).
 	switch req.Tool {
 	case rpc.ToolPing:
-		if t.Audit != nil {
-			t.Audit.Log(req.Tool, req.Args, "allow", rpc.MustRaw(map[string]string{"task": t.ID}), 0)
+		if reason := t.beginControlOp(); reason != "" {
+			t.auditLog(req.Tool, req.Args, "deny", nil, 0)
+			return rpc.Response{ID: req.ID, OK: false, Error: reason}
 		}
+		defer t.endControlOp()
+		t.auditLog(req.Tool, req.Args, "allow", rpc.MustRaw(map[string]string{"task": t.ID}), 0)
 		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.PingResult{Task: t.ID})}
 	case rpc.ToolRevokeSelf:
+		if reason := t.beginControlOp(); reason != "" {
+			t.auditLog(req.Tool, req.Args, "deny", nil, 0)
+			return rpc.Response{ID: req.ID, OK: false, Error: reason}
+		}
+		t.endControlOp() // release before Stop: its drain waits on this wg
 		t.Stop("revoked")
 		s.Delete(t.ID)
-		if s.OnRevoked != nil {
-			s.OnRevoked(t.ID)
-		}
 		return rpc.Response{ID: req.ID, OK: true, Result: rpc.MustRaw(rpc.RevokeSelfResult{Revoked: true})}
 	}
 	if reason := t.beginOp(); reason != "" {

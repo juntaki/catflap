@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,8 +50,26 @@ func Publish(ctx context.Context, rendezvousURL string, env *Envelope, ttl time.
 	return nil
 }
 
+// ErrPairingNotFound means the id is missing, expired, or already
+// consumed — terminal: retrying with the same code cannot succeed.
+var ErrPairingNotFound = errors.New("pairing not found or expired (code used, wrong, or too old)")
+
+// ErrRendezvousRateLimited means the rendezvous is rate-limiting this
+// client — the envelope was NOT burned; retrying later can still succeed.
+var ErrRendezvousRateLimited = errors.New("rendezvous rate limited, retry later")
+
+// ErrRendezvousUnavailable means the rendezvous itself is unreachable or
+// erroring (network failure, 5xx) — not a verdict on the code; retrying
+// later can still succeed.
+var ErrRendezvousUnavailable = errors.New("rendezvous unavailable, retry later")
+
 // Fetch retrieves and burns the envelope for id. A second fetch for the
-// same id fails: envelopes are single-use.
+// same id fails: envelopes are single-use. The returned error is one of
+// the sentinels above (via errors.Is) so a caller — the eventual `mcp
+// pair` tool included — can tell "this code is dead" apart from
+// "rendezvous hiccup, try again", instead of every non-200 collapsing
+// into one "not found or expired" message that is simply wrong for a 429
+// or a 503.
 func Fetch(ctx context.Context, rendezvousURL, id string) (*Envelope, error) {
 	if id == "" || strings.ContainsAny(id, "/?#") {
 		return nil, fmt.Errorf("bad envelope id")
@@ -64,12 +83,21 @@ func Fetch(ctx context.Context, rendezvousURL, id string) (*Envelope, error) {
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("rendezvous fetch: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrRendezvousUnavailable, err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, MaxEnvelopeBytes+1024))
-	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("pairing not found or expired (code used, wrong, or too old)")
+	switch {
+	case res.StatusCode == http.StatusOK:
+		// fall through
+	case res.StatusCode == http.StatusNotFound:
+		return nil, ErrPairingNotFound
+	case res.StatusCode == http.StatusTooManyRequests:
+		return nil, ErrRendezvousRateLimited
+	case res.StatusCode >= 500:
+		return nil, fmt.Errorf("%w (%d): %s", ErrRendezvousUnavailable, res.StatusCode, strings.TrimSpace(string(raw)))
+	default:
+		return nil, fmt.Errorf("rendezvous fetch failed (%d): %s", res.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	env, err := DecodeEnvelope(raw)
 	if err != nil {

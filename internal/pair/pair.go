@@ -115,6 +115,7 @@ func Mint() (id string, key []byte, code string, err error) {
 
 func crcBytes(data []byte) []byte {
 	crc := crc16CCITT(data)
+	//nolint:gosec // reason: deliberate truncation to the CRC-16's two bytes, not an overflow.
 	return []byte{byte(crc >> 8), byte(crc)}
 }
 

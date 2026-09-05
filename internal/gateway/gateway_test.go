@@ -274,8 +274,8 @@ func TestMalformedArgsAudited(t *testing.T) {
 	go s.HandlerFor("agt_test")(c2)
 	// Valid JSON (so the outer Request frame itself still marshals), but
 	// the wrong shape to unmarshal into rpc.ExecArgs.
-	if err := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: []byte(`123`)}); err != nil {
-		t.Fatal(err)
+	if werr := rpc.WriteRequest(c1, rpc.Request{Task: "agt_test", Secret: "s3cret", ID: 1, Tool: rpc.ToolExec, Args: []byte(`123`)}); werr != nil {
+		t.Fatal(werr)
 	}
 	res, err := rpc.ReadResponse(bufio.NewReader(c1))
 	if err != nil {
@@ -285,6 +285,7 @@ func TestMalformedArgsAudited(t *testing.T) {
 		t.Fatalf("malformed args must still be denied normally, got %+v", res)
 	}
 
+	//nolint:gosec // reason: test-owned t.TempDir() joined with a fixed literal filename; never external input.
 	raw, err := os.ReadFile(filepath.Join(dir, "agt_test.jsonl"))
 	if err != nil {
 		t.Fatal(err)

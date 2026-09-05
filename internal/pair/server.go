@@ -94,7 +94,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 // clientIP resolves the rate-limit identity: TCP peer, or — only when the
-// peer is a configured trusted proxy — the leftmost X-Forwarded-For entry.
+// peer is a configured trusted proxy — the nearest X-Forwarded-For entry
+// not itself a trusted proxy.
 func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -107,29 +108,42 @@ func (s *Server) clientIP(r *http.Request) string {
 		return host
 	}
 	peer := net.ParseIP(host)
-	if peer == nil {
+	if peer == nil || !isTrustedIP(peer, trusted) {
 		return host
 	}
-	trustedPeer := false
-	for _, n := range trusted {
-		if n.Contains(peer) {
-			trustedPeer = true
-			break
-		}
-	}
-	if !trustedPeer {
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
 		return host
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first := xff
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			first = xff[:i]
+	// Peel trusted hops from the right: a proxy APPENDS the address it
+	// saw, it never overwrites what's already there, so a client can
+	// prepend an arbitrary spoofed entry to the left of whatever the
+	// trusted proxy adds. Scanning left-to-right and taking the first
+	// entry (the old bug) trusts exactly what the client wrote. Scanning
+	// from the right and stopping at the first entry that is NOT itself
+	// one of our trusted proxies finds the address the nearest trusted
+	// hop actually observed, which the client cannot forge.
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := net.ParseIP(strings.TrimSpace(parts[i]))
+		if candidate == nil {
+			continue
 		}
-		if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
-			return ip.String()
+		if isTrustedIP(candidate, trusted) {
+			continue
 		}
+		return candidate.String()
 	}
 	return host
+}
+
+func isTrustedIP(ip net.IP, trusted []*net.IPNet) bool {
+	for _, n := range trusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +170,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("bad envelope: %v", err))
 		return
 	}
-	if env.ID == "" || len(env.ID) > 64 {
+	if !validID(env.ID) {
 		writeError(w, http.StatusBadRequest, "bad envelope id")
 		return
 	}
@@ -184,8 +198,12 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	s.items[env.ID] = stored{body: sealed, expires: env.ExpiresAt}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	raw, _ = json.Marshal(PublishResponse{ID: env.ID})
-	_, _ = w.Write(raw)
+	respRaw, merr := json.Marshal(PublishResponse{ID: env.ID})
+	if merr != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	_, _ = w.Write(respRaw)
 }
 
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +216,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Path[len("/v1/envelopes/"):]
-	if id == "" || len(id) > 64 || !validID(id) {
+	if !validID(id) {
 		writeError(w, http.StatusNotFound, "no such pairing")
 		return
 	}
@@ -229,13 +247,25 @@ func (s *Server) sweepLocked() {
 	}
 }
 
+// idLen matches Mint's id shape exactly (48-bit locator, hex-encoded).
+// publish and fetch both enforce it via validID, so an id that could
+// never be fetched (wrong length/charset) can never be published either
+// — otherwise it would sit occupying a maxItems slot until its TTL with
+// no way for anyone to ever burn it early.
+const idLen = 12
+
 func validID(id string) bool {
+	if len(id) != idLen {
+		return false
+	}
 	for _, c := range []byte(id) {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		isDigit := c >= '0' && c <= '9'
+		isHexLower := c >= 'a' && c <= 'f'
+		if !isDigit && !isHexLower {
 			return false
 		}
 	}
-	return len(id) > 0
+	return true
 }
 
 // limiter is a per-key fixed-window counter.
@@ -250,6 +280,15 @@ type window struct {
 	reset time.Time
 }
 
+// maxLimiterIdentities bounds the limiter's map, independent of how many
+// requests arrive: an unbounded number of distinct identities (spoofed
+// XFF entries, IPv6 rotation, etc.) must not grow this without limit,
+// since the old "sweep past 100000" check never actually capped size —
+// if every tracked identity was still within its current window, nothing
+// was ever evicted, and the sweep itself became an O(n) cost on every
+// call once past the threshold.
+const maxLimiterIdentities = 100000
+
 func newLimiter(perMin int) *limiter {
 	return &limiter{budget: perMin, hits: map[string]*window{}}
 }
@@ -259,17 +298,27 @@ func (l *limiter) allow(key string) bool {
 	defer l.mu.Unlock()
 	now := time.Now()
 	w, ok := l.hits[key]
-	if !ok || !w.reset.After(now) {
-		w = &window{reset: now.Add(time.Minute)}
-		l.hits[key] = w
-	}
-	// Bound map growth: drop stale windows opportunistically.
-	if len(l.hits) > 100000 {
-		for k, v := range l.hits {
-			if !v.reset.After(now) {
-				delete(l.hits, k)
+	switch {
+	case ok && !w.reset.After(now):
+		// Known identity, window rolled over: reset in place, no growth.
+		w.count = 0
+		w.reset = now.Add(time.Minute)
+	case !ok:
+		if len(l.hits) >= maxLimiterIdentities {
+			for k, v := range l.hits {
+				if !v.reset.After(now) {
+					delete(l.hits, k)
+				}
 			}
 		}
+		if len(l.hits) >= maxLimiterIdentities {
+			// Still full after sweeping stale entries: deny the new
+			// identity rather than grow past the bound. Identities
+			// already tracked keep working normally.
+			return false
+		}
+		w = &window{reset: now.Add(time.Minute)}
+		l.hits[key] = w
 	}
 	if w.count >= l.budget {
 		return false

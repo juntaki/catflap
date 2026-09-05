@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/capability"
@@ -53,18 +54,24 @@ type server struct {
 	// cannot all observe a free slot.
 	closing bool
 	pending int
+	// pendingNames reserves a task's name from reserve() until commit or
+	// release frees it (same lock as pending/live), so two concurrent
+	// grants resolving names independently can never both land on the
+	// same one — the decision and the reservation are the same atomic
+	// step, unlike a check against s.live alone.
+	pendingNames map[string]bool
 }
 
 // GatewayOptions configures one gateway process (serve or share).
 type GatewayOptions struct {
-	Transport  string
-	AuditDir   string
-	StatePath  string
-	AdminAddr  string
-	Verbose    bool
-	MaxTasks   int
-	TaskName   string // preferred human name for the initial task ("" = mint)
-	Policy     *policy.Policy
+	Transport string
+	AuditDir  string
+	StatePath string
+	AdminAddr string
+	Verbose   bool
+	MaxTasks  int
+	TaskName  string // preferred human name for the initial task ("" = mint)
+	Policy    *policy.Policy
 }
 
 // Announce carries the first live task to the caller's printer.
@@ -107,19 +114,9 @@ func Serve(args []string) int {
 		}
 		pol.TTL = ttlDur
 	}
-	// Same validation path as grant overrides: --ttl must not bypass the
-	// 24h ceiling enforced by Policy.Validate.
-	if verr := pol.Validate(); verr != nil {
-		fmt.Fprintf(os.Stderr, "policy: %v\n", verr)
-		return 1
-	}
-	// The admin API carries a bearer token over plain HTTP: it MUST bind
-	// loopback only. Remote administration rides a future Unix-socket
-	// transport, not TCP.
-	if rerr := requireLoopback(*adminAddr); rerr != nil {
-		fmt.Fprintf(os.Stderr, "admin: %v\n", rerr)
-		return 1
-	}
+	// Policy.Validate (including the 24h TTL ceiling) and the admin-addr
+	// loopback check both happen inside RunGateway, the single place every
+	// gateway entry point (serve, and eventually share) must go through.
 
 	announce := func(a Announce) error {
 		if *outPath != "" {
@@ -144,29 +141,43 @@ func Serve(args []string) int {
 // loopback admin API (/grant, /revoke, /tasks), state file, then serve
 // until SIGINT/SIGTERM. announce prints the first live task; its error
 // tears everything down.
+//
+// RunGateway owns every security invariant a gateway process must satisfy
+// regardless of caller (serve, and eventually share): a policy that isn't
+// Validate()'d, an admin listener that isn't loopback-only, an unknown
+// transport, or a non-positive max-tasks bound must never reach a running
+// admin API. CLI wrappers should only translate flags into GatewayOptions
+// — they must not duplicate these checks, or a second call site that
+// forgets one silently reopens the hole this closes.
 func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
+	if opts.Policy == nil {
+		fmt.Fprintf(os.Stderr, "internal error: no policy\n")
+		return 1
+	}
+	if verr := opts.Policy.Validate(); verr != nil {
+		fmt.Fprintf(os.Stderr, "policy: %v\n", verr)
+		return 1
+	}
+	if opts.Transport != "tailcat" && opts.Transport != "local" {
+		fmt.Fprintf(os.Stderr, "unknown transport %q (tailcat|local)\n", opts.Transport)
+		return 1
+	}
+	if opts.MaxTasks < 1 {
+		fmt.Fprintf(os.Stderr, "invalid max tasks %d\n", opts.MaxTasks)
+		return 1
+	}
+	// The admin API carries a bearer token over plain HTTP: it MUST bind
+	// loopback only. Remote administration rides a future Unix-socket
+	// transport, not TCP.
+	if rerr := requireLoopback(opts.AdminAddr); rerr != nil {
+		fmt.Fprintf(os.Stderr, "admin: %v\n", rerr)
+		return 1
+	}
 
 	s := &server{
 		transport: opts.Transport, verbose: opts.Verbose,
 		auditDir: opts.AuditDir, store: &gateway.Store{}, live: map[string]*liveTask{},
 		maxTasks: opts.MaxTasks,
-	}
-	if s.maxTasks < 1 {
-		fmt.Fprintf(os.Stderr, "invalid --max-tasks %d\n", s.maxTasks)
-		return 1
-	}
-	// Agent-side self-revoke (disconnect) drops the serve-side timer and
-	// live entry too; the gateway already Stopped and Deleted the task.
-	s.store.OnRevoked = func(taskID string) {
-		s.mu.Lock()
-		lt, ok := s.live[taskID]
-		if ok {
-			delete(s.live, taskID)
-		}
-		s.mu.Unlock()
-		if ok {
-			lt.timer.Stop()
-		}
 	}
 
 	// Root context for the process: every task context derives from it, so
@@ -322,24 +333,38 @@ var errTooManyTasks = errors.New("too many live tasks")
 // errShuttingDown fails admissions racing server shutdown.
 var errShuttingDown = errors.New("server is shutting down")
 
-// reserve holds one admission slot. The check and the increment are one
-// atomic step under lock: concurrent grants cannot all see a free slot.
-func (s *server) reserve() error {
+// reserve holds one admission slot AND resolves+reserves the task's name,
+// as one atomic step under lock: concurrent grants cannot all see a free
+// slot, and cannot both resolve to the same name (the decision and the
+// reservation must be the same step — deciding against s.live and
+// inserting into s.live as two separate critical sections is exactly the
+// race that let two concurrent grants both mint the same "unique" name).
+// On success the caller MUST eventually call commit or release(name).
+func (s *server) reserve(preferred string) (name string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closing {
-		return errShuttingDown
+		return "", errShuttingDown
 	}
 	if len(s.live)+s.pending >= s.maxTasks {
-		return fmt.Errorf("%w (max %d)", errTooManyTasks, s.maxTasks)
+		return "", fmt.Errorf("%w (max %d)", errTooManyTasks, s.maxTasks)
+	}
+	name, err = s.resolveNameLocked(preferred)
+	if err != nil {
+		return "", err
 	}
 	s.pending++
-	return nil
+	if s.pendingNames == nil {
+		s.pendingNames = map[string]bool{}
+	}
+	s.pendingNames[NormalizeName(name)] = true
+	return name, nil
 }
 
-func (s *server) release() {
+func (s *server) release(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.pendingNames, NormalizeName(name))
 	if s.pending > 0 {
 		s.pending--
 	}
@@ -354,7 +379,8 @@ func (s *server) release() {
 // append task.stop after it — never seal an empty chain, and creation
 // failure yields task.create + task.stop failed.
 func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*capability.Capability, *gateway.Task, error) {
-	if err := s.reserve(); err != nil {
+	resolvedName, err := s.reserve(name)
+	if err != nil {
 		return nil, nil, err
 	}
 	taskID := capability.NewTaskID()
@@ -362,21 +388,20 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 	agentKey := ""
 	var clientPriv string
 	if s.transport == "tailcat" {
-		priv, pub, err := tct.GenerateClientKey()
-		if err != nil {
-			s.release()
-			return nil, nil, err
+		priv, pub, kerr := tct.GenerateClientKey()
+		if kerr != nil {
+			s.release(resolvedName)
+			return nil, nil, kerr
 		}
 		clientPriv, agentKey = priv, pub
 	}
 	alog, err := audit.Open(s.auditDir, taskID, agentKey)
 	if err != nil {
-		s.release()
+		s.release(resolvedName)
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
-	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
+	t := &gateway.Task{ID: taskID, Name: resolvedName, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
 	t.InitContext(ctx) // in-flight execs die with the task (C7)
-	t.Name = s.taskName(name)
 	s.store.Add(t)
 	// Creation opens the chain and binds the canonical policy snapshot
 	// into the audit trail (args = canonical policy bytes). The sink is
@@ -386,7 +411,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 	if aerr := alog.Err(); aerr != nil {
 		t.Stop("failed")
 		s.store.Delete(taskID)
-		s.release()
+		s.release(resolvedName)
 		return nil, nil, fmt.Errorf("audit sink failed: %w", aerr)
 	}
 
@@ -408,7 +433,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 		// so a half-created task never lingers. No capability is emitted.
 		t.Stop("failed")
 		s.store.Delete(taskID)
-		s.release()
+		s.release(resolvedName)
 		return nil, nil, fmt.Errorf("start task server: %w", err)
 	}
 	// TTL starts at transport readiness: slow DERP startup must not eat
@@ -416,7 +441,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 	// fire-and-vanish before the task exists.
 	expires := time.Now().Add(p.TTL)
 	t.ExpiresAt = expires
-	if err := s.commit(taskID, t, srv); err != nil {
+	if err := s.commit(taskID, resolvedName, t, srv); err != nil {
 		t.Stop("failed")
 		s.store.Delete(taskID)
 		return nil, nil, err
@@ -442,10 +467,11 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 // can never be reactivated. A task whose context already died (shutdown
 // cancel won the lock race) is refused too: no capability is ever emitted
 // from a cancelled parent.
-func (s *server) commit(taskID string, t *gateway.Task, srv transport.Server) error {
+func (s *server) commit(taskID, name string, t *gateway.Task, srv transport.Server) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending--
+	delete(s.pendingNames, NormalizeName(name))
 	if s.closing || t.Context().Err() != nil {
 		_ = srv.Close()
 		return errShuttingDown
@@ -503,40 +529,67 @@ func toolsForPolicy(p *policy.Policy) []string {
 	return out
 }
 
-// taskName returns preferred when free, else a minted unique name.
-func (s *server) taskName(preferred string) string {
-	if NormalizeName(preferred) != "" {
-		s.mu.Lock()
-		used := false
-		for _, lt := range s.live {
-			if NormalizeName(lt.task.Name) == NormalizeName(preferred) {
-				used = true
-				break
-			}
-		}
-		s.mu.Unlock()
-		if !used {
-			return strings.TrimSpace(preferred)
-		}
+// resolveNameLocked resolves preferred to a name reserved for the caller,
+// or mints a fresh unique one. Must be called with s.mu held, and as part
+// of the same critical section that records the reservation (reserve) —
+// checking availability and reserving it are one atomic step, or two
+// concurrent grants could both resolve to the same "unique" name.
+func (s *server) resolveNameLocked(preferred string) (string, error) {
+	sanitized, err := sanitizeName(preferred)
+	if err != nil {
+		return "", err
 	}
-	return s.mintName()
-}
-
-// mintName returns a human-readable task name unique among live tasks.
-func (s *server) mintName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	used := map[string]bool{}
-	for _, lt := range s.live {
-		used[NormalizeName(lt.task.Name)] = true
+	if sanitized != "" {
+		if !s.nameTakenLocked(sanitized) {
+			return sanitized, nil
+		}
+		// Silent fallback to a minted name, matching mint's own
+		// collision behavior: a taken preferred name is a UX nudge, not
+		// a hard failure, since names are display metadata only.
 	}
 	for i := 0; i < 100; i++ {
 		name := MintName()
-		if !used[NormalizeName(name)] {
-			return name
+		if !s.nameTakenLocked(name) {
+			return name, nil
 		}
 	}
-	return capability.NewTaskID() // absurd collision run; fall back to id
+	return capability.NewTaskID(), nil // absurd collision run; fall back to id
+}
+
+// nameTakenLocked checks both committed (live) and reserved-but-not-yet-
+// committed (pendingNames) names. Must be called with s.mu held.
+func (s *server) nameTakenLocked(name string) bool {
+	n := NormalizeName(name)
+	if s.pendingNames[n] {
+		return true
+	}
+	for _, lt := range s.live {
+		if NormalizeName(lt.task.Name) == n {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeName validates a caller-supplied preferred task name before it
+// can reach any display surface (tasks list, announce output) or the
+// wire (capability.Name): an unrestricted name is a control-character/
+// ANSI-escape injection vector into whatever terminal renders it later.
+// Returns "" (no preference — mint one) for empty/whitespace-only input.
+func sanitizeName(preferred string) (string, error) {
+	s := strings.TrimSpace(preferred)
+	if s == "" {
+		return "", nil
+	}
+	if len(s) > 64 {
+		return "", fmt.Errorf("task name too long (max 64 bytes)")
+	}
+	for _, r := range s {
+		if r > unicode.MaxASCII || !unicode.IsPrint(r) {
+			return "", fmt.Errorf("task name must be printable ASCII")
+		}
+	}
+	return s, nil
 }
 
 // takeLive removes a live task from the registry and returns it.

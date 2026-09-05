@@ -62,23 +62,51 @@ func Revoke(args []string) int {
 	return rc
 }
 
-// resolveTask maps a human name or id prefix to a full task id. Unknown
-// inputs pass through: the server answers "unknown" idempotently.
+// resolveTask maps a human name or id prefix to a full task id, in strict
+// precedence order: exact task id (never ambiguous — ids are unique by
+// construction) > exact name > id prefix. This is a destructive command,
+// so a name or prefix matching more than one live task is a hard error
+// rather than "pick the first one" — Store.List's iteration order is a Go
+// map's, so silently picking one would nondeterministically revoke the
+// wrong task. Unknown inputs pass through: the server answers "unknown"
+// idempotently.
 func resolveTask(st *StateFile, nameOrID string) (string, error) {
 	list, err := ListTasks(st.AdminAddr, st.AdminToken)
 	if err != nil {
 		return "", err
 	}
-	want := NormalizeName(nameOrID)
 	for _, item := range list {
-		if item.Task == nameOrID || NormalizeName(item.Name) == want {
+		if item.Task == nameOrID {
 			return item.Task, nil
 		}
 	}
+	want := NormalizeName(nameOrID)
+	var byName []string
+	for _, item := range list {
+		if NormalizeName(item.Name) == want {
+			byName = append(byName, item.Task)
+		}
+	}
+	switch len(byName) {
+	case 1:
+		return byName[0], nil
+	case 0:
+		// no name match: fall through to prefix match
+	default:
+		return "", fmt.Errorf("%q matches %d tasks by name; use the full task id", nameOrID, len(byName))
+	}
+	var byPrefix []string
 	for _, item := range list {
 		if strings.HasPrefix(item.Task, nameOrID) {
-			return item.Task, nil
+			byPrefix = append(byPrefix, item.Task)
 		}
 	}
-	return nameOrID, nil
+	switch len(byPrefix) {
+	case 1:
+		return byPrefix[0], nil
+	case 0:
+		return nameOrID, nil
+	default:
+		return "", fmt.Errorf("%q matches %d tasks by id prefix; use the full task id", nameOrID, len(byPrefix))
+	}
 }
