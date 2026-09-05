@@ -63,8 +63,8 @@ teardown (stop-accepting → cancel with cause → bounded drain → terminal
 - [x] `--cap-file` / `--out` flows: no symlinks, no silent overwrite
   (`--force`), atomic 0600 writes — tokens avoid argv and shell history
 - [x] Hash-chained JSONL audit incl. terminal lifecycle events
-- [x] CI: golangci-lint (correctness/security/context/resource boundary,
-  Tailcat quarantine via depguard) + `go test -race` + `go build` + govulncheck
+- [x] CI: golangci-lint (incl. Tailcat quarantine via depguard) +
+  `go test -race` + `go build` + govulncheck + adversarial E2E job
 - [ ] Human approval, network restrictions, specialized adapters (roadmap)
 
 ## Quickstart
@@ -110,6 +110,15 @@ argv, no shell), `remote_read`, `remote_stat`, and — only with an explicit
 `file.write` grant — `remote_write`.
 
 `--transport local` runs the same stack over loopback (tests, LAN demos).
+
+## MCP protocol
+
+The agent adapter is built on the official MCP Go SDK (pinned in
+`go.mod`), speaking spec `2026-07-28` by default (`server/discover`,
+stateless requests) while negotiating older spec versions with older
+clients — no handwritten protocol parsing remains. Gateway RPC frames are
+bounded at 2MiB enforced incrementally, and every policy size grant must
+fit inside one frame, so a valid policy is always executable.
 
 ## Policy
 
@@ -259,11 +268,13 @@ Concretely, v0.1.1 assumes the **agent is untrusted but the operator running
   lifecycle containment, not a hostile-code sandbox.
 - Every decision (allow/deny/expired/error) is hash-chained to JSONL.
 - Bearer tokens travel via files (`--out` / `--cap-file`), not argv.
+- The admin API binds loopback only; the state file (admin bearer token)
+  gets the same secure-file semantics as capabilities.
 
-Known gaps: no human approval yet, no network egress policy yet, no resource
-limits yet, SafeFS is dirfd-walk (not full `openat2`-only) with a residual
-rename race against concurrent local writers (which the agent is not),
-audit chain has no external anchor yet.
+Known gaps: no human approval yet, no network egress policy yet, SafeFS is
+dirfd-walk (not full `openat2`-only) with a residual rename race against
+concurrent local writers (which the agent is not), audit chain has no
+external anchor yet.
 
 ## Layout (Tailcat is quarantined)
 
@@ -278,9 +289,9 @@ internal/
   policy/               structured argv policy + file grants (schema v1)
   safefs/               dedicated filesystem layer (dirfd walk, openat2)
   gateway/              per-task auth, TTL, enforcement (no shell), Stop/GC
-  rpc/                  JSONL request/response frames
-  audit/                hash-chained JSONL logger
-  mcp/                  MCP stdio bridge (initialize/tools/list/tools/call)
+  rpc/                  JSONL request/response frames (2MiB bound, enforced incrementally)
+  audit/                hash-chained JSONL logger (v1 records, verify, anchors)
+  mcp/                  MCP adapter on the official Go SDK (spec 2026-07-28 baseline, older clients negotiated)
   cli/                  serve (per-task servers+admin API) / grant / mcp wiring
 examples/policies/      readonly-debug, lab-gpu
 testdata/               e2e drivers (local + live-Tailcat probes) + adversarial tests

@@ -32,11 +32,21 @@ func writeLog(t *testing.T, tools ...string) string {
 
 func readLines(t *testing.T, path string) []string {
 	t.Helper()
+	//nolint:gosec // reason: test-only readback of fixtures created by the same test.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+func mustMarshal(t *testing.T, e Entry) string {
+	t.Helper()
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func writeLines(t *testing.T, path string, lines []string) {
@@ -67,8 +77,7 @@ func TestVerifyTamperDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Decision = "allow-evil"
-	raw, _ := json.Marshal(e)
-	lines[1] = string(raw)
+	lines[1] = mustMarshal(t, e)
 	writeLines(t, path, lines)
 	if _, err := Verify(path); err == nil {
 		t.Error("tampered decision must be detected")
@@ -119,8 +128,7 @@ func TestVerifyVersionRejected(t *testing.T) {
 	}
 	e.V = 99
 	e.Hash = HashEntry(e) // re-chained, but wrong version
-	raw, _ := json.Marshal(e)
-	writeLines(t, path, []string{string(raw)})
+	writeLines(t, path, []string{mustMarshal(t, e)})
 	if _, err := Verify(path); err == nil {
 		t.Error("unknown audit version must be rejected")
 	}
@@ -140,4 +148,45 @@ func TestVerifyEmptyRejected(t *testing.T) {
 	if _, err := Verify(p); err == nil {
 		t.Error("empty file must be rejected")
 	}
+}
+
+func TestSealRefusesPostTerminal(t *testing.T) {
+	l, err := Open("", "agt_seal", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Log("remote_exec", nil, "allow", nil, 0)
+	term := l.LogTerminal("expired")
+	if term.Tool != TerminalTool || term.Decision != "expired" || term.Seq != 2 {
+		t.Errorf("bad terminal event: %+v", term)
+	}
+	if e := l.Log("remote_exec", nil, "deny", nil, 0); e != (Entry{}) {
+		t.Errorf("post-terminal Log must be refused, got %+v", e)
+	}
+	// Chain still verifies: seal only stops new records.
+	if l.f != nil {
+		t.Error("in-memory logger should have no file")
+	}
+}
+
+func TestStickyWriteError(t *testing.T) {
+	dir := "testdata/audit-sticky"
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	l, err := Open(dir, "agt_sticky", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Break the sink behind the logger's back: writes now fail.
+	if err := l.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l.Log("remote_exec", nil, "allow", nil, 0)
+	if err := l.Err(); err == nil {
+		t.Error("sink failure must stick")
+	}
+	_ = l.Close()
 }

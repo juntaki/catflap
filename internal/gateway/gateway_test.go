@@ -416,6 +416,9 @@ func TestLifecycleStates(t *testing.T) {
 		t.Error("stopped task must reject operations")
 		task.endOp()
 	}
+	if task.TryActivate() {
+		t.Error("a stopped task must never reactivate (CAS)")
+	}
 	task.Stop("revoked") // idempotent: no panic, no second terminal event
 }
 

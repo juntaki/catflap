@@ -247,6 +247,10 @@ tools:
 	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      create: true\n")); err == nil {
 		t.Error("file.write without roots must be rejected")
 	}
+	// Write sizes obey the same transport ceiling.
+	if _, err := Parse([]byte("version: 1\nname: x\nttl: 15m\ntools:\n  file:\n    write:\n      roots: [/.]\n      max_file_size: 2097152\n")); err == nil {
+		t.Error("file.write above 1MiB must be rejected")
+	}
 }
 
 func TestParseNestedRoots(t *testing.T) {
@@ -384,10 +388,19 @@ tools:
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 0\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 99999999\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: big\n",
+		// Transport ceiling: results travel in one 2MiB frame, so no
+		// grant may promise more than fits (chunking is future work).
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_stdout_bytes: 2097152\n",
+		"version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 2097152\n",
 		"version: 1\nname: x\nttl: 15m\nlimits:\n  warp_drive: 9\n",
 	} {
 		if _, err := Parse([]byte(y)); err == nil {
 			t.Errorf("bad limits must be rejected: %q", y)
 		}
+	}
+	// 1MiB is the ceiling and parses.
+	m := mustParse(t, "version: 1\nname: x\nttl: 15m\nlimits:\n  max_read_bytes: 1048576\n")
+	if m.EffectiveLimits().MaxReadBytes != 1048576 {
+		t.Error("1MiB must be accepted")
 	}
 }

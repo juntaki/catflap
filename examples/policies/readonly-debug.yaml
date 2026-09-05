@@ -27,9 +27,11 @@ tools:
       - command: echo
         rest: any
       - command: uname
-        rest: any
-      - command: ls
-        rest: any
+        args:
+          - { choice: ["-a", "-s", "-r", "-m"] }
+      - command: pwd
+      - command: whoami
+      - command: date
   file:
     read:
       roots:

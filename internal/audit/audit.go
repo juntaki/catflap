@@ -39,18 +39,27 @@ type Entry struct {
 
 // Logger appends Entries as JSONL.
 type Logger struct {
-	mu       sync.Mutex
-	f        *os.File
+	mu sync.Mutex
+	f  *os.File
+	// path identifies the sink in degradation reports.
+	path     string
 	task     string
 	agentKey string
 	seq      int64
 	prev     string
+	// sealed, once set by LogTerminal, refuses further records: the
+	// runtime can no longer emit "deny after task.stop" entries.
+	sealed bool
+	// writeErr is sticky: the first sink failure is retained so the
+	// operator can be told the audit degraded instead of silently
+	// losing records.
+	writeErr error
 }
 
 // Open creates (or appends to) dir/<task>.jsonl.
 func Open(dir, task, agentKey string) (*Logger, error) {
 	if dir == "" {
-		return &Logger{task: task, agentKey: agentKey, prev: "genesis"}, nil
+		return &Logger{task: task, agentKey: agentKey, prev: Genesis}, nil
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -61,7 +70,7 @@ func Open(dir, task, agentKey string) (*Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Logger{f: f, task: task, agentKey: agentKey, prev: "genesis"}
+	l := &Logger{f: f, path: path, task: task, agentKey: agentKey, prev: Genesis}
 	// Resume chain: read last hash if file non-empty.
 	if st, _ := f.Stat(); st.Size() > 0 {
 		if last, err := lastHash(path); err == nil && last != "" {
@@ -76,9 +85,35 @@ func Open(dir, task, agentKey string) (*Logger, error) {
 }
 
 // Log appends one entry. args and result are hashed, never stored raw.
+// Records refused after sealing return a zero Entry.
 func (l *Logger) Log(tool string, args []byte, decision string, result []byte, dur time.Duration) Entry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.sealed {
+		return Entry{}
+	}
+	return l.appendLocked(tool, args, decision, result, dur)
+}
+
+// LogTerminal writes the terminal lifecycle event and seals the logger:
+// seal and write are atomic under the logger mutex, so no concurrent Log
+// can land after the terminal record.
+func (l *Logger) LogTerminal(reason string) Entry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.appendLocked(TerminalTool, nil, reason, nil, 0)
+	l.sealed = true
+	return e
+}
+
+// Err reports the sticky sink failure, if the audit degraded.
+func (l *Logger) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writeErr
+}
+
+func (l *Logger) appendLocked(tool string, args []byte, decision string, result []byte, dur time.Duration) Entry {
 	l.seq++
 	e := Entry{
 		V:          AuditVersion,
@@ -101,15 +136,21 @@ func (l *Logger) Log(tool string, args []byte, decision string, result []byte, d
 		// so skip the write rather than recording a partial entry.
 		if raw, merr := json.Marshal(e); merr == nil {
 			raw = append(raw, '\n')
-			_, _ = l.f.Write(raw)
+			if _, werr := l.f.Write(raw); werr != nil && l.writeErr == nil {
+				l.writeErr = werr
+			}
 		}
 	}
 	return e
 }
 
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.f != nil {
-		return l.f.Close()
+		f := l.f
+		l.f = nil
+		return f.Close()
 	}
 	return nil
 }

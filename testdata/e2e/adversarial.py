@@ -36,6 +36,22 @@ class Mcp:
         )
         self.rid = 0
         self.lock = threading.Lock()
+        # Spec handshake first: tools/call before initialize is rejected.
+        self._raw({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05",
+                              "capabilities": {},
+                              "clientInfo": {"name": "adversarial", "version": "0"}}})
+        self._raw({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _raw(self, obj):
+        self.p.stdin.write(json.dumps(obj) + "\n")
+        self.p.stdin.flush()
+        if "id" in obj:
+            while True:
+                r = json.loads(self.p.stdout.readline())
+                if r.get("id") == obj["id"]:
+                    return r
+        return None
 
     def call(self, name, args):
         with self.lock:
@@ -87,7 +103,56 @@ def main():
                 break
         assert task, "serve did not print a task"
         print("task:", task, flush=True)
+
+        # --- protocol hygiene: tools/call before initialize is rejected ---
+        raw = subprocess.Popen(
+            [BIN, "mcp", "--cap-file", CAP],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1)
+        raw.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "remote_exec",
+                        "arguments": {"command": "echo", "args": ["x"]}}}) + "\n")
+        raw.stdin.flush()
+        first = json.loads(raw.stdout.readline())
+        raw.stdin.close()
+        raw.wait(timeout=15)
+        check("pre-handshake call rejected",
+              "error" in first and "initializ" in json.dumps(first))
+
         m = Mcp(CAP)
+
+        # --- transport framing: oversized and newline-less floods die fast ---
+        import base64
+        import socket
+        cap = json.loads(base64.urlsafe_b64decode(
+            open(CAP).read().strip()[5:] + "=="))
+        host, port = cap["endpoint"].rsplit(":", 1)
+        frame = json.dumps({"task": cap["task"], "secret": cap["task_secret"],
+                            "id": 1, "tool": "remote_exec",
+                            "args": {"command": "echo", "args": ["x" * (2 * 1024 * 1024)]}})
+        s = socket.create_connection((host, int(port)), timeout=10)
+        s.sendall((frame + "\n").encode())
+        s.settimeout(10)
+        try:
+            data = s.recv(4096)
+        except (socket.timeout, ConnectionResetError):
+            data = b""
+        # Oversized frame: server closes the connection with no response.
+        check("oversized frame killed", data == b"", "got %d bytes" % len(data))
+        s.close()
+        s = socket.create_connection((host, int(port)), timeout=10)
+        try:
+            s.sendall(b"z" * (4 * 1024 * 1024))  # no newline: must not balloon memory
+        except BrokenPipeError:
+            pass  # server already hung up at the bound: ideal outcome
+        s.settimeout(10)
+        try:
+            data = s.recv(4096)
+        except (socket.timeout, ConnectionResetError, BrokenPipeError):
+            data = b""
+        s.close()
+        check("newline-less flood killed", data == b"", "got %d bytes" % len(data))
 
         # --- shell metacharacters are inert data ---
         # NOTE: compare decoded stdout, not the JSON dump (Go escapes &,<,>).
@@ -114,7 +179,10 @@ def main():
         r = m.call("remote_exec", {"command": "echo", "args": ["x" * 5000]})
         check("very long argv denied", r["result"].get("isError") is True)
         r = m.call("no_such_tool", {})
-        check("unknown tool denied", r["result"].get("isError") is True)
+        # Unregistered tools die at SDK routing (protocol error), never
+        # reaching the gateway — also a deny.
+        check("unknown tool denied",
+              (r.get("result") or {}).get("isError") is True or "unknown tool" in json.dumps(r))
 
         # --- path attacks ---
         for bad in ["/etc/passwd", "./testdata/../README.md",

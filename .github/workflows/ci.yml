@@ -47,3 +47,17 @@ jobs:
         with:
           go-version-file: go.mod
           go-package: ./...
+
+  e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go build -o ./bin/catflap ./cmd/catflap
+      - run: python3 ./testdata/e2e/adversarial.py

@@ -3,7 +3,7 @@ package rpc
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net"
 	"time"
 )
@@ -16,8 +16,14 @@ const (
 	ToolWrite = "remote_write"
 )
 
-// MaxLine caps a single JSONL frame (1 MiB + headroom).
+// MaxLine caps a single JSONL frame (1 MiB + headroom). It is the
+// transport ceiling: every size limit a policy may grant MUST fit inside
+// one frame, so a valid policy is always an executable policy. Larger
+// payloads need chunked tools (future), not larger limits.
 const MaxLine = 2 << 20
+
+// errFrameTooLarge aborts a connection the moment a frame exceeds MaxLine.
+var errFrameTooLarge = errors.New("frame too large")
 
 // Request is one gateway call. Task+Secret authenticate the task;
 // the Tailcat layer underneath authenticates the client identity.
@@ -110,15 +116,34 @@ func WriteResponse(c net.Conn, res Response) error {
 	return err
 }
 
+// readFrame reads one newline-terminated JSONL frame, enforcing MaxLine
+// incrementally: the connection is abandoned the instant the bound is
+// exceeded, so a peer can force at most MaxLine bytes of allocation per
+// frame — with or without sending a newline.
+func readFrame(r *bufio.Reader) ([]byte, error) {
+	var frame []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		frame = append(frame, chunk...)
+		if len(frame) > MaxLine {
+			return nil, errFrameTooLarge
+		}
+		if err == nil {
+			return frame, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return nil, err
+	}
+}
+
 // ReadRequest reads one JSONL frame.
 func ReadRequest(r *bufio.Reader) (Request, error) {
 	var req Request
-	line, err := r.ReadBytes('\n')
+	line, err := readFrame(r)
 	if err != nil {
 		return req, err
-	}
-	if len(line) > MaxLine {
-		return req, fmt.Errorf("frame too large")
 	}
 	if err := json.Unmarshal(line, &req); err != nil {
 		return req, err
@@ -130,12 +155,9 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 func ReadResponse(r *bufio.Reader) (Response, error) {
 	var res Response
 	_ = struct{}{}
-	line, err := r.ReadBytes('\n')
+	line, err := readFrame(r)
 	if err != nil {
 		return res, err
-	}
-	if len(line) > MaxLine {
-		return res, fmt.Errorf("frame too large")
 	}
 	if err := json.Unmarshal(line, &res); err != nil {
 		return res, err

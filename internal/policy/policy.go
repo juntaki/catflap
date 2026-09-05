@@ -104,8 +104,9 @@ func (c *WriteConfig) Options() safefs.WriteOptions {
 }
 
 // Default returns a conservative demo policy for `serve` without --policy.
-// Note: no file-reading command (cat, …) is listed under exec — file access
-// goes through remote_read/remote_stat so filesystem roots always apply.
+// File-reading commands (cat, ls, …) are deliberately absent: `ls /etc`
+// or GNU `date -f` would bypass SafeFS roots, so directory listing belongs
+// in a future list_directory tool built on SafeFS — not in exec.
 func Default() *Policy {
 	return &Policy{
 		Name: "readonly-debug",
@@ -113,11 +114,10 @@ func Default() *Policy {
 		Tools: Tools{
 			Exec: &ExecPolicy{Allow: []ExecRule{
 				{Command: "echo", Rest: "any"},
-				{Command: "uname", Rest: "any"},
-				{Command: "ls", Rest: "any"},
+				{Command: "uname", Args: []ArgMatcher{{Choice: []string{"-a", "-s", "-r", "-m"}}}},
 				{Command: "pwd"},
 				{Command: "whoami"},
-				{Command: "date", Rest: "any"},
+				{Command: "date"},
 			}},
 			File: &FilePolicy{Read: []string{"."}},
 		},
@@ -315,8 +315,11 @@ func compileLimits(raw *rawLimits) (*Limits, error) {
 		if field.v == nil {
 			continue
 		}
-		if *field.v <= 0 || *field.v > 16<<20 {
-			return nil, fmt.Errorf("limits.%s must be within (0, 16MiB]", field.name)
+		// Transport ceiling: results travel in one MaxLine (2MiB) frame,
+		// so no grant may promise more than fits. Larger payloads need
+		// chunked tools (future), not larger limits.
+		if *field.v <= 0 || *field.v > 1<<20 {
+			return nil, fmt.Errorf("limits.%s must be within (0, 1MiB]", field.name)
 		}
 		*field.dst = *field.v
 	}
@@ -571,8 +574,8 @@ func (p *Policy) Validate() error {
 		if len(wc.Roots) == 0 {
 			return fmt.Errorf("file.write.roots is required when file.write is granted")
 		}
-		if wc.MaxFileSize < 0 || wc.MaxFileSize > 16<<20 {
-			return fmt.Errorf("file.write.max_file_size must be within [0, 16MiB]")
+		if wc.MaxFileSize < 0 || wc.MaxFileSize > 1<<20 {
+			return fmt.Errorf("file.write.max_file_size must be within [0, 1MiB] (transport frame ceiling)")
 		}
 	}
 	return nil

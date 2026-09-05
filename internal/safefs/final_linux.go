@@ -12,6 +12,7 @@ import (
 // dirfd walk open; genuine errors (EACCES, ELOOP, …) are returned.
 func openFinal(dirFd int, base string, flags int, mode uint32, tryOpenat2 bool) (int, error) {
 	if tryOpenat2 {
+		//nolint:gosec // reason: flags is a non-negative O_* bitset assembled at internal call sites; never agent input.
 		how := &unix.OpenHow{
 			Flags:   uint64(flags),
 			Mode:    uint64(mode),

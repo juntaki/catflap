@@ -1,28 +1,18 @@
 bin/
 .DS_Store
 
-# Generated e2e artifacts (may contain bearer capabilities — never commit)
-testdata/e2e/serve.out
-testdata/e2e/serve.err
-testdata/e2e/serve.cap
-testdata/e2e/grant.out
-testdata/e2e/grant.err
-testdata/e2e/grant.cap
-testdata/e2e/mcptest.err
-testdata/e2e/state.json
+# Generated e2e artifacts (may contain bearer capabilities — never commit).
+# Drivers (*.py), policies (*.yaml), fixtures (.gitkeep, hello.txt) stay tracked.
+testdata/e2e/*.cap
+testdata/e2e/*.out
+testdata/e2e/*.err
+testdata/e2e/*.json
+testdata/e2e/*.log
 testdata/e2e/audit/
 testdata/e2e/work/n.txt
 testdata/e2e/work/adv.txt
 testdata/e2e/work/big.txt
 testdata/e2e/work/dbg.txt
-testdata/e2e/adv-state.json
-testdata/e2e/adv.cap
-testdata/e2e/adv-audit/
-testdata/e2e/work/n.txt
-testdata/e2e/w.cap
-testdata/e2e/wserve.out
-testdata/e2e/wserve.err
-testdata/e2e/wstate.json
 testdata/e2e/PWNED
 testdata/e2e/pwned-c0
 testdata/e2e-expire.out

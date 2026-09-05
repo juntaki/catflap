@@ -109,6 +109,13 @@ func (t *Task) StateOf() State { return State(t.state.Load()) }
 // be emitted before this point (§8.1).
 func (t *Task) Activate() { t.state.Store(int32(StateActive)) }
 
+// TryActivate moves a created task to ACTIVE, but only from CREATING.
+// Compare-and-swap: a task that already left Creating (stopping, stopped)
+// can never be reactivated, closing the shutdown/commit race.
+func (t *Task) TryActivate() bool {
+	return t.state.CompareAndSwap(int32(StateCreating), int32(StateActive))
+}
+
 // InitContext arms the task's cancellation scope under a non-nil parent
 // (the serve root context in production, Background in tests) and sizes
 // the concurrency semaphore from the effective limits. Idempotent.
@@ -157,7 +164,7 @@ func (t *Task) Stop(reason string) {
 		case <-time.After(10 * time.Second):
 		}
 		if t.Audit != nil {
-			t.Audit.Log("task.stop", nil, reason, nil, 0)
+			t.Audit.LogTerminal(reason)
 		}
 		if t.onStop != nil {
 			t.onStop()

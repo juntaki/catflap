@@ -45,6 +45,12 @@ type server struct {
 	// maxTasks bounds live tasks; exhaustion fails the grant, never an
 	// unbounded allocation (§18).
 	maxTasks int
+	// closing flips at shutdown: reserve/commit refuse new tasks, so a
+	// task can never register after the shutdown snapshot was taken.
+	// pending counts reserved-but-uncommitted tasks so concurrent grants
+	// cannot all observe a free slot.
+	closing bool
+	pending int
 }
 
 // Serve runs the target gateway. Each task (the initial one and every
@@ -78,6 +84,19 @@ func Serve(args []string) int {
 			return 1
 		}
 		pol.TTL = ttlDur
+	}
+	// Same validation path as grant overrides: --ttl must not bypass the
+	// 24h ceiling enforced by Policy.Validate.
+	if verr := pol.Validate(); verr != nil {
+		fmt.Fprintf(os.Stderr, "policy: %v\n", verr)
+		return 1
+	}
+	// The admin API carries a bearer token over plain HTTP: it MUST bind
+	// loopback only. Remote administration rides a future Unix-socket
+	// transport, not TCP.
+	if rerr := requireLoopback(*adminAddr); rerr != nil {
+		fmt.Fprintf(os.Stderr, "admin: %v\n", rerr)
+		return 1
 	}
 
 	s := &server{
@@ -177,6 +196,7 @@ func Serve(args []string) int {
 			lt.timer.Stop()
 			lt.task.Stop("revoked") // same teardown as expiry
 			s.store.Delete(rreq.Task)
+			reportDegraded(lt)
 			status = "revoked"
 			fmt.Fprintf(os.Stderr, "catflap serve: task %s revoked — server closed, address dead\n", rreq.Task)
 		}
@@ -242,32 +262,62 @@ func Serve(args []string) int {
 // it to 429; anything else is a 500.
 var errTooManyTasks = errors.New("too many live tasks")
 
+// errShuttingDown fails admissions racing server shutdown.
+var errShuttingDown = errors.New("server is shutting down")
+
+// reserve holds one admission slot. The check and the increment are one
+// atomic step under lock: concurrent grants cannot all see a free slot.
+func (s *server) reserve() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return errShuttingDown
+	}
+	if len(s.live)+s.pending >= s.maxTasks {
+		return fmt.Errorf("%w (max %d)", errTooManyTasks, s.maxTasks)
+	}
+	s.pending++
+	return nil
+}
+
+func (s *server) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending > 0 {
+		s.pending--
+	}
+}
+
 // mkTask creates one task with its own ephemeral network server and arms
 // its expiry: timer → server.Close + audit.Close + store.Delete.
+//
+// Admission is reserve → create → commit: the slot is held across the slow
+// transport startup, and commit (register + Activate + timer arm) is one
+// locked step that also refuses tasks racing shutdown. TTL starts when the
+// transport is ready, not when the request arrived. No capability is
+// emitted until commit succeeds.
 func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capability, *gateway.Task, error) {
-	s.mu.Lock()
-	full := len(s.live) >= s.maxTasks
-	s.mu.Unlock()
-	if full {
-		return nil, nil, fmt.Errorf("%w (max %d)", errTooManyTasks, s.maxTasks)
+	if err := s.reserve(); err != nil {
+		return nil, nil, err
 	}
 	taskID := capability.NewTaskID()
 	secret := capability.NewSecret()
-	expires := time.Now().Add(p.TTL)
 	agentKey := ""
 	var clientPriv string
 	if s.transport == "tailcat" {
 		priv, pub, err := tct.GenerateClientKey()
 		if err != nil {
+			s.release()
 			return nil, nil, err
 		}
 		clientPriv, agentKey = priv, pub
 	}
 	alog, err := audit.Open(s.auditDir, taskID, agentKey)
 	if err != nil {
+		s.release()
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
-	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, ExpiresAt: expires, Audit: alog, AgentKey: agentKey}
+	t := &gateway.Task{ID: taskID, Secret: secret, Policy: p, Audit: alog, AgentKey: agentKey}
 	t.InitContext(ctx) // in-flight execs die with the task (C7)
 	s.store.Add(t)
 
@@ -289,15 +339,19 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		// so a half-created task never lingers. No capability is emitted.
 		t.Stop("failed")
 		s.store.Delete(taskID)
+		s.release()
 		return nil, nil, fmt.Errorf("start task server: %w", err)
 	}
-	lt := &liveTask{task: t, srv: srv}
-	t.OnStopFunc(func() { _ = srv.Close() })
-	lt.timer = time.AfterFunc(time.Until(expires), func() { s.expire(taskID) })
-	s.mu.Lock()
-	s.live[taskID] = lt
-	s.mu.Unlock()
-	t.Activate() // ACTIVE only now: server, binding, audit, expiry all armed
+	// TTL starts at transport readiness: slow DERP startup must not eat
+	// the task's lifetime, and a timer armed before registration could
+	// fire-and-vanish before the task exists.
+	expires := time.Now().Add(p.TTL)
+	t.ExpiresAt = expires
+	if err := s.commit(taskID, t, srv); err != nil {
+		t.Stop("failed")
+		s.store.Delete(taskID)
+		return nil, nil, err
+	}
 	// Creation event first in the chain, binding the canonical policy
 	// snapshot hash into the audit trail (args = canonical policy bytes).
 	t.Audit.Log("task.create", p.Canonical(), "active", nil, 0)
@@ -313,6 +367,30 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy) (*capability.Capa
 		Tools:      toolsForPolicy(p),
 	}
 	return cap, t, nil
+}
+
+// commit registers a reserved task: live entry, Activate, and timer arming
+// happen under one lock, in that order, and refuse work racing shutdown.
+// Activate is CAS (Creating→Active only): a task that already left Creating
+// can never be reactivated.
+func (s *server) commit(taskID string, t *gateway.Task, srv transport.Server) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pending--
+	if s.closing {
+		_ = srv.Close()
+		return errShuttingDown
+	}
+	lt := &liveTask{task: t, srv: srv}
+	t.OnStopFunc(func() { _ = srv.Close() })
+	s.live[taskID] = lt
+	if !t.TryActivate() {
+		delete(s.live, taskID)
+		_ = srv.Close()
+		return fmt.Errorf("task %s left creating before commit", taskID)
+	}
+	lt.timer = time.AfterFunc(time.Until(t.ExpiresAt), func() { s.expire(taskID) })
+	return nil
 }
 
 // toolsForPolicy normalizes the policy into the MCP tool list the task
@@ -360,12 +438,14 @@ func (s *server) expire(taskID string) {
 	lt.timer.Stop()
 	lt.task.Stop("expired") // closes this task's server + audit
 	s.store.Delete(taskID)
+	reportDegraded(lt)
 	fmt.Fprintf(os.Stderr, "catflap serve: task %s expired — server closed, address dead\n", taskID)
 }
 
 // shutdown destroys every live task.
 func (s *server) shutdown() {
 	s.mu.Lock()
+	s.closing = true
 	live := s.live
 	s.live = map[string]*liveTask{}
 	s.mu.Unlock()
@@ -373,7 +453,38 @@ func (s *server) shutdown() {
 		lt.timer.Stop()
 		lt.task.Stop("shutdown")
 		s.store.Delete(id)
+		reportDegraded(lt)
 	}
+}
+
+// reportDegraded tells the operator when a task's audit sink failed: a
+// degraded audit must never pass silently.
+func reportDegraded(lt *liveTask) {
+	if lt == nil || lt.task == nil || lt.task.Audit == nil {
+		return
+	}
+	if err := lt.task.Audit.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "catflap serve: WARNING: audit degraded for task %s: %v\n", lt.task.ID, err)
+	}
+}
+
+// requireLoopback rejects non-loopback admin listen addresses. An empty
+// host (":port") binds all interfaces and is rejected.
+func requireLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("bad admin address %q: %w", addr, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.IsLoopback() {
+			return fmt.Errorf("admin address %q is not loopback (admin API carries a bearer token over plain HTTP)", addr)
+		}
+		return nil
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return nil
+	}
+	return fmt.Errorf("admin address %q is not loopback (use 127.0.0.1 or ::1)", addr)
 }
 
 func loadPolicy(path string) (*policy.Policy, error) {
@@ -392,10 +503,46 @@ func writeState(path string, st StateFile) error {
 	if merr != nil {
 		return merr
 	}
+	// The state file holds the admin bearer token: same secure private-file
+	// semantics as capability files (no symlinks, no silent overwrite,
+	// always 0600, atomic rename). Like --out, the state file refuses to
+	// clobber an existing live coordination file: a second serve on the
+	// same --state fails instead of hijacking the first one's admin API.
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink state file %q", path)
+		}
+		return fmt.Errorf("state file %q exists (another serve running? remove it first)", path)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	tmp, err := os.CreateTemp(dirOf(path), ".state-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Chmod(0o600)
+	_, werr := tmp.Write(raw)
+	serr := tmp.Sync()
+	cerr := tmp.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		_ = os.Remove(tmpName)
+		if werr != nil {
+			return werr
+		}
+		if serr != nil {
+			return serr
+		}
+		return cerr
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func randomToken() string {
