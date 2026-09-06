@@ -48,6 +48,14 @@ type Task struct {
 	Audit     *audit.Logger
 
 	hostSigner gossh.Signer
+	// sshSrv is ONE gliderssh.Server shared by every connection this
+	// task ever accepts (constructed once in NewTask, not per-connection):
+	// gliderssh.Server.Close "immediately closes all active listeners and
+	// all active connections", which is exactly what Stop needs to sever
+	// a client mid-session, not just refuse new connections — a
+	// per-connection Server instance would have nothing for Stop to
+	// reach back into.
+	sshSrv *ssh.Server
 
 	mu         sync.Mutex
 	allowedKey gossh.PublicKey // nil until pairing registers one; no key authenticates until then
@@ -55,7 +63,6 @@ type Task struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stopDone chan struct{}
 	// onStop releases task-external resources (the task's transport
@@ -68,19 +75,19 @@ type Task struct {
 // a session killed by expiry should not be reported the same as one
 // killed by an explicit revoke.
 var (
-	causeExpired  = fmt.Errorf("task expired")
-	causeRevoked  = fmt.Errorf("task revoked")
-	causeShutdown = fmt.Errorf("task shutdown")
+	errExpired  = fmt.Errorf("task expired")
+	errRevoked  = fmt.Errorf("task revoked")
+	errShutdown = fmt.Errorf("task shutdown")
 )
 
 func causeFor(reason string) error {
 	switch reason {
 	case "revoked":
-		return causeRevoked
+		return errRevoked
 	case "shutdown":
-		return causeShutdown
+		return errShutdown
 	default:
-		return causeExpired
+		return errExpired
 	}
 }
 
@@ -101,6 +108,20 @@ func NewTask(parent context.Context, id string, ttl time.Duration, alog *audit.L
 		ID: id, ExpiresAt: time.Now().Add(ttl), Audit: alog,
 		hostSigner: signer, ctx: ctx, cancel: cancel,
 		stopDone: make(chan struct{}),
+	}
+	t.sshSrv = &ssh.Server{
+		HostSigners: []ssh.Signer{t.hostSigner},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session": ssh.DefaultSessionHandler,
+		},
+		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) error {
+			allowed := t.getAllowedKey()
+			if allowed == nil || !ssh.KeysEqual(key, allowed) {
+				return fmt.Errorf("unauthorized key")
+			}
+			return nil
+		},
+		Handler: t.handleSession,
 	}
 	time.AfterFunc(ttl, func() { t.Stop("expired") })
 	return t, nil
@@ -145,6 +166,14 @@ func (t *Task) OnStopFunc(f func()) { t.onStop = f }
 func (t *Task) Stop(reason string) {
 	t.stopOnce.Do(func() {
 		t.cancel(causeFor(reason))
+		// Closing the shared gliderssh.Server severs every currently
+		// open SSH connection for this task, not just future ones — a
+		// revoke/expiry/shutdown must disconnect an already-paired
+		// client sitting in an interactive session, not merely stop
+		// admitting new ones. Cancelling t.ctx above already kills any
+		// in-flight exec'd process tree; this is what kills the
+		// connection carrying an idle PTY with nothing running yet.
+		_ = t.sshSrv.Close()
 		if t.Audit != nil {
 			t.Audit.LogTerminal(reason)
 		}
@@ -169,21 +198,7 @@ func (t *Task) Expired(now time.Time) bool { return now.After(t.ExpiresAt) }
 // by pairing) allowed client key. Every session it runs is rooted in
 // the task's own context, so Stop kills every in-flight command.
 func (t *Task) Handler() transport.Handler {
-	srv := &ssh.Server{
-		HostSigners: []ssh.Signer{t.hostSigner},
-		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"session": ssh.DefaultSessionHandler,
-		},
-		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) error {
-			allowed := t.getAllowedKey()
-			if allowed == nil || !ssh.KeysEqual(key, allowed) {
-				return fmt.Errorf("unauthorized key")
-			}
-			return nil
-		},
-		Handler: t.handleSession,
-	}
-	return func(conn net.Conn) { srv.HandleConn(conn) }
+	return func(conn net.Conn) { t.sshSrv.HandleConn(conn) }
 }
 
 // auditExec logs one command's shape and outcome — never its output —
@@ -227,7 +242,6 @@ func (t *Task) handleSession(s ssh.Session) {
 		cmd.Env = append(os.Environ(), "TERM="+ptyReq.Term)
 		f, err := pty.Start(cmd)
 		if err != nil {
-			runErr = err
 			_ = s.Exit(1)
 			t.auditExec(s.RawCommand(), true, start, 1, err)
 			return

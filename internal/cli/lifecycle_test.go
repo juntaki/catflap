@@ -370,10 +370,7 @@ func TestShutdownCancelsAllTasksBeforeAnyTeardownWaits(t *testing.T) {
 	// it does not tolerate the bug, which would never let fast's stop
 	// happen while slow's teardown is still blocked.
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if fastTask.Context().Err() != nil && fastTask.StateOf() != gateway.StateActive {
-			break
-		}
+	for fastTask.Context().Err() == nil || fastTask.StateOf() == gateway.StateActive {
 		if time.Now().After(deadline) {
 			t.Fatal("fast task must leave ACTIVE and have its context cancelled while the slow task's teardown is still in flight")
 		}
