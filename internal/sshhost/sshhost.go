@@ -1,0 +1,274 @@
+// Package sshhost is the new core of Catflap: an embedded SSH server
+// bound to one ephemeral task. There is no command allowlist, no
+// filesystem capability, and no approval flow here — the OS account
+// `catflap share` runs as already defines what the agent can do,
+// exactly like a normal SSH login. What Catflap adds is that the
+// endpoint, the route to it, and the credential that authenticates
+// against it all live no longer than the task itself:
+//
+//   - the SSH host key is generated fresh per task and exists only in
+//     memory;
+//   - the one client key allowed to authenticate is registered during
+//     pairing and is exact-match only — no authorized_keys file, no
+//     persistence;
+//   - the whole task is torn down by its own TTL, an explicit revoke,
+//     or process shutdown, which cancels every in-flight command's
+//     context and closes the listener — the access dies with the task,
+//     including anything it started.
+package sshhost
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+
+	"github.com/creack/pty"
+	gossh "golang.org/x/crypto/ssh"
+
+	ssh "github.com/tailscale/gliderssh"
+
+	"github.com/juntaki/catflap/internal/audit"
+	"github.com/juntaki/catflap/internal/transport"
+)
+
+// Task is one live ephemeral SSH endpoint. Its context governs every
+// command it runs: cancelling it (TTL, revoke, shutdown) kills every
+// in-flight process tree, not just new connection attempts.
+type Task struct {
+	ID        string
+	ExpiresAt time.Time
+	Audit     *audit.Logger
+
+	hostSigner gossh.Signer
+
+	mu         sync.Mutex
+	allowedKey gossh.PublicKey // nil until pairing registers one; no key authenticates until then
+
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+	stopDone chan struct{}
+	// onStop releases task-external resources (the task's transport
+	// server). Set by the caller before the task starts serving.
+	onStop func()
+}
+
+// causeExpired/causeRevoked/causeShutdown distinguish why a task's
+// context was cancelled, mirroring gateway.Task's terminationCause —
+// a session killed by expiry should not be reported the same as one
+// killed by an explicit revoke.
+var (
+	causeExpired  = fmt.Errorf("task expired")
+	causeRevoked  = fmt.Errorf("task revoked")
+	causeShutdown = fmt.Errorf("task shutdown")
+)
+
+func causeFor(reason string) error {
+	switch reason {
+	case "revoked":
+		return causeRevoked
+	case "shutdown":
+		return causeShutdown
+	default:
+		return causeExpired
+	}
+}
+
+// NewTask mints a task with a fresh ephemeral Ed25519 host key and a
+// context that self-cancels at ttl. No client key is allowed until
+// SetAllowedKey registers one (see pairing).
+func NewTask(parent context.Context, id string, ttl time.Duration, alog *audit.Logger) (*Task, error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate host key: %w", err)
+	}
+	signer, err := gossh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("wrap host key: %w", err)
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	t := &Task{
+		ID: id, ExpiresAt: time.Now().Add(ttl), Audit: alog,
+		hostSigner: signer, ctx: ctx, cancel: cancel,
+		stopDone: make(chan struct{}),
+	}
+	time.AfterFunc(ttl, func() { t.Stop("expired") })
+	return t, nil
+}
+
+// HostKeyAuthorizedLine renders the task's host public key in
+// authorized_keys/known_hosts line format, for delivery to the client
+// during pairing.
+func (t *Task) HostKeyAuthorizedLine() string {
+	return string(gossh.MarshalAuthorizedKey(t.hostSigner.PublicKey()))
+}
+
+// HostKeyFingerprint is a human-checkable SHA256 fingerprint of the
+// task's host key, for display alongside the pairing code.
+func (t *Task) HostKeyFingerprint() string {
+	return gossh.FingerprintSHA256(t.hostSigner.PublicKey())
+}
+
+// SetAllowedKey registers the exact client public key pairing
+// delivered. Only this key will ever authenticate against this task —
+// there is no allowlist file and no way to add a second key.
+func (t *Task) SetAllowedKey(k gossh.PublicKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.allowedKey = k
+}
+
+func (t *Task) getAllowedKey() gossh.PublicKey {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.allowedKey
+}
+
+// OnStopFunc sets the external-release hook (closes the task's
+// transport server). Must be set before the task starts serving.
+func (t *Task) OnStopFunc(f func()) { t.onStop = f }
+
+// Stop tears the task down: cancels every in-flight command, closes
+// the transport server via onStop, and closes the audit sink. Safe to
+// call more than once and from multiple goroutines; only the first
+// call has effect.
+func (t *Task) Stop(reason string) {
+	t.stopOnce.Do(func() {
+		t.cancel(causeFor(reason))
+		if t.Audit != nil {
+			t.Audit.LogTerminal(reason)
+		}
+		if t.onStop != nil {
+			t.onStop()
+		}
+		if t.Audit != nil {
+			_ = t.Audit.Close()
+		}
+		close(t.stopDone)
+	})
+}
+
+// Done reports when the task has been stopped.
+func (t *Task) Done() <-chan struct{} { return t.stopDone }
+
+// Expired reports whether the task is past its TTL.
+func (t *Task) Expired(now time.Time) bool { return now.After(t.ExpiresAt) }
+
+// Handler returns the transport.Handler for this task: one gliderssh
+// server, bound to the task's host key and its (initially absent, set
+// by pairing) allowed client key. Every session it runs is rooted in
+// the task's own context, so Stop kills every in-flight command.
+func (t *Task) Handler() transport.Handler {
+	srv := &ssh.Server{
+		HostSigners: []ssh.Signer{t.hostSigner},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session": ssh.DefaultSessionHandler,
+		},
+		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) error {
+			allowed := t.getAllowedKey()
+			if allowed == nil || !ssh.KeysEqual(key, allowed) {
+				return fmt.Errorf("unauthorized key")
+			}
+			return nil
+		},
+		Handler: t.handleSession,
+	}
+	return func(conn net.Conn) { srv.HandleConn(conn) }
+}
+
+// auditExec logs one command's shape and outcome — never its output —
+// so the audit trail shows what ran and how it ended without capturing
+// arbitrary command output as an implicit second copy of the session.
+func (t *Task) auditExec(rawCommand string, pty bool, start time.Time, exitCode int, err error) {
+	if t.Audit == nil {
+		return
+	}
+	decision := "allow"
+	if err != nil && t.ctx.Err() != nil {
+		decision = "terminated"
+	}
+	args := fmt.Sprintf(`{"command":%q,"pty":%v}`, rawCommand, pty)
+	result := fmt.Sprintf(`{"exit_code":%d}`, exitCode)
+	t.Audit.Log("ssh_exec", []byte(args), decision, []byte(result), time.Since(start))
+}
+
+// handleSession runs one SSH session's command (or login shell, if the
+// client sent none) to completion, wired to a PTY when the client
+// requested one. Every command is rooted in the task's own context:
+// task expiry/revoke/shutdown kills it immediately, not just future
+// sessions.
+func (t *Task) handleSession(s ssh.Session) {
+	start := time.Now()
+	cmdline := s.Command()
+	var cmd *exec.Cmd
+	if len(cmdline) == 0 {
+		shell := loginShell()
+		//nolint:gosec // reason: no shell metacharacter interpretation here — this launches the user's own login shell with no untrusted argv; the client's raw command text (if any) is never passed to sh -c.
+		cmd = exec.CommandContext(t.ctx, shell, "-l")
+	} else {
+		//nolint:gosec // reason: this IS the SSH exec primitive — argv comes straight from the client's own session request, run directly (no shell), exactly like sshd running an authenticated user's command.
+		cmd = exec.CommandContext(t.ctx, cmdline[0], cmdline[1:]...)
+	}
+
+	ptyReq, winCh, isPty := s.Pty()
+	var exitCode int
+	var runErr error
+	if isPty {
+		cmd.Env = append(os.Environ(), "TERM="+ptyReq.Term)
+		f, err := pty.Start(cmd)
+		if err != nil {
+			runErr = err
+			_ = s.Exit(1)
+			t.auditExec(s.RawCommand(), true, start, 1, err)
+			return
+		}
+		go func() {
+			for win := range winCh {
+				_ = pty.Setsize(f, &pty.Winsize{Rows: uint16(win.Height), Cols: uint16(win.Width)}) //nolint:gosec // reason: SSH window dimensions are small terminal row/col counts, never large enough to overflow uint16 in practice; a client sending an absurd value just clamps via wraparound, no memory-safety issue.
+			}
+		}()
+		go func() { _, _ = io.Copy(f, s) }()
+		_, _ = io.Copy(s, f)
+		runErr = cmd.Wait()
+		_ = f.Close()
+	} else {
+		cmd.Stdin = s
+		cmd.Stdout = s
+		cmd.Stderr = s.Stderr()
+		runErr = cmd.Run()
+	}
+
+	switch {
+	case cmd.ProcessState != nil:
+		exitCode = cmd.ProcessState.ExitCode()
+	case runErr != nil:
+		exitCode = 1
+	}
+	t.auditExec(s.RawCommand(), isPty, start, exitCode, runErr)
+	_ = s.Exit(exitCode)
+}
+
+func loginShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
+// NewID mints a random task id, matching capability.NewTaskID's shape
+// without importing the (soon to be retired) capability package.
+func NewID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "agt_" + hex.EncodeToString(b[:])[:16]
+}
