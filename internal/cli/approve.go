@@ -92,7 +92,7 @@ func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequ
 			}
 			approved, matched := parseApprovalAnswer(line, token)
 			if !matched {
-				_, _ = fmt.Fprintf(a.out, "(ignoring unrelated input; type %s to approve, anything else to deny)\n", token)
+				_, _ = fmt.Fprintf(a.out, "(ignoring unrelated input; type %s to approve, or %s plus anything else to deny)\n", token, token)
 				continue
 			}
 			return approved, nil
@@ -124,13 +124,13 @@ func parseApprovalAnswer(line, token string) (approved, matched bool) {
 
 func formatApprovalPrompt(req gateway.ApprovalRequest, token string) string {
 	return fmt.Sprintf(
-		"\n--- approval required (#%s) ---\ntask:    %s\ntool:    %s\n%s\n%s\ntype %s to approve, anything else to deny\n> ",
+		"\n--- approval required (#%s) ---\ntask:    %s\ntool:    %s\n%s\n%s\ntype %s to approve, or %s plus anything else (e.g. %s n) to deny\n> ",
 		token,
 		sanitizeForTerminal(req.TaskID),
 		sanitizeForTerminal(req.Tool),
 		sanitizeForTerminal(req.Summary),
 		sanitizeForTerminal(req.Detail),
-		token,
+		token, token, token,
 	)
 }
 

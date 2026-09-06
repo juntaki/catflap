@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/policy"
 )
@@ -85,14 +86,14 @@ func Share(args []string) int {
 // down" — see RunGateway.
 func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
 	return func(a Announce) error {
-		code, err := mintAndPublishPairingCode(rendezvousURL, pairingTTL, a.Cap)
+		code, actualTTL, err := mintAndPublishPairingCode(rendezvousURL, pairingTTL, a.Cap)
 		if err != nil {
 			return err
 		}
 		_, _ = fmt.Fprintf(out,
 			"Sharing %s for %s\n\nAccess\n%s\nPairing code (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nExpires: %s\n",
 			a.Task.Name, pol.TTL.Round(time.Second), formatEffectiveAccess(pol),
-			pairingTTL.Round(time.Second), code, code, a.Task.ExpiresAt.Format(time.RFC3339),
+			actualTTL.Round(time.Second), code, code, a.Task.ExpiresAt.Format(time.RFC3339),
 		)
 		return nil
 	}
@@ -103,25 +104,41 @@ func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.P
 // the same sequence `share` uses for a brand-new task, reused by
 // `share-code` to reissue a new code for an already-live one. Never
 // returns the capability itself, only the pairing code.
-func mintAndPublishPairingCode(rendezvousURL string, pairingTTL time.Duration, cap any) (string, error) {
+//
+// The published envelope TTL is clamped to the task's own remaining
+// TTL (never the caller's requested pairingTTL alone): a code that
+// outlives its task would sit "claimable" on the rendezvous server
+// after the task itself has already expired, so pair.Fetch would
+// succeed but the capability behind it would immediately fail as
+// expired — a confusing, silent near-miss instead of a clean upfront
+// error. Returns the ACTUAL ttl used (possibly shorter than requested)
+// so callers report what really happened, not what was asked for.
+func mintAndPublishPairingCode(rendezvousURL string, pairingTTL time.Duration, cap *capability.Capability) (string, time.Duration, error) {
+	remaining := time.Until(cap.ExpiresAt)
+	if remaining <= 0 {
+		return "", 0, fmt.Errorf("task already expired at %s", cap.ExpiresAt.Format(time.RFC3339))
+	}
+	if remaining < pairingTTL {
+		pairingTTL = remaining
+	}
 	id, key, code, merr := pair.Mint()
 	if merr != nil {
-		return "", fmt.Errorf("mint pairing code: %w", merr)
+		return "", 0, fmt.Errorf("mint pairing code: %w", merr)
 	}
 	payload, jerr := json.Marshal(cap)
 	if jerr != nil {
-		return "", fmt.Errorf("encode capability: %w", jerr)
+		return "", 0, fmt.Errorf("encode capability: %w", jerr)
 	}
 	env, serr := pair.Seal(id, payload, key)
 	if serr != nil {
-		return "", fmt.Errorf("seal envelope: %w", serr)
+		return "", 0, fmt.Errorf("seal envelope: %w", serr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if perr := pair.Publish(ctx, rendezvousURL, env, pairingTTL); perr != nil {
-		return "", fmt.Errorf("publish to rendezvous: %w", perr)
+		return "", 0, fmt.Errorf("publish to rendezvous: %w", perr)
 	}
-	return code, nil
+	return code, pairingTTL, nil
 }
 
 // formatEffectiveAccess renders what a policy actually grants — read

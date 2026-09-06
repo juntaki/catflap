@@ -13,11 +13,13 @@ import (
 	"github.com/juntaki/catflap/internal/buildinfo"
 )
 
-// Doctor runs a handful of cheap, read-only checks across the moving
+// Doctor runs a handful of cheap diagnostic checks across the moving
 // parts a working Catflap setup depends on (Claude Code registration,
 // rendezvous reachability, audit directory writability, an active
-// target) and prints one aligned ✓/✗ line per check. It never mutates
-// anything — diagnosis only, so it's always safe to run.
+// target) and prints one aligned ✓/✗ line per check. It mutates nothing
+// the operator cares about — the audit-directory check does create the
+// directory and write+remove a small probe file (the same way a real
+// task's audit.Open would), but leaves no trace behind.
 func Doctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	statePath := fs.String("state", DefaultStatePath(), "state file to check for an active target")
@@ -45,6 +47,7 @@ func Doctor(args []string) int {
 			line("Claude MCP registration", "✗", "run: catflap setup claude")
 		}
 	} else {
+		ok = false
 		line("Claude Code", "✗", "not found in PATH")
 		line("Claude MCP registration", "✗", "n/a (no claude CLI)")
 	}

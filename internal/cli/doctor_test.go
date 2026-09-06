@@ -1,10 +1,41 @@
 package cli
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestDoctorFailsWhenClaudeCLIMissing covers a real bug: the "claude not
+// found in PATH" branch printed two ✗ lines but never set ok=false,
+// so Doctor() reported "Ready." (exit 0) even though nothing about
+// Claude Code was actually working.
+func TestDoctorFailsWhenClaudeCLIMissing(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // guaranteed no "claude" binary anywhere on it
+
+	rsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer rsrv.Close()
+	t.Setenv("CATFLAP_RENDEZVOUS", rsrv.URL)
+	t.Setenv("CATFLAP_AUDIT", filepath.Join(t.TempDir(), "audit"))
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	rc := Doctor([]string{"--state", filepath.Join(t.TempDir(), "no-such-state.json")})
+	_ = w.Close()
+	os.Stdout = old
+	_, _ = io.Copy(io.Discard, r)
+
+	if rc != 1 {
+		t.Errorf("Doctor() with no claude CLI on PATH = %d, want 1 (unhealthy)", rc)
+	}
+}
 
 func TestCheckWritableCreatesAndCleansUpProbe(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "audit")

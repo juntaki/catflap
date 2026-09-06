@@ -73,14 +73,14 @@ func ShareCode(args []string) int {
 		fmt.Fprintf(os.Stderr, "share-code: decode capability: %v\n", derr)
 		return 1
 	}
-	code, perr := mintAndPublishPairingCode(rdv, pairingTTL, cap)
+	code, actualTTL, perr := mintAndPublishPairingCode(rdv, pairingTTL, cap)
 	if perr != nil {
 		fmt.Fprintf(os.Stderr, "share-code: %v\n", perr)
 		return 1
 	}
 	fmt.Printf(
 		"New pairing code for %s (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nTask still expires: %s\n",
-		taskID, pairingTTL.Round(time.Second), code, code, capRes.ExpiresAt,
+		taskID, actualTTL.Round(time.Second), code, code, capRes.ExpiresAt,
 	)
 	return 0
 }

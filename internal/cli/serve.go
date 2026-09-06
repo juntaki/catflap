@@ -56,11 +56,23 @@ func (s *server) setCapability(taskID string, cap *capability.Capability) {
 }
 
 // getCapability returns the retained capability for a still-live task.
+// getCapability returns the retained capability only for a task that
+// is still genuinely live: present in s.live, ACTIVE (not STOPPING —
+// audit-fail-closed and other paths flip state synchronously before
+// the async teardown that removes it from s.live actually runs, so
+// s.live alone lags reality briefly), and not yet past its own TTL.
+// share-code's whole contract is "reissue for a still-live task" — it
+// must never hand out a capability for one that is already on its way
+// out, even if the capability struct itself is still sitting in
+// memory for a few more moments.
 func (s *server) getCapability(taskID string) (*capability.Capability, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	lt, ok := s.live[taskID]
+	s.mu.Unlock()
 	if !ok || lt.cap == nil {
+		return nil, false
+	}
+	if lt.task.StateOf() != gateway.StateActive || lt.task.Expired(time.Now()) {
 		return nil, false
 	}
 	return lt.cap, true
