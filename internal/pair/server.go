@@ -42,7 +42,19 @@ type Server struct {
 // first). Callers MUST clamp ttl to the underlying task's own remaining
 // TTL before calling this — Serve does not know the task's expiry and
 // will happily run for the full ttl requested.
-func Serve(transportName string, cap *capability.Capability, ttl time.Duration, verbose bool) (*Server, error) {
+//
+// stillLive, if non-nil, is consulted right before actually writing the
+// capability to a claimed connection — not just once at issuance time.
+// A caller's own "is the task still live" check, taken before starting
+// the pair server, can never fully close the window between that check
+// and a connection landing (creating the underlying transport server
+// itself takes real time, more so for tailcat's DERP handshake) — the
+// task can start dying in that gap. Re-checking at the last possible
+// moment, right before the bytes actually leave, shrinks that window to
+// as close to zero as this package can get without the caller managing
+// its own locking here. Pass nil to skip this (e.g. tests with no task
+// lifecycle to check).
+func Serve(transportName string, cap *capability.Capability, ttl time.Duration, verbose bool, stillLive func() bool) (*Server, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("pair server ttl must be positive")
 	}
@@ -60,7 +72,7 @@ func Serve(transportName string, cap *capability.Capability, ttl time.Duration, 
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 
-	handler := func(conn net.Conn) { s.handleConn(conn, payload) }
+	handler := func(conn net.Conn) { s.handleConn(conn, payload, stillLive) }
 
 	var underlying transport.Server
 	switch transportName {
@@ -101,9 +113,17 @@ const teardownGrace = 2 * time.Second
 // dropped peer does not get a second chance, matching the old
 // rendezvous's "fetch burns the envelope regardless of what follows"
 // semantics.
-func (s *Server) handleConn(conn net.Conn, payload []byte) {
+func (s *Server) handleConn(conn net.Conn, payload []byte, stillLive func() bool) {
 	if !s.claimed.CompareAndSwap(false, true) {
 		_ = conn.Close()
+		return
+	}
+	if stillLive != nil && !stillLive() {
+		// The task died between Serve's own caller-side check and this
+		// connection actually landing — the claim is still burned (no
+		// second chance for a replay), but nothing is delivered.
+		_ = conn.Close()
+		time.AfterFunc(teardownGrace, s.Close)
 		return
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(deliverTimeout))

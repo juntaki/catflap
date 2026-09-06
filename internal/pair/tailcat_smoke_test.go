@@ -14,7 +14,7 @@ func TestServeOverRealTailcat(t *testing.T) {
 		t.Skip("needs a real Tailcat/DERP round trip")
 	}
 	cap := testCap()
-	srv, err := Serve("tailcat", cap, time.Minute, true)
+	srv, err := Serve("tailcat", cap, time.Minute, true, nil)
 	if err != nil {
 		t.Fatalf("Serve(tailcat): %v", err)
 	}

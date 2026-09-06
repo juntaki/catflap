@@ -84,7 +84,7 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 // the first Fetch gets the exact capability handed to Serve.
 func TestServeDeliversCapabilityOnce(t *testing.T) {
 	cap := testCap()
-	srv, err := Serve("local", cap, time.Minute, false)
+	srv, err := Serve("local", cap, time.Minute, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestServeDeliversCapabilityOnce(t *testing.T) {
 // Fetch — even against the exact same address — must fail.
 func TestServeSecondFetchGetsNothing(t *testing.T) {
 	cap := testCap()
-	srv, err := Serve("local", cap, time.Minute, false)
+	srv, err := Serve("local", cap, time.Minute, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestServeSecondFetchGetsNothing(t *testing.T) {
 // property under real concurrency, not just sequential calls.
 func TestServeConcurrentFetchesExactlyOneWinner(t *testing.T) {
 	cap := testCap()
-	srv, err := Serve("local", cap, time.Minute, false)
+	srv, err := Serve("local", cap, time.Minute, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestServeConcurrentFetchesExactlyOneWinner(t *testing.T) {
 // but the pair server must still stop accepting once its TTL elapses.
 func TestServeClosesAfterTTL(t *testing.T) {
 	cap := testCap()
-	srv, err := Serve("local", cap, 100*time.Millisecond, false)
+	srv, err := Serve("local", cap, 100*time.Millisecond, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,14 +166,42 @@ func TestServeClosesAfterTTL(t *testing.T) {
 	}
 }
 
+// TestServeChecksStillLiveAtDeliveryTime covers the codex-round-2 fix:
+// a caller's own liveness check, taken before Serve even starts (real
+// wall-clock time for tailcat's DERP handshake), can never fully close
+// the window between that check and a connection actually landing — the
+// task can start dying in that gap. stillLive is re-consulted right
+// before the bytes are written, not just once at issuance, so a task
+// that died in that window gets nothing delivered even though the
+// connection still burns the one-shot claim (no replay either).
+func TestServeChecksStillLiveAtDeliveryTime(t *testing.T) {
+	cap := testCap()
+	live := false // simulates "the task already died by delivery time"
+	srv, err := Serve("local", cap, time.Minute, false, func() bool { return live })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	addr := srv.Addr()
+
+	if _, err := Fetch(context.Background(), "local", addr, false); err == nil {
+		t.Error("Fetch must get nothing when stillLive reports the task is no longer live")
+	}
+	// The claim is still burned: no second chance, even though nothing
+	// was actually delivered the first time.
+	if _, err := Fetch(context.Background(), "local", addr, false); err == nil {
+		t.Error("a dead-on-arrival delivery must still burn the one-shot claim")
+	}
+}
+
 // TestServeRejectsNonPositiveTTL covers a construction-time guard: a
 // caller forgetting to clamp TTL to something positive must fail
 // loudly, not silently start a pair server that's already "expired".
 func TestServeRejectsNonPositiveTTL(t *testing.T) {
-	if _, err := Serve("local", testCap(), 0, false); err == nil {
+	if _, err := Serve("local", testCap(), 0, false, nil); err == nil {
 		t.Error("Serve with ttl=0 must fail")
 	}
-	if _, err := Serve("local", testCap(), -time.Second, false); err == nil {
+	if _, err := Serve("local", testCap(), -time.Second, false, nil); err == nil {
 		t.Error("Serve with a negative ttl must fail")
 	}
 }

@@ -95,7 +95,11 @@ func (s *server) issuePairCode(taskID string, requestedTTL time.Duration) (code 
 	if remaining < ttl {
 		ttl = remaining
 	}
-	ps, serr := pair.Serve(s.transport, lt.cap, ttl, s.verbose)
+	task := lt.task
+	stillLive := func() bool {
+		return task.StateOf() == gateway.StateActive && !task.Expired(time.Now())
+	}
+	ps, serr := pair.Serve(s.transport, lt.cap, ttl, s.verbose, stillLive)
 	if serr != nil {
 		return "", 0, fmt.Errorf("start pair server: %w", serr)
 	}

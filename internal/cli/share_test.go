@@ -40,7 +40,7 @@ func TestShareAnnouncePrintsOnlyTheCode(t *testing.T) {
 	a := Announce{Cap: cap, Task: task, Transport: "local"}
 	a.IssuePairCode = func(requestedTTL time.Duration) (string, time.Duration, error) {
 		var serr error
-		ps, serr = pair.Serve("local", cap, requestedTTL, false)
+		ps, serr = pair.Serve("local", cap, requestedTTL, false, nil)
 		if serr != nil {
 			return "", 0, serr
 		}

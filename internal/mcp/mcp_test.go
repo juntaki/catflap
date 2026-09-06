@@ -160,7 +160,7 @@ func liveLocalTaskWithServer(t *testing.T, tools []string) (*capability.Capabili
 // handlePair does.
 func mintPairingCode(t *testing.T, cp *capability.Capability) string {
 	t.Helper()
-	ps, err := pair.Serve("local", cp, time.Minute, false)
+	ps, err := pair.Serve("local", cp, time.Minute, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
