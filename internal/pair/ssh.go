@@ -20,6 +20,11 @@ import (
 	tct "github.com/juntaki/catflap/internal/transport/tailcat"
 )
 
+// frameHeaderLen is the fixed-size big-endian uint32 length prefix in
+// front of every framed payload this package sends — see
+// writeFrame/readFrame.
+const frameHeaderLen = 4
+
 // sshExchangeMaxBytes bounds both frames of the SSH pairing exchange —
 // generous for an offer (endpoint string + host key line) or an accept
 // (one public key line), far below anything that would strain the
@@ -138,6 +143,7 @@ func (s *SSHOfferServer) handleConn(conn net.Conn, payload []byte, stillLive fun
 	var a SSHOfferAccept
 	if err := json.Unmarshal(accept, &a); err != nil || a.PublicKey == "" {
 		_ = writeAckStatus(conn, false)
+		_ = waitFinalAck(conn)
 		return
 	}
 	ok := onAccept(a.PublicKey) == nil
@@ -148,6 +154,18 @@ func (s *SSHOfferServer) handleConn(conn net.Conn, payload []byte, stillLive fun
 	// accept frame only proves the bytes reached this connection, not
 	// that registration happened. See writeAckStatus/readAckStatus.
 	_ = writeAckStatus(conn, ok)
+	// Wait for the client's own final ack before tearing this
+	// connection's Tailcat identity down, exactly like the legacy
+	// capability delivery's post-write wait (see handleConn in the old
+	// server.go / this package's history): over real Tailcat, a Write
+	// returning success only means the bytes reached the local
+	// netstack's send queue, not that they've gone out over the
+	// (async, possibly DERP-relayed) tunnel yet. Closing this
+	// connection's underlying transport server immediately after
+	// writeAckStatus risks dropping that final status byte in flight —
+	// caught by TestServeSSHOfferOverRealTailcat, not the local-
+	// transport tests, exactly as it was the first time.
+	_ = waitFinalAck(conn)
 }
 
 // Addr returns the pair server's own address.
@@ -232,6 +250,12 @@ func FetchSSHOffer(ctx context.Context, transportName, addr string, verbose bool
 	if aerr != nil {
 		return SSHOffer{}, nil, fmt.Errorf("read pairing confirmation: %w", aerr)
 	}
+	// Best-effort final ack so the server knows it's safe to tear this
+	// connection's transport identity down — see waitFinalAck. Its
+	// content and delivery are both irrelevant beyond "a byte arrived";
+	// this pairing has already fully succeeded or failed by this point.
+	_ = conn.SetWriteDeadline(time.Now().Add(sshExchangeTimeout))
+	_, _ = conn.Write([]byte{0})
 	if !ok {
 		return SSHOffer{}, nil, fmt.Errorf("host rejected this pairing")
 	}
@@ -266,6 +290,19 @@ func readAckStatus(conn net.Conn, timeout time.Duration) (bool, error) {
 		return false, err
 	}
 	return b[0] == ackStatusOK, nil
+}
+
+// waitFinalAck bounds how long the server waits, after writing its
+// ack status, for the client's own one-byte final ack — content and
+// timeout-vs-arrival are both irrelevant beyond "stop waiting now".
+// The claim is already burned either way; this only protects the
+// LAST write of the exchange from being dropped by an immediate
+// Close() over an async transport (see the call site).
+func waitFinalAck(conn net.Conn) error {
+	_ = conn.SetReadDeadline(time.Now().Add(sshExchangeTimeout))
+	var b [1]byte
+	_, err := io.ReadFull(conn, b[:])
+	return err
 }
 
 // writeFrame/readFrame implement the same big-endian length-prefixed

@@ -134,12 +134,6 @@ func (t *Task) HostKeyAuthorizedLine() string {
 	return string(gossh.MarshalAuthorizedKey(t.hostSigner.PublicKey()))
 }
 
-// HostKeyFingerprint is a human-checkable SHA256 fingerprint of the
-// task's host key, for display alongside the pairing code.
-func (t *Task) HostKeyFingerprint() string {
-	return gossh.FingerprintSHA256(t.hostSigner.PublicKey())
-}
-
 // SetAllowedKey registers the exact client public key pairing
 // delivered. Only this key will ever authenticate against this task —
 // there is no allowlist file and no way to add a second key.
@@ -189,9 +183,6 @@ func (t *Task) Stop(reason string) {
 
 // Done reports when the task has been stopped.
 func (t *Task) Done() <-chan struct{} { return t.stopDone }
-
-// Expired reports whether the task is past its TTL.
-func (t *Task) Expired(now time.Time) bool { return now.After(t.ExpiresAt) }
 
 // Handler returns the transport.Handler for this task: one gliderssh
 // server, bound to the task's host key and its (initially absent, set

@@ -69,7 +69,7 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/juntaki/catflap"
-    description: "Ephemeral capability gateway for AI agents: lend a machine, not a credential."
+    description: "Ephemeral SSH access for AI agents: no pre-existing reachability, no persistent credential."
     license: "MIT"
     test: |
       system "#{bin}/catflap", "version"
