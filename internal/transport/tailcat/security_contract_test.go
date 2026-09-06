@@ -25,10 +25,21 @@ func dialRawPort(t *testing.T, addr, privText string, port uint16, timeout time.
 	}
 	c := tailcat.NewClient(tailcat.Addr(addr))
 	c.Key = priv
-	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return c.DialTCPPort(ctx, port)
+	conn, err := c.DialTCPPort(ctx, port)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	// c.Close() must NOT run before this function returns: a defer
+	// here would tear the underlying client (and thus conn) down
+	// before the caller ever receives it, since deferred calls run
+	// after a return statement's value is computed but before the
+	// function actually returns. Clean up at test end instead, once
+	// the caller is done with conn.
+	t.Cleanup(func() { _ = c.Close() })
+	return conn, nil
 }
 
 // denyTimeout bounds how long a "must be denied" sub-test waits. An
@@ -231,6 +242,13 @@ func TestCloseThenReconnectDenied(t *testing.T) {
 // TestFreshServeYieldsDifferentIdentity covers "fresh keys every time":
 // two independent Serve calls must never produce the same address —
 // each task, and each pair server, gets its own unguessable identity.
+//
+// Compares the decoded ConnInfo.ServerPublic node key, not the raw
+// address string: a Tailcat address also embeds a fresh, independently
+// random pre-shared key (see ConnInfo's own doc comment), so two
+// addresses could differ solely because of PSK rotation while the
+// underlying server node identity was actually reused — comparing
+// opaque strings alone wouldn't catch that.
 func TestFreshServeYieldsDifferentIdentity(t *testing.T) {
 	skipIfShort(t)
 	srv1, err := Serve(echoHandler, nil, false)
@@ -246,6 +264,18 @@ func TestFreshServeYieldsDifferentIdentity(t *testing.T) {
 
 	if srv1.Addr() == srv2.Addr() {
 		t.Fatal("two independent Serve calls produced the same address")
+	}
+
+	info1, err := tailcat.ParseAddr(tailcat.Addr(srv1.Addr()))
+	if err != nil {
+		t.Fatalf("parse srv1 address: %v", err)
+	}
+	info2, err := tailcat.ParseAddr(tailcat.Addr(srv2.Addr()))
+	if err != nil {
+		t.Fatalf("parse srv2 address: %v", err)
+	}
+	if info1.ServerPublic == info2.ServerPublic {
+		t.Fatal("two independent Serve calls produced the SAME server node identity (ServerPublic) — only the address's embedded pre-shared key differed")
 	}
 }
 
@@ -266,9 +296,14 @@ func TestOnlyRPCPortIsServed(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 
-	// Sanity: the allowed client CAN reach the real RPC port.
-	if conn, derr := mustDial(t, srv.Addr(), priv, 30*time.Second); derr != nil {
-		t.Fatalf("sanity dial to the real RPC port failed: %v", derr)
+	// Positive control, through the SAME raw-client mechanism the
+	// denial check below uses: this proves dialRawPort itself can
+	// actually establish a connection at all, so the denial below means
+	// "this port is blocked", not "this raw dial path is broken for an
+	// unrelated reason" (a setup/handshake failure that had nothing to
+	// do with port restriction).
+	if conn, derr := dialRawPort(t, srv.Addr(), priv, transport.RPCPort, 30*time.Second); derr != nil {
+		t.Fatalf("positive control: raw dial to the real RPC port failed: %v", derr)
 	} else {
 		_ = conn.Close()
 	}
