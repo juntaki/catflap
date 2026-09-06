@@ -301,9 +301,19 @@ func TestServeRejectsNonPositiveTTL(t *testing.T) {
 // failure-injection case: a client that connects (burning the one-shot
 // claim) and then disconnects before reading the capability frame —
 // simulating a network drop or a killed agent process mid-delivery.
-// The pair server must not hang or panic, must still tear itself down
-// promptly (no ack will ever arrive), and — since the claim is already
-// burned — a second, well-behaved client must get nothing.
+// The pair server must not hang or panic, and must still tear itself
+// down promptly (no ack will ever arrive to wait for).
+//
+// This deliberately never creates a second connection to "prove" the
+// claim was burned: an earlier version of this test polled with a real
+// Fetch, which is itself a NEW connection racing to claim the pair
+// server — if that poll's own connection happened to win instead of
+// the deliberately-disconnected one, the test could pass without ever
+// actually exercising a claim-then-disconnect, since a lone successful
+// poll iteration was silently treated as "keep polling", not a failure.
+// Reading the server's own claimed/closed fields directly (this file
+// is in package pair) instead makes the assertion unambiguous: no
+// other connection exists to compete for the claim.
 func TestHandleConnClientDisconnectsDuringDelivery(t *testing.T) {
 	cap := testCap()
 	srv, err := Serve("local", cap, time.Minute, false, nil)
@@ -320,22 +330,25 @@ func TestHandleConnClientDisconnectsDuringDelivery(t *testing.T) {
 	}
 	_ = conn.Close() // disconnect immediately, before reading anything
 
-	done := make(chan struct{})
-	go func() {
-		// Poll rather than sleep a fixed amount: the server should
-		// tear itself down quickly once the write to the now-closed
-		// connection fails (no ack will ever arrive to wait for).
-		for i := 0; i < 100; i++ {
-			if _, err := Fetch(context.Background(), "local", addr, false); err != nil {
-				close(done)
-				return
-			}
-			time.Sleep(20 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for !srv.claimed.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the disconnecting client's own connection never burned the one-shot claim")
 		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("pair server never became unreachable after its one client disconnected mid-delivery")
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		srv.closeMu.Lock()
+		closed := srv.closed
+		srv.closeMu.Unlock()
+		if closed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pair server never tore itself down after its one client disconnected mid-delivery")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
