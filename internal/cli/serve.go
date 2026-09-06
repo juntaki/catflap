@@ -107,15 +107,23 @@ func (s *server) issuePairCode(taskID string, requestedTTL time.Duration) (code 
 
 	s.mu.Lock()
 	lt, ok = s.live[taskID]
+	// Re-check liveness here too, not just presence: pair.Serve above
+	// can take real wall-clock time (DERP handshake for tailcat), long
+	// enough for the task to flip to STOPPING in the meantime — that
+	// transition is synchronous, but removal from s.live is async (up
+	// to a 10s drain), so `ok` alone can still be true for a task that
+	// is already on its way out. A stale first check must not be the
+	// only thing standing between a dying task and a freshly-handed-out
+	// code for it.
+	stillActive := ok && lt.task.StateOf() == gateway.StateActive && !lt.task.Expired(time.Now())
 	var old *pair.Server
-	if ok {
+	if stillActive {
 		old, lt.pairSrv = lt.pairSrv, ps
 	}
 	s.mu.Unlock()
-	if !ok {
-		// The task died in the window between the liveness check above
-		// and here (e.g. a concurrent revoke) — never hand out a code
-		// for it.
+	if !stillActive {
+		// The task died (or started dying) in the window between the
+		// liveness check above and here — never hand out a code for it.
 		ps.Close()
 		return "", 0, fmt.Errorf("task is no longer live")
 	}
