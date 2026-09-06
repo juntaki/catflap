@@ -1,0 +1,46 @@
+name: tailcat-upgrade-check
+
+# Manual only — normal CI pins github.com/tailscale/tailcat and only
+# needs to test against that pinned version. Run this by hand before
+# actually bumping the dependency: it points internal/transport's
+# common + Tailcat-security contract suites (see
+# internal/transport/transporttest and
+# internal/transport/tailcat/security_contract_test.go) at a candidate
+# version first, so an API-compatible but semantics-changed release
+# (e.g. "empty AllowedClients" starts meaning something different) is
+# caught here instead of surfacing as a live pairing/task bug after the
+# bump lands on main.
+on:
+  workflow_dispatch:
+    inputs:
+      tailcat_version:
+        description: "github.com/tailscale/tailcat version/ref to test against (e.g. v0.7.0, or a commit SHA)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: bump tailcat to the candidate version
+        env:
+          TAILCAT_VERSION: ${{ inputs.tailcat_version }}
+        run: |
+          go get "github.com/tailscale/tailcat@${TAILCAT_VERSION}"
+          go mod tidy
+
+      - name: transport contract suite (local + real Tailcat/DERP)
+        run: go test -race -v ./internal/transport/...
+
+      - name: full suite, for good measure
+        run: go test -race ./...

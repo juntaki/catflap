@@ -65,9 +65,14 @@ jobs:
 
       - name: deadcode
         # deadcode prints unreachable funcs but always exits 0:
-        # fail the job when it reports anything.
+        # fail the job when it reports anything. -test also roots the
+        # analysis in test binaries, not just cmd/catflap's main: without
+        # it, internal/transport/transporttest (a shared conformance
+        # suite imported only by other packages' _test.go files — the
+        # same pattern as net/http/httptest) reports as entirely dead,
+        # since nothing in the real binary ever calls it.
         run: |
-          out="$(go run golang.org/x/tools/cmd/deadcode@v0.49.0 ./...)"
+          out="$(go run golang.org/x/tools/cmd/deadcode@v0.49.0 -test ./...)"
           if [ -n "$out" ]; then
             printf '%s\n' "$out"
             exit 1

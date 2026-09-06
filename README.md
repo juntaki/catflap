@@ -407,8 +407,9 @@ cmd/catflap/            CLI entry point
 internal/
   transport/            seam: Server/Client interfaces (no Tailcat types leak out)
     transport.go
-    tailcat/            ONLY package that imports github.com/tailscale/tailcat
+    tailcat/            ONLY package that imports github.com/tailscale/tailcat; also owns Tailcat's own security contract (allowlist, port restriction, per-Serve identity)
     local/              loopback transport (tests/demos)
+    transporttest/        shared behavioral contract every transport (local, tailcat, future ones) must satisfy
   capability/           agc1_… bearer tokens (task, endpoint, client key, secret, expiry)
   pair/                 pairing codes (encode/decode only, no crypto) + the one-shot pair server/client
   policy/               structured argv policy + file grants + approval modes (schema v1)
@@ -439,7 +440,12 @@ v0.3-B human approval engine: never/once/always, hash-bound, fail-closed, termin
 v0.3   release hardening: cross-platform CI, signed releases, README/golden-path parity ✓
 v0.3.1 UX pass: effective-permissions share output, share-code re-pair, catflap doctor ✓
 v0.3.2 pairing rewrite: direct Tailcat pair servers, no HTTP rendezvous, no hosted infra ✓
-v0.4   network egress policy, specialized adapters
+v0.4   pair protocol reliability: capability delivery ack replaces a fixed-sleep teardown heuristic ✓
+v0.5   security torture: fuzz targets (7 input boundaries), lifecycle failure-injection, leak stress ✓
+v0.6   Tailcat transport contract: common behavioral suite + Tailcat security contract, real DERP probes ✓
+v0.7   release-artifact verification: automated re-check of what a user actually downloads/installs
+v0.8+  feature freeze — P0/P1 fixes only, dogfooding, then 1.0
+v1.0   same architecture as today; network egress policy and specialized adapters land after, as v1.x features
 ```
 
 ## License
