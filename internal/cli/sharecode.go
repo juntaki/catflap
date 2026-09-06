@@ -28,7 +28,7 @@ import (
 func ShareCode(args []string) int {
 	fs := flag.NewFlagSet("share-code", flag.ContinueOnError)
 	statePath := fs.String("state", DefaultStatePath(), "state file written by `share`/`serve`")
-	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the new pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL)")
+	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the new pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL and to a 10m ceiling)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

@@ -44,8 +44,17 @@ const CodePrefix = "CAT-"
 // DefaultCodeTTL bounds how long a pairing code (and its underlying
 // pair server) stays claimable when the caller doesn't ask for
 // something else — always further clamped to the task's own remaining
-// TTL (see internal/cli/serve.go's issuePairCode).
+// TTL and to MaxCodeTTL (see internal/cli/serve.go's issuePairCode).
 const DefaultCodeTTL = 5 * time.Minute
+
+// MaxCodeTTL is a hard ceiling on how long any pairing code can stay
+// claimable, independent of the task's own TTL. A long-lived task
+// (hours) must not let an operator (deliberately or via a careless
+// --pairing-ttl) turn a leaked pairing code into an hours-long
+// authorization window — the code is a bootstrap secret in transit
+// (over chat logs, screenshots, a operator's clipboard) and should be
+// short-lived on its own terms, not just "no longer than the task".
+const MaxCodeTTL = 10 * time.Minute
 
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
 

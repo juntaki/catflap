@@ -194,6 +194,66 @@ func TestServeChecksStillLiveAtDeliveryTime(t *testing.T) {
 	}
 }
 
+// TestServeRejectsTTLAboveMaxCodeTTL covers a real regression: this
+// hard ceiling is what stands between a long-lived task (hours) and a
+// pairing code that stays claimable for just as long. It must be
+// enforced at Serve itself — the single lowest-level chokepoint every
+// pairing code goes through — independent of any caller's own clamping.
+func TestServeRejectsTTLAboveMaxCodeTTL(t *testing.T) {
+	if _, err := Serve("local", testCap(), MaxCodeTTL+time.Second, false, nil); err == nil {
+		t.Error("Serve must reject a ttl above MaxCodeTTL")
+	}
+	if _, err := Serve("local", testCap(), MaxCodeTTL, false, nil); err != nil {
+		t.Errorf("Serve must accept a ttl exactly at MaxCodeTTL, got %v", err)
+	}
+}
+
+// TestFetchRejectsUnsupportedCapabilityVersion, TestFetchRejectsMissingClientPrivForTailcat,
+// and TestFetchRejectsZeroExpiry cover a real regression: Fetch used to
+// only check TaskID/Endpoint/TaskSecret non-empty, not the same strict
+// v1 validation (capability.Decode) the legacy --cap-file path has
+// always gone through — an unsupported version, a tailcat capability
+// missing its client identity, or a capability with no expiry at all
+// would all have been accepted and handed straight to dialerFor/ping.
+func TestFetchRejectsUnsupportedCapabilityVersion(t *testing.T) {
+	cap := testCap()
+	cap.Version = 2
+	srv, err := Serve("local", cap, time.Minute, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	if _, err := Fetch(context.Background(), "local", srv.Addr(), false); err == nil {
+		t.Error("Fetch must reject an unsupported capability version")
+	}
+}
+
+func TestFetchRejectsMissingClientPrivForTailcat(t *testing.T) {
+	cap := testCap()
+	cap.Transport = "tailcat" // claims tailcat but never sets ClientPriv
+	srv, err := Serve("local", cap, time.Minute, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	if _, err := Fetch(context.Background(), "local", srv.Addr(), false); err == nil {
+		t.Error("Fetch must reject a tailcat capability with no client_priv")
+	}
+}
+
+func TestFetchRejectsZeroExpiry(t *testing.T) {
+	cap := testCap()
+	cap.ExpiresAt = time.Time{}
+	srv, err := Serve("local", cap, time.Minute, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	if _, err := Fetch(context.Background(), "local", srv.Addr(), false); err == nil {
+		t.Error("Fetch must reject a capability with no expires_at")
+	}
+}
+
 // TestServeRejectsNonPositiveTTL covers a construction-time guard: a
 // caller forgetting to clamp TTL to something positive must fail
 // loudly, not silently start a pair server that's already "expired".

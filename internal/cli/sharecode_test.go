@@ -185,6 +185,37 @@ func TestIssuePairCodeClampsToRemainingTaskTTL(t *testing.T) {
 	}
 }
 
+// TestIssuePairCodeClampsToMaxCodeTTL covers a real regression: a
+// long-lived task (hours, e.g. --ttl 24h) must not let a careless or
+// deliberate --pairing-ttl turn a leaked pairing code into an
+// hours-long authorization window — the ceiling is independent of the
+// task's own remaining TTL, not just "no longer than the task".
+func TestIssuePairCodeClampsToMaxCodeTTL(t *testing.T) {
+	s := &server{
+		transport: "local",
+		auditDir:  t.TempDir(),
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  4,
+	}
+	p := policy.Default()
+	p.TTL = 24 * time.Hour
+
+	_, task, err := s.mkTask(context.Background(), p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer task.Stop("revoked")
+
+	_, actualTTL, err := s.issuePairCode(task.ID, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("issuePairCode: %v", err)
+	}
+	if actualTTL > pair.MaxCodeTTL {
+		t.Errorf("actualTTL = %v, want it clamped to MaxCodeTTL (%v), not the task's 24h remaining TTL", actualTTL, pair.MaxCodeTTL)
+	}
+}
+
 // TestIssuePairCodeRejectsAlreadyExpiredTask covers the edge of the
 // same fix: a task with no time left must fail upfront, never issue a
 // code for it.

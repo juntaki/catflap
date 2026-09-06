@@ -30,7 +30,7 @@ func Share(args []string) int {
 	fs := flag.NewFlagSet("share", flag.ContinueOnError)
 	policyPath := fs.String("policy", "", "YAML policy file (default: built-in readonly-debug)")
 	ttlFlag := fs.String("ttl", "", "task TTL, e.g. 15m (default: policy ttl)")
-	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL)")
+	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL and to a 10m ceiling)")
 	name := fs.String("name", "", "preferred human name for the task (default: minted)")
 	transportFlag := fs.String("transport", "tailcat", "transport: tailcat | local")
 	auditDir := fs.String("audit", DefaultAuditDir(), "audit JSONL directory (empty disables file audit)")

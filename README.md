@@ -26,12 +26,16 @@ catflap share --policy p.yaml                        catflap setup claude
                                                     expires → Close
 ```
 
-No rendezvous, no hosted infrastructure of any kind: the agent connects
-straight to a throwaway pair server over the same encrypted Tailcat tunnel
-the task itself uses, fetches the capability once, and the pair server
-destroys itself immediately after — whether or not that delivery even
-succeeded. One task = one ephemeral network identity + one policy snapshot
-+ one audit chain. Expiry closes the task's own server (and any still-open
+No Catflap-operated rendezvous, no Catflap-hosted service of any kind: the
+agent connects straight to a throwaway pair server over the same Tailcat
+tunnel the task itself uses, fetches the capability once, and the pair
+server destroys itself immediately after — whether or not that delivery
+even succeeded. (Tailcat itself may still use Tailscale's DERP relays to
+bootstrap and, when a direct path isn't possible, as a fallback relay —
+see [Security model](#security-model--read-this) — but no Catflap
+component of any kind sits in that path.) One task = one ephemeral network
+identity + one policy snapshot + one audit chain. Expiry closes the task's
+own server (and any still-open
 pair server for it), so the WireGuard identity, the PSK, the address, and
 the RPC authorization all die together.
 
@@ -100,9 +104,10 @@ Paste the `Tell Claude:` line from `share`'s output into the `claude` session.
 Nothing is copy-pasted by hand except that one pairing code: it encodes only
 the address of a temporary pair server — a throwaway Tailcat (or local, for
 tests) identity that accepts one connection, hands over the capability, and
-destroys itself right after. No rendezvous, no third party ever sees the
-capability or any task traffic — the agent dials the pair server directly
-over the same encrypted tunnel the task itself uses. Once paired, the SDK
+destroys itself right after. No Catflap-operated rendezvous or third party
+ever sees the capability in the clear — the agent dials the pair server
+directly, and the capability travels only inside the WireGuard tunnel.
+Once paired, the SDK
 advertises the granted `remote_*` tools via `tools/list_changed` — no
 reconnect needed. Pairing codes are single-use (a second claim gets nothing)
 and their TTL is always clamped to the task's own remaining TTL.
@@ -376,9 +381,14 @@ running `share`/`serve` is trusted**, and enforces:
   is its own Tailcat identity, separate from the task's, claims exactly one
   connection, and self-destructs immediately after (whether or not delivery
   succeeded) or after its own TTL — always clamped to the task's remaining
-  TTL, so a code can never outlive its task. No rendezvous, no third party,
-  no hosted infrastructure of any kind sees the capability or any task
-  traffic. The legacy manual flow's bearer token is best carried via
+  TTL and to a fixed 10-minute ceiling regardless of how long the task
+  itself runs, so a code can never outlive its task or become a long-lived
+  bootstrap secret on its own. No Catflap-operated rendezvous or third
+  party sees the capability in the clear. Tailcat's own DERP relays remain
+  a bootstrap/fallback-transit dependency (see the callout above the
+  Golden path) — Catflap has no hosted infrastructure of its own in that
+  path, but Tailscale's DERP servers are still a third party the encrypted
+  traffic may transit. The legacy manual flow's bearer token is best carried via
   `--out` / `--cap-file` (0600 files); it also accepts `--cap` or an env
   var, both discouraged (`--cap` visibly leaks the token into argv/shell
   history) — prefer the pairing flow, or at minimum `--cap-file`.

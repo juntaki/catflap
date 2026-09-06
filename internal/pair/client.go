@@ -2,7 +2,7 @@ package pair
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"time"
@@ -62,12 +62,18 @@ func Fetch(ctx context.Context, transportName, addr string, verbose bool) (*capa
 	if len(raw) > MaxCapabilityBytes {
 		return nil, fmt.Errorf("pair server response too large")
 	}
-	var cp capability.Capability
-	if jerr := json.Unmarshal(raw, &cp); jerr != nil {
-		return nil, fmt.Errorf("bad capability from pair server: %w", jerr)
+	// Re-wrap as a bearer string and reuse capability.Decode's existing
+	// strict v1 validation (version, transport-specific required
+	// fields, expiry shape) instead of duplicating it — this is a real
+	// protocol boundary (whatever a pair server actually sends in, a
+	// Capability out) even though in normal operation the sender is
+	// catflap's own code marshaling its own struct: reject anything
+	// that doesn't match the exact shape a legitimate pair server would
+	// ever produce, the same way the pre-pairing capability.Decode call
+	// site (the legacy --cap-file path) always has.
+	cp, derr := capability.Decode(capability.Prefix + base64.RawURLEncoding.EncodeToString(raw))
+	if derr != nil {
+		return nil, fmt.Errorf("bad capability from pair server: %w", derr)
 	}
-	if cp.TaskID == "" || cp.Endpoint == "" || cp.TaskSecret == "" {
-		return nil, fmt.Errorf("bad capability from pair server: missing required fields")
-	}
-	return &cp, nil
+	return cp, nil
 }

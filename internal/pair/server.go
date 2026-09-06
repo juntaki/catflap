@@ -58,6 +58,16 @@ func Serve(transportName string, cap *capability.Capability, ttl time.Duration, 
 	if ttl <= 0 {
 		return nil, fmt.Errorf("pair server ttl must be positive")
 	}
+	if ttl > MaxCodeTTL {
+		// Hard ceiling enforced at this single lowest-level chokepoint
+		// every pairing code goes through, independent of any caller's
+		// own clamping: a pairing code is a bootstrap secret in transit
+		// (chat logs, screenshots, a clipboard) and must stay
+		// short-lived on its own terms, never just "no longer than the
+		// task" — a long-lived task must not turn a careless
+		// --pairing-ttl (or a leaked code) into an hours-long window.
+		return nil, fmt.Errorf("pair server ttl %s exceeds MaxCodeTTL %s", ttl, MaxCodeTTL)
+	}
 	payload, err := json.Marshal(cap)
 	if err != nil {
 		return nil, fmt.Errorf("encode capability: %w", err)

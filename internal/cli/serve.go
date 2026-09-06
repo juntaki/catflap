@@ -72,11 +72,14 @@ func (s *server) setCapability(taskID string, cap *capability.Capability) {
 // STOPPING — audit-fail-closed and other paths flip state
 // synchronously before the async teardown that removes it from
 // s.live actually runs, so s.live alone lags reality briefly), and not
-// yet past its own TTL. requestedTTL is clamped to the task's own
-// remaining TTL: a pairing code must never outlive the task it
-// delivers a capability for. Any previous still-open pair server for
-// this task is closed before the new one starts — at most one
-// claimable code per task at a time.
+// yet past its own TTL. requestedTTL is clamped to the SHORTER of the
+// task's own remaining TTL and pair.MaxCodeTTL: a pairing code must
+// never outlive its task, AND must never outlive the fixed absolute
+// ceiling regardless of how long the task itself runs (pair.Serve
+// enforces the ceiling too, as a hard invariant independent of this
+// clamp). Any previous still-open pair server for this task is closed
+// before the new one starts — at most one claimable code per task at
+// a time.
 func (s *server) issuePairCode(taskID string, requestedTTL time.Duration) (code string, actualTTL time.Duration, err error) {
 	s.mu.Lock()
 	lt, ok := s.live[taskID]
@@ -94,6 +97,9 @@ func (s *server) issuePairCode(taskID string, requestedTTL time.Duration) (code 
 	ttl := requestedTTL
 	if remaining < ttl {
 		ttl = remaining
+	}
+	if ttl > pair.MaxCodeTTL {
+		ttl = pair.MaxCodeTTL
 	}
 	task := lt.task
 	stillLive := func() bool {
