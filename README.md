@@ -443,7 +443,7 @@ v0.3.2 pairing rewrite: direct Tailcat pair servers, no HTTP rendezvous, no host
 v0.4   pair protocol reliability: capability delivery ack replaces a fixed-sleep teardown heuristic ✓
 v0.5   security torture: fuzz targets (7 input boundaries), lifecycle failure-injection, leak stress ✓
 v0.6   Tailcat transport contract: common behavioral suite + Tailcat security contract, real DERP probes ✓
-v0.7   release-artifact verification: automated re-check of what a user actually downloads/installs
+v0.7   release-artifact verification: re-download from GitHub Releases + Homebrew, verify sig/checksum/provenance, golden E2E on the real binary ✓
 v0.8+  feature freeze — P0/P1 fixes only, dogfooding, then 1.0
 v1.0   same architecture as today; network egress policy and specialized adapters land after, as v1.x features
 ```

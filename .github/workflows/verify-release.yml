@@ -1,0 +1,168 @@
+name: verify-release
+
+# Verifies what a user actually gets from a published release — not the
+# dist/ directory the release job built, but the bytes GitHub Releases
+# and the Homebrew tap serve back over the network, on a separate
+# runner, after the release job has finished. Checking release.yml's
+# own dist/ would only prove the build succeeded, not that what ships
+# is genuinely signed, checksummed, attested, and installable the way
+# a real user (or `brew install`) would receive it.
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.7.0). Defaults to the tag that triggered the most recent release run."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-tag:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          WORKFLOW_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ -n "$DISPATCH_TAG" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag="$WORKFLOW_RUN_TAG"
+          fi
+          # tag is used later as a git ref (actions/checkout) and in
+          # shell commands — constrain it to catflap's actual release
+          # tag shape before it goes anywhere near either.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "refusing to verify malformed tag: $tag"
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: resolve-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Golden pairing E2E needs to actually execute the downloaded
+          # binary, so it only runs where a native (non-emulated)
+          # runner is available for that platform. Homebrew's tap is
+          # macOS/arm64-only today, so the fresh-install check lives
+          # only there (see the separate verify-homebrew job below).
+          - platform: darwin-arm64
+            os: macos-latest
+            golden_e2e: true
+          - platform: linux-amd64
+            os: ubuntu-latest
+            golden_e2e: true
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            golden_e2e: false
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+
+      - name: download release assets from GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl
+          suffix="${PLATFORM/-/_}"
+          gh release download "$TAG" -R juntaki/catflap -D dl \
+            -p 'checksums.txt' -p 'checksums.txt.sig' -p 'checksums.txt.pem' \
+            -p "catflap_*_${suffix}.tar.gz"
+
+      - name: verify checksums.txt's keyless signature (GitHub Actions issuer, this repo's release.yml only)
+        run: |
+          cosign verify-blob \
+            --certificate dl/checksums.txt.pem \
+            --signature dl/checksums.txt.sig \
+            --certificate-identity-regexp '^https://github\.com/juntaki/catflap/\.github/workflows/release\.yml@refs/tags/.*$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dl/checksums.txt
+
+      - name: verify archive checksum against the now-trusted checksums.txt
+        run: |
+          archive=$(ls dl/catflap_*_"${PLATFORM/-/_}".tar.gz)
+          name=$(basename "$archive")
+          expected=$(grep " $name\$" dl/checksums.txt | awk '{print $1}')
+          if [ -z "$expected" ]; then
+            echo "no checksum entry for $name in checksums.txt"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$archive" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+          fi
+          if [ "$expected" != "$actual" ]; then
+            echo "checksum mismatch for $name: expected $expected, got $actual"
+            exit 1
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: verify build provenance attestation (this repo's release.yml only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify "$ARCHIVE" \
+            --repo juntaki/catflap \
+            --signer-workflow juntaki/catflap/.github/workflows/release.yml
+
+      - name: extract the verified archive
+        run: |
+          mkdir -p extract bin
+          tar xzf "$ARCHIVE" -C extract
+          chmod +x extract/catflap
+          cp extract/catflap bin/catflap
+
+      - name: version check
+        run: |
+          got=$(./bin/catflap version)
+          want="catflap ${TAG#v}"
+          if [ "$got" != "$want" ]; then
+            echo "unexpected version output: got '$got' want '$want'"
+            exit 1
+          fi
+
+      - name: golden pairing E2E against the downloaded binary
+        if: matrix.golden_e2e
+        run: python3 testdata/e2e/pairing.py
+
+  verify-homebrew:
+    needs: resolve-tag
+    runs-on: macos-latest
+    env:
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+    steps:
+      - name: fresh install from the published tap
+        run: brew install juntaki/catflap/catflap
+
+      - name: version + smoke
+        run: |
+          got=$(catflap version)
+          want="catflap ${TAG#v}"
+          if [ "$got" != "$want" ]; then
+            echo "unexpected version output: got '$got' want '$want'"
+            exit 1
+          fi
+          catflap --help >/dev/null
