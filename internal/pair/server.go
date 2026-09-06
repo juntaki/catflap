@@ -1,8 +1,10 @@
 package pair
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,10 +20,31 @@ import (
 // are ~1KB).
 const MaxCapabilityBytes = 8192
 
+// frameHeaderLen is the fixed-size big-endian uint32 length prefix in
+// front of the capability payload — see handleConn/Fetch. Explicit
+// framing, not "read until the connection closes": the client must be
+// able to tell it has the whole payload before it sends its own ack,
+// and the server won't close until that ack arrives (or times out).
+const frameHeaderLen = 4
+
 // deliverTimeout bounds how long the pair server waits to finish writing
 // the capability once a connection lands — a stalled peer must not keep
 // the one-shot claim open indefinitely.
 const deliverTimeout = 10 * time.Second
+
+// ackTimeout bounds how long the pair server waits, after writing the
+// capability, for the client's one-byte acknowledgement that it was
+// actually received and validated — see handleConn's doc comment for
+// why this replaced a fixed sleep. A stalled or hostile client cannot
+// hold the pair server (and its underlying WireGuard engine) open past
+// this regardless: the one-shot claim is already burned either way.
+const ackTimeout = 10 * time.Second
+
+// ackByte is the client's acknowledgement — its content carries no
+// meaning (the server never inspects it beyond "a byte arrived"); its
+// arrival is what actually proves the capability got to the other end,
+// which conn.Write returning success does not (see handleConn).
+const ackByte = 0x06 // ASCII ACK
 
 // Server is a temporary, one-shot capability-delivery server: it starts
 // its own ephemeral Tailcat (or local) identity, open to any client (no
@@ -72,6 +95,12 @@ func Serve(transportName string, cap *capability.Capability, ttl time.Duration, 
 	if err != nil {
 		return nil, fmt.Errorf("encode capability: %w", err)
 	}
+	if len(payload) > MaxCapabilityBytes {
+		// Can't happen for a real Capability (~1KB) — but this bound
+		// is exactly what Fetch enforces on the read side, and it's
+		// what keeps the length prefix below a safe uint32 cast.
+		return nil, fmt.Errorf("encoded capability (%d bytes) exceeds MaxCapabilityBytes", len(payload))
+	}
 
 	s := &Server{}
 	// Held for the whole setup below: the underlying transport's accept
@@ -101,45 +130,58 @@ func Serve(transportName string, cap *capability.Capability, ttl time.Duration, 
 	return s, nil
 }
 
-// teardownGrace is how long handleConn waits after writing before it
-// tears down the WHOLE pair server (WireGuard engine included). This
-// is not cosmetic: over Tailcat, conn.Write returning only means the
-// bytes reached the local netstack's send queue, not that they've
-// actually gone out over the (async, relayed-over-DERP) tunnel yet.
-// Closing the underlying transport.Server immediately after Write — as
-// a first version of this did — killed the WireGuard engine before the
-// just-written capability had actually left the box, so the client's
-// connection died mid-flight and Fetch timed out waiting for data that
-// was never going to arrive. Discovered by actually running this over
-// real Tailcat, not just the local-transport tests.
-const teardownGrace = 2 * time.Second
-
 // handleConn is Server's transport.Handler. Exactly one caller across
 // the whole process ever gets past the CompareAndSwap — every other
 // concurrent (or later) connection is dropped with nothing written,
 // including a replay of the same pairing code once the first has
-// landed. Whether or not the write below actually succeeds, the server
-// self-destructs shortly after (see teardownGrace): a stalled or
-// dropped peer does not get a second chance, matching the old
-// rendezvous's "fetch burns the envelope regardless of what follows"
-// semantics.
+// landed. Whether or not delivery actually succeeds, the server
+// self-destructs once this returns: a stalled or dropped peer does not
+// get a second chance, matching the old rendezvous's "fetch burns the
+// envelope regardless of what follows" semantics.
+//
+// After writing, this waits for the client's one-byte ack (bounded by
+// ackTimeout) instead of a fixed sleep before tearing the whole pair
+// server down. An earlier version closed the server immediately after
+// Write returned — but over Tailcat, Write returning only means the
+// bytes reached the local netstack's send queue, not that they've
+// actually gone out over the (async, possibly DERP-relayed) tunnel
+// yet. Closing the WireGuard engine that fast killed the connection
+// mid-flight and the client's Fetch timed out waiting for data that
+// was never going to arrive — discovered by actually running this over
+// real Tailcat, not just the local-transport tests. Waiting for a real
+// signal that the client actually got the bytes (or giving up after a
+// bounded timeout either way) replaces that guess with a fact.
 func (s *Server) handleConn(conn net.Conn, payload []byte, stillLive func() bool) {
 	if !s.claimed.CompareAndSwap(false, true) {
 		_ = conn.Close()
 		return
 	}
+	defer func() {
+		_ = conn.Close()
+		s.Close()
+	}()
 	if stillLive != nil && !stillLive() {
 		// The task died between Serve's own caller-side check and this
 		// connection actually landing — the claim is still burned (no
 		// second chance for a replay), but nothing is delivered.
-		_ = conn.Close()
-		time.AfterFunc(teardownGrace, s.Close)
 		return
 	}
+	// Length-prefixed, not newline/close-delimited: the client must be
+	// able to tell the capability frame is fully received WITHOUT
+	// waiting for this connection to close — it has to send its own
+	// ack (below) before we do that, so "close signals end of payload"
+	// would deadlock both ends waiting on each other.
+	frame := make([]byte, frameHeaderLen+len(payload))
+	//nolint:gosec // reason: len(payload) is already bounded to MaxCapabilityBytes (8192) by the check in Serve, far below uint32's range.
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[frameHeaderLen:], payload)
 	_ = conn.SetWriteDeadline(time.Now().Add(deliverTimeout))
-	_, _ = conn.Write(append(append([]byte(nil), payload...), '\n'))
-	_ = conn.Close()
-	time.AfterFunc(teardownGrace, s.Close)
+	if _, werr := conn.Write(frame); werr != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(ackTimeout))
+	ack := make([]byte, 1)
+	_, _ = io.ReadFull(conn, ack) // content and timeout-vs-arrival are both irrelevant beyond "stop waiting now"
 }
 
 // Addr returns the pair server's own address (a tailcat "tc…" address,

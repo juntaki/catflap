@@ -99,6 +99,32 @@ func TestServeDeliversCapabilityOnce(t *testing.T) {
 	}
 }
 
+// TestServeAndFetchCompleteWithoutAnySleep covers the v0.4 fix at the
+// level that actually matters for local transport (the fixed-sleep bug
+// itself only ever manifested over real Tailcat's async, possibly
+// DERP-relayed delivery — see TestServeOverRealTailcat for that): the
+// server no longer waits a fixed 2s after writing before tearing itself
+// down, closing instead as soon as the client's ack arrives. A full
+// Fetch round trip (dial, length-prefixed read, decode, ack) completing
+// this fast is what proves no sleep crept back into either side of the
+// handshake.
+func TestServeAndFetchCompleteWithoutAnySleep(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, time.Minute, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := Fetch(context.Background(), "local", srv.Addr(), false); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Fetch took %s — no step of the handshake should involve a fixed sleep", elapsed)
+	}
+}
+
 // TestServeSecondFetchGetsNothing covers "replays get nothing": once
 // claimed, the pair server has already destroyed itself, so a second
 // Fetch — even against the exact same address — must fail.

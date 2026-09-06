@@ -3,6 +3,7 @@ package pair
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"time"
@@ -55,12 +56,22 @@ func Fetch(ctx context.Context, transportName, addr string, verbose bool) (*capa
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetReadDeadline(time.Now().Add(fetchReadTimeout))
 
-	raw, err := io.ReadAll(io.LimitReader(conn, MaxCapabilityBytes+1))
-	if err != nil {
+	// Length-prefixed, not read-until-close: the server won't close
+	// until it gets our ack below, so relying on EOF to know we have
+	// the whole payload would deadlock both ends waiting on each
+	// other. See handleConn's matching write for why this replaced a
+	// fixed post-write sleep on the server side.
+	var lenBuf [frameHeaderLen]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 		return nil, fmt.Errorf("read from pair server: %w", err)
 	}
-	if len(raw) > MaxCapabilityBytes {
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n > MaxCapabilityBytes {
 		return nil, fmt.Errorf("pair server response too large")
+	}
+	raw := make([]byte, n)
+	if _, err := io.ReadFull(conn, raw); err != nil {
+		return nil, fmt.Errorf("read from pair server: %w", err)
 	}
 	// Re-wrap as a bearer string and reuse capability.Decode's existing
 	// strict v1 validation (version, transport-specific required
@@ -75,5 +86,11 @@ func Fetch(ctx context.Context, transportName, addr string, verbose bool) (*capa
 	if derr != nil {
 		return nil, fmt.Errorf("bad capability from pair server: %w", derr)
 	}
+	// Ack only after the capability actually validated: the server
+	// tears itself down once this arrives (or ackTimeout elapses), so
+	// this is the real signal that delivery succeeded, not just that
+	// Write() returned on the server's end.
+	_ = conn.SetWriteDeadline(time.Now().Add(fetchReadTimeout))
+	_, _ = conn.Write([]byte{ackByte}) // best-effort: the claim already succeeded regardless of whether this lands
 	return cp, nil
 }
