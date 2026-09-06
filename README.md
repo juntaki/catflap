@@ -84,11 +84,12 @@ sides at it with `--rendezvous` / `CATFLAP_RENDEZVOUS`.
 ./bin/catflap revoke <task|name>        # destroy a task early: same teardown as expiry
 ```
 
-The agent sees at most four tools: `remote_exec` (command + argv, no
-shell), `remote_read`, `remote_stat`, and — only with an explicit
-`file.write` grant — `remote_write`. After the TTL, the task's server is
-closed: calls fail with `capability expired` (or `task revoked` / `task
-shutdown` when killed that way).
+Once paired, the agent sees `disconnect` (revoke its own access) alongside
+whatever the policy grants: `remote_exec` (command + argv, no shell),
+`remote_read`, `remote_stat`, and — only with an explicit `file.write`
+grant — `remote_write`. After the TTL, the task's server is closed: calls
+fail with `capability expired` (or `task revoked` / `task shutdown` when
+killed that way).
 
 ### Advanced / legacy: manual capability file
 
@@ -131,8 +132,8 @@ revoke, and approval denial kill server-side meanwhile).
 Gateway RPC frames are bounded at 2MiB, enforced incrementally on receipt
 and checked before send. All policy-controlled content limits are capped
 so even fully-adversarial bytes (worst-case 6x JSON escaping) fit one
-frame. Argument vectors are unbounded by policy (use tight argv shapes) —
-content limits, not argv, carry the frame guarantee.
+frame. Argv is capped independently (64 args, 4096 bytes each) and content
+limits are capped separately — together they carry the frame guarantee.
 
 ## Policy
 
@@ -166,7 +167,8 @@ Arg matchers: exact string, `{any:true}`, `{integer:{min,max}}`,
 for commands that cannot reach files — never for `cat`-likes). Arity is
 exact otherwise. Commands resolve via `PATH` at call time (operator's PATH,
 never the agent's) or as absolute paths. The v0.1 shell-string allowlist
-(`exec.commands`) is rejected at load: it cannot be made shell-safe.
+(`exec.commands`) is rejected at load: it cannot be made shell-safe. Argv
+itself is bounded too: at most 64 arguments, each at most 4096 bytes.
 
 ### Human approval
 
@@ -333,8 +335,10 @@ running `share`/`serve` is trusted**, and enforces:
 - Pairing codes are one-time, short-lived, brute-force resistant, and
   typo-safe (CRC-16 checked locally before any network round trip); the
   rendezvous server sees only a sealed envelope, never a capability or task
-  traffic. Bearer tokens in the legacy manual flow travel via files
-  (`--out` / `--cap-file`), not argv.
+  traffic. The legacy manual flow's bearer token is best carried via
+  `--out` / `--cap-file` (0600 files); it also accepts `--cap` or an env
+  var, both discouraged (`--cap` visibly leaks the token into argv/shell
+  history) — prefer the pairing flow, or at minimum `--cap-file`.
 - The admin API binds loopback only; the state file (admin bearer token)
   gets the same secure-file semantics as capabilities.
 
