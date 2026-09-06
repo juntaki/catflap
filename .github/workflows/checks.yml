@@ -39,7 +39,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - run: go test -race ./...
+      # -p 1: run package test binaries one at a time, not concurrently.
+      # The real-Tailcat/DERP transport suite is CPU/network heavy on
+      # its own; letting it run alongside other packages' tests under
+      # -race on a constrained runner (observed specifically on
+      # ubuntu-24.04-arm) starved unrelated goroutines badly enough to
+      # make an otherwise sub-millisecond operation (an SSH connection
+      # actually closing) not complete within 30s. Full package
+      # isolation removes that contention as a class; the real-Tailcat
+      # suite is already the dominant cost regardless of what else runs
+      # alongside it, so serializing packages costs little extra wall
+      # time in practice.
+      - run: go test -race -p 1 ./...
       - run: go build ./...
 
   vulncheck:
@@ -93,6 +104,4 @@ jobs:
           cache: true
 
       - run: go build -o ./bin/catflap ./cmd/catflap
-      - run: python3 ./testdata/e2e/adversarial.py
-      - run: python3 ./testdata/e2e/pairing.py
-      - run: python3 ./testdata/e2e/approval.py
+      - run: python3 ./testdata/e2e/ssh_share.py

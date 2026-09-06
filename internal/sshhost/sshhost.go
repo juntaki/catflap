@@ -1,0 +1,421 @@
+// Package sshhost is the new core of Catflap: an embedded SSH server
+// bound to one ephemeral task. There is no command allowlist, no
+// filesystem capability, and no approval flow here — the OS account
+// `catflap share` runs as already defines what the agent can do,
+// exactly like a normal SSH login. What Catflap adds is that the
+// endpoint, the route to it, and the credential that authenticates
+// against it all live no longer than the task itself:
+//
+//   - the SSH host key is generated fresh per task and exists only in
+//     memory;
+//   - the one client key allowed to authenticate is registered during
+//     pairing and is exact-match only — no authorized_keys file, no
+//     persistence;
+//   - the whole task is torn down by its own TTL, an explicit revoke,
+//     or process shutdown, which cancels every in-flight command's
+//     context and closes the listener — the access dies with the task,
+//     including anything it started.
+package sshhost
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/creack/pty"
+	gossh "golang.org/x/crypto/ssh"
+
+	ssh "github.com/tailscale/gliderssh"
+
+	"github.com/juntaki/catflap/internal/audit"
+	"github.com/juntaki/catflap/internal/transport"
+)
+
+// Task is one live ephemeral SSH endpoint. Its context governs every
+// command it runs: cancelling it (TTL, revoke, shutdown) kills every
+// in-flight process tree, not just new connection attempts.
+type Task struct {
+	ID        string
+	ExpiresAt time.Time
+	Audit     *audit.Logger
+
+	hostSigner gossh.Signer
+	// sshSrv is ONE gliderssh.Server shared by every connection this
+	// task ever accepts (constructed once in NewTask, not per-connection):
+	// gliderssh.Server.Close "immediately closes all active listeners and
+	// all active connections", which is exactly what Stop needs to sever
+	// a client mid-session, not just refuse new connections — a
+	// per-connection Server instance would have nothing for Stop to
+	// reach back into.
+	sshSrv *ssh.Server
+
+	mu         sync.Mutex
+	allowedKey gossh.PublicKey // nil until pairing registers one; no key authenticates until then
+	stopping   bool            // set under mu at the start of Stop; beginSession refuses admission once true
+
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	// wg tracks in-flight handleSession calls (beginSession/endSession):
+	// Stop drains this, bounded, before sealing the audit log — a
+	// session's own audit line for a command Stop just killed must land
+	// BEFORE the terminal event, not race it.
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+	// stoppingCh closes the instant Stop begins — before the bounded
+	// drain, before the terminal audit event, before Done. A caller
+	// that only needs to know "is this task still the one live claim
+	// worth handing out" (the pair server's stillLive check) must not
+	// wait for drain to finish first: drain can take up to
+	// drainTimeout, and a pair server still advertising a task that's
+	// already mid-teardown would hand out a code for something already
+	// gone.
+	stoppingCh chan struct{}
+	stopDone   chan struct{}
+	// onStop releases task-external resources (the task's transport
+	// server). Set by the caller before the task starts serving; a
+	// caller that sets it AFTER Stop has already begun gets it invoked
+	// immediately instead of silently missing the one call it would
+	// otherwise never get — see OnStopFunc.
+	onStop func()
+}
+
+// drainTimeout bounds how long Stop waits for in-flight sessions to
+// actually finish (their process tree killed, cmd.Wait returned, audit
+// line written) before sealing the audit log regardless — matching the
+// legacy gateway's identical bound on its own drain.
+const drainTimeout = 10 * time.Second
+
+// beginSession admits one handleSession call, refusing once Stop has
+// begun. The caller MUST call endSession on a true return.
+func (t *Task) beginSession() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopping {
+		return false
+	}
+	t.wg.Add(1)
+	return true
+}
+
+func (t *Task) endSession() { t.wg.Done() }
+
+// causeExpired/causeRevoked/causeShutdown distinguish why a task's
+// context was cancelled, mirroring gateway.Task's terminationCause —
+// a session killed by expiry should not be reported the same as one
+// killed by an explicit revoke.
+var (
+	errExpired  = fmt.Errorf("task expired")
+	errRevoked  = fmt.Errorf("task revoked")
+	errShutdown = fmt.Errorf("task shutdown")
+)
+
+func causeFor(reason string) error {
+	switch reason {
+	case "revoked":
+		return errRevoked
+	case "shutdown":
+		return errShutdown
+	default:
+		return errExpired
+	}
+}
+
+// NewTask mints a task with a fresh ephemeral Ed25519 host key and a
+// context that self-cancels at ttl. No client key is allowed until
+// SetAllowedKey registers one (see pairing).
+func NewTask(parent context.Context, id string, ttl time.Duration, alog *audit.Logger) (*Task, error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate host key: %w", err)
+	}
+	signer, err := gossh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("wrap host key: %w", err)
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	t := &Task{
+		ID: id, ExpiresAt: time.Now().Add(ttl), Audit: alog,
+		hostSigner: signer, ctx: ctx, cancel: cancel,
+		stoppingCh: make(chan struct{}), stopDone: make(chan struct{}),
+	}
+	t.sshSrv = &ssh.Server{
+		HostSigners: []ssh.Signer{t.hostSigner},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session": ssh.DefaultSessionHandler,
+		},
+		PublicKeyHandler: func(_ ssh.Context, key ssh.PublicKey) error {
+			allowed := t.getAllowedKey()
+			if allowed == nil || !ssh.KeysEqual(key, allowed) {
+				return fmt.Errorf("unauthorized key")
+			}
+			return nil
+		},
+		Handler: t.handleSession,
+	}
+	time.AfterFunc(ttl, func() { t.Stop("expired") })
+	return t, nil
+}
+
+// HostKeyAuthorizedLine renders the task's host public key in
+// authorized_keys/known_hosts line format, for delivery to the client
+// during pairing.
+func (t *Task) HostKeyAuthorizedLine() string {
+	return string(gossh.MarshalAuthorizedKey(t.hostSigner.PublicKey()))
+}
+
+// SetAllowedKey registers the exact client public key pairing
+// delivered. Only this key will ever authenticate against this task —
+// there is no allowlist file and no way to add a second key.
+func (t *Task) SetAllowedKey(k gossh.PublicKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.allowedKey = k
+}
+
+func (t *Task) getAllowedKey() gossh.PublicKey {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.allowedKey
+}
+
+// OnStopFunc sets the external-release hook (closes the task's
+// transport server). Ordinarily set once, before the task starts
+// serving. If Stop has already begun by the time this is called — a
+// narrow window that only matters for a pathologically short TTL —
+// f runs immediately instead of being silently stored somewhere Stop
+// already finished reading from: a hook registered "too late" must
+// still fire exactly once, not get lost.
+func (t *Task) OnStopFunc(f func()) {
+	t.mu.Lock()
+	if t.stopping {
+		t.mu.Unlock()
+		f()
+		return
+	}
+	t.onStop = f
+	t.mu.Unlock()
+}
+
+// Stop tears the task down in the order the "endpoint, route, and
+// credential all die together" contract needs: signal first (anything
+// only waiting to know the task is no longer a live claim, like the
+// pair server, must not wait for the slow parts), then the actual
+// teardown, then the bounded drain, then the audit trail is sealed
+// last of all. Safe to call more than once and from multiple
+// goroutines; only the first call has effect.
+func (t *Task) Stop(reason string) {
+	t.stopOnce.Do(func() {
+		t.mu.Lock()
+		t.stopping = true
+		onStop := t.onStop
+		t.mu.Unlock()
+		// Closes before anything else runs: a pair server's stillLive
+		// check (see internal/cli's runSSHShare) must see this task as
+		// already gone the instant teardown starts, not up to
+		// drainTimeout later — handing out a fresh pairing code for a
+		// task that's mid-teardown would be handing out a code for
+		// something already dead.
+		close(t.stoppingCh)
+		// Release the transport server (Tailcat/local listener) before
+		// the bounded drain below, not after: the network ROUTE dying
+		// is part of "access dies with the task", not a cleanup detail
+		// that can wait behind up to drainTimeout of in-flight
+		// commands finishing.
+		if onStop != nil {
+			onStop()
+		}
+		// Cancelling is what actually kills a running command's whole
+		// process tree: startDetached wires t.ctx's cancellation
+		// straight to cmd.Cancel, which SIGKILLs the process GROUP, not
+		// just the shell exec.CommandContext started — a command that
+		// spawned children (a build, a test runner) must not survive
+		// its task.
+		t.cancel(causeFor(reason))
+		// Closing the shared gliderssh.Server severs every currently
+		// open SSH connection for this task, not just future ones — a
+		// revoke/expiry/shutdown must disconnect an already-paired
+		// client sitting in an interactive session, not merely stop
+		// admitting new ones.
+		_ = t.sshSrv.Close()
+		// Bounded drain: wait for every handleSession call already
+		// in flight to actually finish — its killed process reaped and
+		// its own ssh_exec audit line written — before sealing the log.
+		// Without this, a session Stop just killed could still be
+		// writing its audit line after LogTerminal has already sealed
+		// the logger, silently losing that record.
+		drained := make(chan struct{})
+		go func() { t.wg.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(drainTimeout):
+		}
+		if t.Audit != nil {
+			t.Audit.LogTerminal(reason)
+			_ = t.Audit.Close()
+		}
+		close(t.stopDone)
+	})
+}
+
+// Stopping reports when Stop has begun — closes immediately, well
+// before Done (which waits for the full drain and audit seal). Use
+// this for "is this task still a live claim worth acting on" checks
+// that must not block behind drainTimeout; use Done for "has teardown
+// fully finished".
+func (t *Task) Stopping() <-chan struct{} { return t.stoppingCh }
+
+// Done reports when the task has been fully stopped: drain finished,
+// terminal audit event written, audit sink closed.
+func (t *Task) Done() <-chan struct{} { return t.stopDone }
+
+// Handler returns the transport.Handler for this task: one gliderssh
+// server, bound to the task's host key and its (initially absent, set
+// by pairing) allowed client key. Every session it runs is rooted in
+// the task's own context, so Stop kills every in-flight command.
+func (t *Task) Handler() transport.Handler {
+	return func(conn net.Conn) { t.sshSrv.HandleConn(conn) }
+}
+
+// auditExec logs one command's shape and outcome — never its output —
+// so the audit trail shows what ran and how it ended without capturing
+// arbitrary command output as an implicit second copy of the session.
+func (t *Task) auditExec(rawCommand string, pty bool, start time.Time, exitCode int, err error) {
+	if t.Audit == nil {
+		return
+	}
+	decision := "allow"
+	if err != nil && t.ctx.Err() != nil {
+		decision = "terminated"
+	}
+	args := fmt.Sprintf(`{"command":%q,"pty":%v}`, rawCommand, pty)
+	result := fmt.Sprintf(`{"exit_code":%d}`, exitCode)
+	t.Audit.Log("ssh_exec", []byte(args), decision, []byte(result), time.Since(start))
+}
+
+// handleSession runs one SSH session's command (or login shell, if the
+// client sent none) to completion, wired to a PTY when the client
+// requested one. Every command is rooted in the task's own context:
+// task expiry/revoke/shutdown kills it immediately, not just future
+// sessions.
+func (t *Task) handleSession(s ssh.Session) {
+	if !t.beginSession() {
+		_ = s.Exit(1)
+		return
+	}
+	defer t.endSession()
+
+	start := time.Now()
+	shell := loginShell()
+	var cmd *exec.Cmd
+	if raw := s.RawCommand(); raw != "" {
+		// Match real sshd: an exec request runs "$SHELL -c <raw command
+		// text>", not an argv Catflap parses and execs directly. Catflap
+		// has no command allowlist to protect by avoiding a shell here —
+		// the OS account is the boundary now — and the caller (an agent
+		// driving builds/tests, or a human's own ssh client) expects
+		// ordinary shell semantics: pipes, &&, redirection, quoting.
+		//nolint:gosec // reason: this IS the SSH exec primitive; running the client's command text through the login shell is standard sshd behavior, not a shell-injection surface — there is no separate trusted argv this could be smuggled past.
+		cmd = exec.CommandContext(t.ctx, shell, "-c", raw)
+	} else {
+		//nolint:gosec // reason: no untrusted argv here — this launches the user's own login shell for an interactive session, matching sshd with no command in the exec/session request.
+		cmd = exec.CommandContext(t.ctx, shell, "-l")
+	}
+	// startDetached puts cmd in its own process group and wires t.ctx's
+	// cancellation to SIGKILL that whole group — revoke/expiry/shutdown
+	// must kill everything a command spawned (a build's child processes,
+	// a test runner's workers), not just the shell exec.CommandContext
+	// started, which is all context cancellation kills on its own.
+	startDetached(cmd)
+
+	ptyReq, winCh, isPty := s.Pty()
+	var exitCode int
+	var runErr error
+	if isPty {
+		cmd.Env = append(safeEnv(), "TERM="+ptyReq.Term)
+		f, err := pty.Start(cmd)
+		if err != nil {
+			_ = s.Exit(1)
+			t.auditExec(s.RawCommand(), true, start, 1, err)
+			return
+		}
+		go func() {
+			for win := range winCh {
+				_ = pty.Setsize(f, &pty.Winsize{Rows: uint16(win.Height), Cols: uint16(win.Width)}) //nolint:gosec // reason: SSH window dimensions are small terminal row/col counts, never large enough to overflow uint16 in practice; a client sending an absurd value just clamps via wraparound, no memory-safety issue.
+			}
+		}()
+		go func() { _, _ = io.Copy(f, s) }()
+		_, _ = io.Copy(s, f)
+		runErr = cmd.Wait()
+		_ = f.Close()
+	} else {
+		cmd.Env = safeEnv()
+		cmd.Stdin = s
+		cmd.Stdout = s
+		cmd.Stderr = s.Stderr()
+		runErr = cmd.Run()
+	}
+
+	switch {
+	case cmd.ProcessState != nil:
+		exitCode = cmd.ProcessState.ExitCode()
+	case runErr != nil:
+		exitCode = 1
+	}
+	t.auditExec(s.RawCommand(), isPty, start, exitCode, runErr)
+	_ = s.Exit(exitCode)
+}
+
+func loginShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
+// safeEnvKeep is the fixed baseline environment every remote session
+// gets, regardless of what `catflap share` itself happened to have
+// exported in its own interactive shell. A real `sshd` login builds the
+// session's environment from the target account (PAM/login.conf), not
+// by inheriting whatever the admin's terminal had exported — inheriting
+// share's FULL environment would hand the agent anything the operator's
+// shell had exported for its own use (a GH_TOKEN, an AWS credential)
+// that was never meant to be part of what this task grants.
+var safeEnvKeep = map[string]bool{
+	"HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"PATH": true, "LANG": true, "TMPDIR": true,
+}
+
+// safeEnv returns a fresh copy of share's environment restricted to
+// safeEnvKeep plus every LC_* locale variable. Only this — never
+// os.Environ() directly — feeds a remote session's cmd.Env.
+func safeEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if safeEnvKeep[key] || strings.HasPrefix(key, "LC_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// NewID mints a random task id, matching capability.NewTaskID's shape
+// without importing the (soon to be retired) capability package.
+func NewID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "agt_" + hex.EncodeToString(b[:])[:16]
+}

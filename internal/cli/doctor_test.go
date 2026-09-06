@@ -21,7 +21,7 @@ func TestDoctorFailsWhenClaudeCLIMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
-	rc := Doctor([]string{"--state", filepath.Join(t.TempDir(), "no-such-state.json")})
+	rc := Doctor(nil)
 	_ = w.Close()
 	os.Stdout = old
 	_, _ = io.Copy(io.Discard, r)

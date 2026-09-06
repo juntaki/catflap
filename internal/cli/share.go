@@ -1,130 +1,177 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"sort"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
 
+	gossh "golang.org/x/crypto/ssh"
+
+	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/pair"
-	"github.com/juntaki/catflap/internal/policy"
+	"github.com/juntaki/catflap/internal/sshhost"
+	"github.com/juntaki/catflap/internal/transport/local"
+	tct "github.com/juntaki/catflap/internal/transport/tailcat"
 )
 
-// Share runs the same gateway as Serve, but instead of printing a
-// capability to copy by hand, it starts a temporary pair server for the
-// initial task and prints a pairing code for it. The other end pairs
-// with `catflap setup claude` + the MCP `pair` tool + the printed code
-// — no capability blob ever needs to be copy-pasted, and no hosted
-// rendezvous infrastructure of any kind is involved: the agent connects
-// DIRECTLY to the pair server over the same transport (Tailcat, or
-// local for tests) the task itself uses.
-//
-// A pair server failing to start is share failure: announce returning
-// an error is RunGateway's existing contract for "tear the just-minted
-// task back down" (see RunGateway/mkTask) — share relies on that rather
-// than duplicating a revoke call.
+// Share is Catflap's core command: grant a temporary SSH login to
+// whoever holds the printed pairing code, for the given TTL, and
+// nothing else. There is no policy, no capability file, no admin API,
+// and no grant/tasks/revoke surface — an ephemeral SSH endpoint IS the
+// product, and Ctrl-C (or the TTL) is how it ends.
 func Share(args []string) int {
 	fs := flag.NewFlagSet("share", flag.ContinueOnError)
-	policyPath := fs.String("policy", "", "YAML policy file (default: built-in readonly-debug)")
-	ttlFlag := fs.String("ttl", "", "task TTL, e.g. 15m (default: policy ttl)")
-	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL and to a 10m ceiling)")
-	name := fs.String("name", "", "preferred human name for the task (default: minted)")
+	ttlFlag := fs.String("ttl", "30m", "how long this machine is reachable, e.g. 30m")
+	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the pairing code stays claimable (clamped to --ttl and to a 10m ceiling)")
 	transportFlag := fs.String("transport", "tailcat", "transport: tailcat | local")
 	auditDir := fs.String("audit", DefaultAuditDir(), "audit JSONL directory (empty disables file audit)")
-	statePath := fs.String("state", DefaultStatePath(), "state file for `grant`/`share-code` coordination")
-	adminAddr := fs.String("admin", "127.0.0.1:0", "loopback admin API listen address")
-	maxTasks := fs.Int("max-tasks", 16, "maximum live tasks (grants beyond this fail)")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	pol, err := loadPolicy(*policyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "policy: %v\n", err)
+	ttl, err := time.ParseDuration(*ttlFlag)
+	if err != nil || ttl <= 0 {
+		fmt.Fprintf(os.Stderr, "invalid --ttl %q\n", *ttlFlag)
 		return 1
-	}
-	if *ttlFlag != "" {
-		ttlDur, ttlErr := time.ParseDuration(*ttlFlag)
-		if ttlErr != nil || ttlDur <= 0 {
-			fmt.Fprintf(os.Stderr, "invalid --ttl %q\n", *ttlFlag)
-			return 1
-		}
-		pol.TTL = ttlDur
 	}
 	pairingTTL, err := time.ParseDuration(*pairingTTLFlag)
 	if err != nil || pairingTTL <= 0 {
 		fmt.Fprintf(os.Stderr, "invalid --pairing-ttl %q\n", *pairingTTLFlag)
 		return 1
 	}
+	if *transportFlag != "tailcat" && *transportFlag != "local" {
+		fmt.Fprintf(os.Stderr, "unknown transport %q (tailcat|local)\n", *transportFlag)
+		return 1
+	}
 
-	return RunGateway(GatewayOptions{
-		Transport: *transportFlag, AuditDir: *auditDir, StatePath: *statePath,
-		AdminAddr: *adminAddr, Verbose: *verbose, MaxTasks: *maxTasks,
-		TaskName: *name, Policy: pol,
-	}, shareAnnounce(pairingTTL, pol, os.Stdout))
+	ctx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSig()
+
+	taskID := sshhost.NewID()
+	alog, err := audit.Open(*auditDir, taskID, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "audit: %v\n", err)
+		return 1
+	}
+	task, err := sshhost.NewTask(ctx, taskID, ttl, alog)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mint task: %v\n", err)
+		_ = alog.Close()
+		return 1
+	}
+	alog.Log("task.create", nil, "active", nil, 0)
+
+	var endpoint string
+	switch *transportFlag {
+	case "tailcat":
+		s, serr := tct.Serve(task.Handler(), nil, *verbose) // nil allow: open network layer; SSH publickey auth is the real gate — see package doc.
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "start task server: %v\n", serr)
+			task.Stop("failed")
+			return 1
+		}
+		task.OnStopFunc(func() { _ = s.Close() })
+		endpoint = s.Addr()
+	case "local":
+		s, serr := local.Serve(task.Handler())
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "start task server: %v\n", serr)
+			task.Stop("failed")
+			return 1
+		}
+		task.OnStopFunc(func() { _ = s.Close() })
+		endpoint = s.Addr()
+	}
+	if err := runSSHShare(ctx, task, endpoint, pairingTTL, *transportFlag, *verbose, os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "share: %v\n", err)
+		task.Stop("failed")
+		return 1
+	}
+
+	// Whichever fires first ends the process: a signal (task.Stop hasn't
+	// run yet, this call does it) or the task's own TTL firing on its
+	// AfterFunc timer (task.Stop("expired") already ran — this process
+	// must still exit instead of hanging on a signal that may never
+	// come, since the access it existed to serve is already gone).
+	select {
+	case <-ctx.Done():
+		fmt.Fprintf(os.Stderr, "catflap share: shutting down, destroying this machine's SSH access\n")
+		task.Stop("shutdown")
+	case <-task.Done():
+		fmt.Fprintf(os.Stderr, "catflap share: task expired, destroying this machine's SSH access\n")
+	}
+	if aerr := alog.Err(); aerr != nil {
+		fmt.Fprintf(os.Stderr, "catflap share: WARNING: audit degraded: %v\n", aerr)
+	}
+	return 0
 }
 
-// shareAnnounce builds the announce callback RunGateway calls once the
-// initial task is live: start a temporary pair server for it (via
-// a.IssuePairCode — the same mechanism `share-code` reuses later) and
-// print the code. Returning an error here is what makes "pair server
-// failed to start" the same as "share failed, task torn back down" —
-// see RunGateway.
-func shareAnnounce(pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
-	return func(a Announce) error {
-		code, actualTTL, err := a.IssuePairCode(pairingTTL)
-		if err != nil {
-			return err
+// runSSHShare starts the one-shot pairing exchange for task, prints
+// the pairing code, and registers the delivered client key — the SSH
+// endpoint accepts no key at all until this completes.
+func runSSHShare(ctx context.Context, task *sshhost.Task, endpoint string, pairingTTL time.Duration, transportName string, verbose bool, out io.Writer) error {
+	remaining := time.Until(task.ExpiresAt)
+	if pairingTTL > remaining {
+		pairingTTL = remaining
+	}
+	if pairingTTL > pair.MaxCodeTTL {
+		pairingTTL = pair.MaxCodeTTL
+	}
+	offer := pair.SSHOffer{
+		Version: 1, TaskID: task.ID, Transport: transportName,
+		Endpoint: endpoint, HostKey: task.HostKeyAuthorizedLine(),
+		ExpiresAt: task.ExpiresAt,
+	}
+	stillLive := func() bool {
+		select {
+		case <-task.Stopping():
+			return false
+		default:
+			return true
 		}
-		_, _ = fmt.Fprintf(out,
-			"Sharing %s for %s\n\nAccess\n%s\nPairing code (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nExpires: %s\n",
-			a.Task.Name, pol.TTL.Round(time.Second), formatEffectiveAccess(pol),
-			actualTTL.Round(time.Second), code, code, a.Task.ExpiresAt.Format(time.RFC3339),
-		)
+	}
+	//nolint:contextcheck // reason: the pair server ServeSSHOffer starts is governed by its own TTL timer and by the goroutine below (task.Done()/ctx.Done()), never by this function's own ctx parameter directly — matching issuePairCode's identical exemption in serve.go.
+	pairSrv, err := pair.ServeSSHOffer(transportName, offer, pairingTTL, verbose, stillLive, func(pub string) error {
+		key, _, _, _, perr := gossh.ParseAuthorizedKey([]byte(pub))
+		if perr != nil {
+			return perr
+		}
+		task.SetAllowedKey(key)
 		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("start pair server: %w", err)
 	}
+	// A pair server must never outlive its task. Stopping, not Done:
+	// the pair server must die the instant teardown BEGINS, not after
+	// the (up to drainTimeout) bounded drain finishes — a fresh code
+	// handed out while a task is mid-teardown would be a code for
+	// something already gone.
+	go func() {
+		select {
+		case <-task.Stopping():
+			pairSrv.Close()
+		case <-ctx.Done():
+			pairSrv.Close()
+		}
+	}()
+
+	code, err := pair.Encode(transportName, pairSrv.Addr())
+	if err != nil {
+		pairSrv.Close()
+		return fmt.Errorf("encode pairing code: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "Sharing this machine for %s\n\nPairing code:\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nExpires: %s\n",
+		ttlDisplay(task.ExpiresAt), code, code, task.ExpiresAt.Format(time.Kitchen))
+	return nil
 }
 
-// formatEffectiveAccess renders what a policy actually grants — read
-// roots, write roots, and allowed exec commands — instead of just its
-// name, so the operator sees exactly what they're handing over without
-// having to go read the policy YAML themselves.
-func formatEffectiveAccess(pol *policy.Policy) string {
-	read := "none"
-	if pol.Tools.File != nil && len(pol.Tools.File.Read) > 0 {
-		read = strings.Join(pol.Tools.File.Read, ", ")
-	}
-	write := "none"
-	if pol.Tools.File != nil && pol.Tools.File.Write.Enabled() {
-		write = strings.Join(pol.Tools.File.Write.Roots, ", ")
-		if pol.Tools.File.Write.Approval.RequiresApproval() {
-			write += " (approval required)"
-		}
-	}
-	run := "none"
-	if pol.Tools.Exec != nil && len(pol.Tools.Exec.Allow) > 0 {
-		seen := map[string]bool{}
-		var cmds []string
-		for _, rule := range pol.Tools.Exec.Allow {
-			label := rule.Command
-			if rule.Approval.RequiresApproval() {
-				label += "*"
-			}
-			if !seen[label] {
-				seen[label] = true
-				cmds = append(cmds, label)
-			}
-		}
-		sort.Strings(cmds)
-		run = strings.Join(cmds, ", ")
-	}
-	suffix := ""
-	if run != "none" && strings.Contains(run, "*") {
-		suffix = "\n  (* requires operator approval)"
-	}
-	return fmt.Sprintf("  Read   %s\n  Write  %s\n  Run    %s%s\n", read, write, run, suffix)
+func ttlDisplay(expiresAt time.Time) string {
+	return time.Until(expiresAt).Round(time.Second).String()
 }

@@ -1,6 +1,6 @@
 //go:build !unix
 
-package gateway
+package sshhost
 
 import (
 	"os"
@@ -10,7 +10,8 @@ import (
 // Non-Unix fallback: no process groups available, so cancellation can only
 // reach the direct child. The Cancel override mirrors the stdlib default
 // explicitly to keep the call site platform-uniform. Platforms without
-// tree-kill MUST NOT be marked stable for hostile workloads (§30).
+// tree-kill are not hardened against a command that spawns children of its
+// own outliving task cancellation.
 func startDetached(cmd *exec.Cmd) {
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {

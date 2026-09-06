@@ -14,14 +14,13 @@ import (
 
 // Doctor runs a handful of cheap diagnostic checks across the moving
 // parts a working Catflap setup depends on (Claude Code registration,
-// audit directory writability, an active target) and prints one
-// aligned ✓/✗ line per check. It mutates nothing the operator cares
-// about — the audit-directory check does create the directory and
-// write+remove a small probe file (the same way a real task's
-// audit.Open would), but leaves no trace behind.
+// audit directory writability) and prints one aligned ✓/✗ line per
+// check. It mutates nothing the operator cares about — the audit-
+// directory check does create the directory and write+remove a small
+// probe file (the same way a real task's audit.Open would), but
+// leaves no trace behind.
 func Doctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	statePath := fs.String("state", DefaultStatePath(), "state file to check for an active target")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -57,23 +56,6 @@ func Doctor(args []string) int {
 	} else {
 		ok = false
 		line("Audit directory", "✗", auditDir+" — "+err.Error())
-	}
-
-	if st, err := LoadState(*statePath); err == nil {
-		if list, lerr := ListTasks(st.AdminAddr, st.AdminToken); lerr == nil {
-			switch len(list) {
-			case 0:
-				line("Active target", "-", "none (no live tasks)")
-			case 1:
-				line("Active target", "✓", fmt.Sprintf("%s (%s)", list[0].Name, list[0].Task))
-			default:
-				line("Active target", "✓", fmt.Sprintf("%d live tasks — see `catflap tasks`", len(list)))
-			}
-		} else {
-			line("Active target", "-", "no reachable share/serve")
-		}
-	} else {
-		line("Active target", "-", "none (no state file)")
 	}
 
 	if ok {
