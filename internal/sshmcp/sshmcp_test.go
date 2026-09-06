@@ -255,7 +255,7 @@ func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 			t.Fatalf("iteration %d: pair A: err=%v res=%v", i, err, res)
 		}
 
-		_, codeB := liveTaskAndCode(t)
+		taskB, codeB := liveTaskAndCode(t)
 		go taskA.Stop("revoked")
 
 		// Wait for the auto-unpair via `status`, not by retrying
@@ -301,6 +301,15 @@ func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 		if _, derr := s.handleDisconnect(context.Background(), callToolRequest(t, struct{}{})); derr != nil {
 			t.Fatalf("iteration %d: cleanup disconnect: %v", i, derr)
 		}
+		// Stop B's underlying task too, not just this adapter's SSH
+		// connection to it: disconnect only ends the adapter side —
+		// task B's own local-transport listener and hour-long TTL
+		// timer would otherwise keep accumulating across all
+		// `iterations` runs (t.Cleanup only unwinds them at the very
+		// end of the test), piling up hundreds of live goroutines and
+		// listening sockets and starving this same test's own
+		// goroutines on a resource-constrained CI runner.
+		taskB.Stop("shutdown")
 	}
 }
 
