@@ -192,11 +192,12 @@ def start_share(rendezvous_url=RENDEZVOUS_URL, ttl="10m", pairing_ttl=None, extr
             break
         lines.append(line)
         stripped = line.strip()
-        if stripped == "Pairing code:":
-            code = p.stdout.readline().strip()
-        elif stripped == "Machine:":
-            machine = p.stdout.readline().strip()
-        elif stripped.startswith("("):
+        if stripped.startswith("Sharing ") and machine is None:
+            # "Sharing <machine> for <ttl>"
+            machine = stripped.split()[1]
+        elif stripped.startswith("CAT-") and code is None:
+            code = stripped
+        elif stripped.startswith("Expires:"):
             break
     return p, code, machine
 

@@ -50,38 +50,62 @@ any approval prompt still pending for that task.
 
 ## Golden path
 
-```bash
-go build -o bin/catflap ./cmd/catflap
-```
-
-Operator (the machine being lent out):
+Install:
 
 ```bash
-./bin/catflap share --policy ./examples/policies/readonly-debug.yaml --ttl 15m
-# Task: agt_…
-# Pairing code (share once, expires in 5m): CAT-XXXX-XXXX-XXXX
+brew install juntaki/catflap/catflap
 ```
+
+Operator (the machine being lent out — run from the project you want Claude
+to work in):
+
+```bash
+catflap share
+```
+
+```text
+Sharing calm-panda for 15m0s
+
+Access
+  Read   .
+  Write  none
+  Run    date, echo, pwd, uname, whoami
+
+Pairing code (valid 5m0s):
+  CAT-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXX
+
+Tell Claude:
+  Connect to Catflap using CAT-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXX
+
+Expires: 2026-…
+```
+
+That's the built-in read-only-current-directory policy; pass `--policy
+p.yaml` for anything else (see [Policy](#policy) below).
 
 Agent side (Claude Code, once — registers the *unpaired* server at user scope):
 
 ```bash
-./bin/catflap setup claude
+catflap setup claude
 claude
 ```
 
-Inside the `claude` session, call the MCP `pair` tool with the printed code.
-Nothing is copy-pasted by hand except the short pairing code: the code is a
-one-time, short-lived locator plus a local wrap key — the rendezvous server
-only ever stores and relays a sealed envelope, never the capability itself,
-and never any task traffic. Once paired, the SDK advertises the granted
-`remote_*` tools via `tools/list_changed` — no reconnect needed. Pairing
-codes are single-use (a replay is a 404) and default to a public rendezvous
-at `pair.catflap.dev`; run your own with `catflap rendezvous` and point both
+Paste the `Tell Claude:` line from `share`'s output into the `claude` session.
+Nothing is copy-pasted by hand except that one pairing code: it's a one-time,
+short-lived locator plus a local wrap key — the rendezvous server only ever
+stores and relays a sealed envelope, never the capability itself, and never
+any task traffic. Once paired, the SDK advertises the granted `remote_*`
+tools via `tools/list_changed` — no reconnect needed. Pairing codes are
+single-use (a replay is a 404) and default to a public rendezvous at
+`pair.catflap.dev`; run your own with `catflap rendezvous` and point both
 sides at it with `--rendezvous` / `CATFLAP_RENDEZVOUS`.
 
 ```bash
-./bin/catflap tasks                    # list live tasks on the running share/serve
-./bin/catflap revoke <task|name>        # destroy a task early: same teardown as expiry
+catflap tasks                    # list live tasks on the running share/serve
+catflap share-code <task|name>   # Claude restarted and the old code is used up?
+                                  # reissue a fresh code for the SAME still-live task
+catflap revoke <task|name>       # destroy a task early: same teardown as expiry
+catflap doctor                   # Claude Code / MCP registration / rendezvous / audit — all in one check
 ```
 
 Once paired, the agent sees `disconnect` (revoke its own access) alongside
@@ -91,7 +115,11 @@ grant — `remote_write`. After the TTL, the task's server is closed: calls
 fail with `capability expired` (or `task revoked` / `task shutdown` when
 killed that way).
 
-### Advanced / legacy: manual capability file
+### Advanced / legacy: build from source, manual capability file
+
+```bash
+go build -o bin/catflap ./cmd/catflap
+```
 
 Before pairing, catflap issued a capability blob directly. This path still
 works — for scripting, tests, or when there is no rendezvous reachable —
@@ -384,7 +412,8 @@ v0.2-E limits (tasks, concurrency, timeouts, byte caps) + policy-normalized tool
 v0.2-F adversarial E2E (25 checks green), 0.2.0 ✓
 v0.3-A pairing: rendezvous server, sealed envelopes, `share`/`setup claude`/pair MCP flow ✓
 v0.3-B human approval engine: never/once/always, hash-bound, fail-closed, terminal UX ✓
-v0.3   release hardening: cross-platform CI, signed releases, README/golden-path parity
+v0.3   release hardening: cross-platform CI, signed releases, README/golden-path parity ✓
+v0.3.1 UX pass: effective-permissions share output, share-code re-pair, catflap doctor ✓
 v0.4   network egress policy, specialized adapters
 ```
 
