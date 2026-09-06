@@ -10,11 +10,11 @@
 package sshmcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -98,6 +98,16 @@ func (s *Server) commitPaired(client transport.Client, sshClient *gossh.Client, 
 	s.taskID = taskID
 	s.pairing = false
 	s.mu.Unlock()
+	// The task can die (TTL, revoke) without this adapter ever calling
+	// disconnect itself — Wait blocks until the underlying SSH
+	// connection actually closes, at which point pairing state must be
+	// forgotten automatically so a fresh pairing code can be used on
+	// this same running adapter instead of it staying stuck reporting
+	// "already paired" against a connection that no longer exists.
+	go func() {
+		_ = sshClient.Wait()
+		s.clearIfCurrent(sshClient)
+	}()
 	s.sdk.AddTool(&mcpsdk.Tool{
 		Name:        "disconnect",
 		Description: "Disconnect from the currently paired SSH share and forget local pairing state. This only ends THIS adapter's connection — it does not revoke the task itself; the operator's own `catflap ssh-share` process (Ctrl-C, or its TTL) is what ends access for good.",
@@ -116,9 +126,20 @@ func (s *Server) commitPaired(client transport.Client, sshClient *gossh.Client, 
 	}, s.handleExec)
 }
 
-func (s *Server) clearPaired() {
+// clearIfCurrent forgets pairing state and removes exec/disconnect, but
+// only if sshClient is still the CURRENT paired connection: the
+// auto-unpair goroutine (commitPaired) and an explicit disconnect call
+// can both race to clear the same dead connection, and a disconnect
+// racing a NEWER pairing (already replaced by the time this runs) must
+// never clobber that newer pairing's state. Returns whether it actually
+// cleared anything.
+func (s *Server) clearIfCurrent(sshClient *gossh.Client) bool {
 	s.mu.Lock()
-	client, sshClient := s.client, s.ssh
+	if s.ssh != sshClient {
+		s.mu.Unlock()
+		return false
+	}
+	client := s.client
 	s.client, s.ssh, s.taskID = nil, nil, ""
 	s.mu.Unlock()
 	if sshClient != nil {
@@ -128,6 +149,7 @@ func (s *Server) clearPaired() {
 		_ = client.Close()
 	}
 	s.sdk.RemoveTools("disconnect", "exec")
+	return true
 }
 
 type pairArgs struct {
@@ -256,7 +278,7 @@ func (s *Server) handleDisconnect(_ context.Context, _ *mcpsdk.CallToolRequest) 
 	if sshClient == nil {
 		return toolError("not paired"), nil
 	}
-	s.clearPaired()
+	s.clearIfCurrent(sshClient)
 	return textResult(map[string]any{"disconnected": true})
 }
 
@@ -265,9 +287,44 @@ type execArgs struct {
 }
 
 type execResult struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	ExitCode        int    `json:"exit_code"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
+}
+
+// maxOutputBytes caps how much of a command's stdout/stderr this
+// adapter holds in memory: with no allowlist steering callers toward
+// well-behaved commands, `exec` must survive a caller running `yes` or
+// dumping a huge build log without OOMing catflap mcp — the SSH session
+// itself keeps running to completion (and the remote side is
+// unaffected), only what this process buffers is bounded.
+const maxOutputBytes = 8 << 20 // 8MiB
+
+// boundedWriter caps how many bytes it retains; past the cap, writes
+// are accepted (so the copier driving it never sees a short write and
+// aborts) but dropped, and Truncated is set.
+type boundedWriter struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (w *boundedWriter) Write(p []byte) (int, error) {
+	remain := w.max - w.buf.Len()
+	if remain <= 0 {
+		if len(p) > 0 {
+			w.truncated = true
+		}
+		return len(p), nil
+	}
+	if len(p) > remain {
+		w.buf.Write(p[:remain])
+		w.truncated = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
 }
 
 // handleExec runs one command over the paired SSH connection's login
@@ -299,12 +356,16 @@ func (s *Server) handleExec(ctx context.Context, req *mcpsdk.CallToolRequest) (*
 	stop := context.AfterFunc(ctx, func() { _ = sess.Close() })
 	defer stop()
 
-	var stdout, stderr strings.Builder
-	sess.Stdout = &stdout
-	sess.Stderr = &stderr
+	stdout := &boundedWriter{max: maxOutputBytes}
+	stderr := &boundedWriter{max: maxOutputBytes}
+	sess.Stdout = stdout
+	sess.Stderr = stderr
 	runErr := sess.Run(args.Command)
 
-	res := execResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := execResult{
+		Stdout: stdout.buf.String(), Stderr: stderr.buf.String(),
+		StdoutTruncated: stdout.truncated, StderrTruncated: stderr.truncated,
+	}
 	var exitErr *gossh.ExitError
 	switch {
 	case runErr == nil:

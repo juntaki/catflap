@@ -94,10 +94,21 @@ func Share(args []string) int {
 		return 1
 	}
 
-	<-ctx.Done()
-	fmt.Fprintf(os.Stderr, "catflap share: shutting down, destroying this machine's SSH access\n")
-	task.Stop("shutdown")
-	<-task.Done()
+	// Whichever fires first ends the process: a signal (task.Stop hasn't
+	// run yet, this call does it) or the task's own TTL firing on its
+	// AfterFunc timer (task.Stop("expired") already ran — this process
+	// must still exit instead of hanging on a signal that may never
+	// come, since the access it existed to serve is already gone).
+	select {
+	case <-ctx.Done():
+		fmt.Fprintf(os.Stderr, "catflap share: shutting down, destroying this machine's SSH access\n")
+		task.Stop("shutdown")
+	case <-task.Done():
+		fmt.Fprintf(os.Stderr, "catflap share: task expired, destroying this machine's SSH access\n")
+	}
+	if aerr := alog.Err(); aerr != nil {
+		fmt.Fprintf(os.Stderr, "catflap share: WARNING: audit degraded: %v\n", aerr)
+	}
 	return 0
 }
 

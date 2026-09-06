@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -145,6 +146,87 @@ func TestAdapterPairExecDisconnect(t *testing.T) {
 	}
 	if res, _ := s.handleExec(context.Background(), callToolRequest(t, execArgs{Command: "echo after disconnect"})); !res.IsError {
 		t.Fatal("exec must fail after disconnect")
+	}
+}
+
+// TestExecTruncatesOversizedOutput is the P1 regression for unbounded
+// buffering: with no command allowlist steering callers toward
+// well-behaved output sizes, a caller running something like `yes` or
+// dumping a huge build log must not be able to OOM `catflap mcp` by
+// making it hold the entire stream in memory. The SSH session itself
+// must still run to completion; only what this adapter retains is
+// capped.
+func TestExecTruncatesOversizedOutput(t *testing.T) {
+	_, code := liveTaskAndCode(t)
+	s := newServer(false)
+	if res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code})); err != nil || res.IsError {
+		t.Fatalf("pair failed: err=%v res=%v", err, res)
+	}
+
+	res, err := s.handleExec(context.Background(), callToolRequest(t, execArgs{
+		Command: fmt.Sprintf("head -c %d /dev/zero | tr '\\0' 'a'", maxOutputBytes+1<<20),
+	}))
+	if err != nil {
+		t.Fatalf("handleExec: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("exec of oversized output must not be a tool error: %s", resultText(t, res))
+	}
+	var got execResult
+	if uerr := json.Unmarshal([]byte(resultText(t, res)), &got); uerr != nil {
+		t.Fatalf("unmarshal exec result: %v", uerr)
+	}
+	if !got.StdoutTruncated {
+		t.Error("stdout_truncated must be true for output exceeding maxOutputBytes")
+	}
+	if len(got.Stdout) != maxOutputBytes {
+		t.Errorf("retained stdout = %d bytes, want exactly maxOutputBytes (%d)", len(got.Stdout), maxOutputBytes)
+	}
+	if got.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0 (the remote command itself completed normally)", got.ExitCode)
+	}
+}
+
+// TestUnpairsAutomaticallyOnTaskDeath is the P2 regression: without
+// this, an adapter whose paired task died (TTL, revoke) stayed stuck
+// reporting "already paired" against a connection that no longer
+// existed, and a fresh pairing code typed into the same still-running
+// Claude session could never be used.
+func TestUnpairsAutomaticallyOnTaskDeath(t *testing.T) {
+	task, code := liveTaskAndCode(t)
+	s := newServer(false)
+	if res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code})); err != nil || res.IsError {
+		t.Fatalf("pair failed: err=%v res=%v", err, res)
+	}
+
+	task.Stop("revoked")
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		res, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
+		var status struct {
+			Paired bool `json:"paired"`
+		}
+		_ = json.Unmarshal([]byte(resultText(t, res)), &status)
+		if !status.Paired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("adapter never auto-unpaired after its task died")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A fresh pairing code from a NEW task must now work on this same
+	// still-running adapter — the whole point of clearing state
+	// automatically instead of requiring an explicit disconnect first.
+	_, code2 := liveTaskAndCode(t)
+	res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code2}))
+	if err != nil {
+		t.Fatalf("handlePair (second code): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("re-pairing after auto-unpair must succeed: %s", resultText(t, res))
 	}
 }
 

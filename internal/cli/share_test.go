@@ -103,3 +103,32 @@ func TestSSHShareEndToEnd(t *testing.T) {
 		t.Fatalf("output = %q, want %q", got, "hello\n")
 	}
 }
+
+// TestShareExitsOnTTLExpiry is the P1 regression: Share's own tail
+// used to be a bare `<-ctx.Done()`, which only reacts to a
+// SIGINT/SIGTERM — a task expiring on its own TTL timer called
+// task.Stop("expired") internally (killing the SSH server and any
+// in-flight command) but left the `catflap share` PROCESS itself
+// running forever, waiting on a signal nothing was ever going to send.
+// An operator's `share` was never going to exit on its own once the
+// access it printed a code for was already gone.
+func TestShareExitsOnTTLExpiry(t *testing.T) {
+	done := make(chan int, 1)
+	go func() {
+		done <- Share([]string{
+			"--transport", "local",
+			"--ttl", "150ms",
+			"--pairing-ttl", "150ms",
+			"--audit", t.TempDir(),
+		})
+	}()
+
+	select {
+	case rc := <-done:
+		if rc != 0 {
+			t.Errorf("Share() on TTL expiry returned %d, want 0", rc)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Share() never returned after its task's TTL expired — the process would hang forever")
+	}
+}

@@ -27,6 +27,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,16 +60,42 @@ type Task struct {
 
 	mu         sync.Mutex
 	allowedKey gossh.PublicKey // nil until pairing registers one; no key authenticates until then
+	stopping   bool            // set under mu at the start of Stop; beginSession refuses admission once true
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
+	// wg tracks in-flight handleSession calls (beginSession/endSession):
+	// Stop drains this, bounded, before sealing the audit log — a
+	// session's own audit line for a command Stop just killed must land
+	// BEFORE the terminal event, not race it.
+	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stopDone chan struct{}
 	// onStop releases task-external resources (the task's transport
 	// server). Set by the caller before the task starts serving.
 	onStop func()
 }
+
+// drainTimeout bounds how long Stop waits for in-flight sessions to
+// actually finish (their process tree killed, cmd.Wait returned, audit
+// line written) before sealing the audit log regardless — matching the
+// legacy gateway's identical bound on its own drain.
+const drainTimeout = 10 * time.Second
+
+// beginSession admits one handleSession call, refusing once Stop has
+// begun. The caller MUST call endSession on a true return.
+func (t *Task) beginSession() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopping {
+		return false
+	}
+	t.wg.Add(1)
+	return true
+}
+
+func (t *Task) endSession() { t.wg.Done() }
 
 // causeExpired/causeRevoked/causeShutdown distinguish why a task's
 // context was cancelled, mirroring gateway.Task's terminationCause —
@@ -159,15 +186,34 @@ func (t *Task) OnStopFunc(f func()) { t.onStop = f }
 // call has effect.
 func (t *Task) Stop(reason string) {
 	t.stopOnce.Do(func() {
+		t.mu.Lock()
+		t.stopping = true
+		t.mu.Unlock()
+		// Cancelling first is what actually kills a running command's
+		// whole process tree: startDetached wires t.ctx's cancellation
+		// straight to cmd.Cancel, which SIGKILLs the process GROUP, not
+		// just the shell exec.CommandContext started — a command that
+		// spawned children (a build, a test runner) must not survive
+		// its task.
 		t.cancel(causeFor(reason))
 		// Closing the shared gliderssh.Server severs every currently
 		// open SSH connection for this task, not just future ones — a
 		// revoke/expiry/shutdown must disconnect an already-paired
 		// client sitting in an interactive session, not merely stop
-		// admitting new ones. Cancelling t.ctx above already kills any
-		// in-flight exec'd process tree; this is what kills the
-		// connection carrying an idle PTY with nothing running yet.
+		// admitting new ones.
 		_ = t.sshSrv.Close()
+		// Bounded drain: wait for every handleSession call already
+		// in flight to actually finish — its killed process reaped and
+		// its own ssh_exec audit line written — before sealing the log.
+		// Without this, a session Stop just killed could still be
+		// writing its audit line after LogTerminal has already sealed
+		// the logger, silently losing that record.
+		drained := make(chan struct{})
+		go func() { t.wg.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(drainTimeout):
+		}
 		if t.Audit != nil {
 			t.Audit.LogTerminal(reason)
 		}
@@ -214,6 +260,12 @@ func (t *Task) auditExec(rawCommand string, pty bool, start time.Time, exitCode 
 // task expiry/revoke/shutdown kills it immediately, not just future
 // sessions.
 func (t *Task) handleSession(s ssh.Session) {
+	if !t.beginSession() {
+		_ = s.Exit(1)
+		return
+	}
+	defer t.endSession()
+
 	start := time.Now()
 	shell := loginShell()
 	var cmd *exec.Cmd
@@ -230,12 +282,18 @@ func (t *Task) handleSession(s ssh.Session) {
 		//nolint:gosec // reason: no untrusted argv here — this launches the user's own login shell for an interactive session, matching sshd with no command in the exec/session request.
 		cmd = exec.CommandContext(t.ctx, shell, "-l")
 	}
+	// startDetached puts cmd in its own process group and wires t.ctx's
+	// cancellation to SIGKILL that whole group — revoke/expiry/shutdown
+	// must kill everything a command spawned (a build's child processes,
+	// a test runner's workers), not just the shell exec.CommandContext
+	// started, which is all context cancellation kills on its own.
+	startDetached(cmd)
 
 	ptyReq, winCh, isPty := s.Pty()
 	var exitCode int
 	var runErr error
 	if isPty {
-		cmd.Env = append(os.Environ(), "TERM="+ptyReq.Term)
+		cmd.Env = append(safeEnv(), "TERM="+ptyReq.Term)
 		f, err := pty.Start(cmd)
 		if err != nil {
 			_ = s.Exit(1)
@@ -252,6 +310,7 @@ func (t *Task) handleSession(s ssh.Session) {
 		runErr = cmd.Wait()
 		_ = f.Close()
 	} else {
+		cmd.Env = safeEnv()
 		cmd.Stdin = s
 		cmd.Stdout = s
 		cmd.Stderr = s.Stderr()
@@ -273,6 +332,36 @@ func loginShell() string {
 		return sh
 	}
 	return "/bin/sh"
+}
+
+// safeEnvKeep is the fixed baseline environment every remote session
+// gets, regardless of what `catflap share` itself happened to have
+// exported in its own interactive shell. A real `sshd` login builds the
+// session's environment from the target account (PAM/login.conf), not
+// by inheriting whatever the admin's terminal had exported — inheriting
+// share's FULL environment would hand the agent anything the operator's
+// shell had exported for its own use (a GH_TOKEN, an AWS credential)
+// that was never meant to be part of what this task grants.
+var safeEnvKeep = map[string]bool{
+	"HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"PATH": true, "LANG": true, "TMPDIR": true,
+}
+
+// safeEnv returns a fresh copy of share's environment restricted to
+// safeEnvKeep plus every LC_* locale variable. Only this — never
+// os.Environ() directly — feeds a remote session's cmd.Env.
+func safeEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if safeEnvKeep[key] || strings.HasPrefix(key, "LC_") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // NewID mints a random task id, matching capability.NewTaskID's shape
