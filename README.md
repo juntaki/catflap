@@ -139,8 +139,9 @@ limits are capped separately — together they carry the frame guarantee.
 
 Policies are schema v1 (`version: 1` required; unknown versions and unknown
 fields fail closed). The capability carries a short prefix of the policy's
-canonical hash — equal authorization semantics hash equal, regardless of
-YAML formatting.
+canonical hash, independent of YAML formatting (key order, quoting,
+whitespace); the hash also covers `name` and `ttl`, so two policies with
+identical rules but a different name or TTL hash differently.
 
 ```yaml
 version: 1
@@ -265,7 +266,7 @@ write failure denies the operation rather than silently proceeding. Verify
 offline:
 
 ```bash
-catflap audit verify <task>.jsonl [--expect-head sha256:…]
+catflap audit verify [--expect-head sha256:…] <task>.jsonl
 catflap audit anchor [--out anchor.log] <task>.jsonl
 ```
 
