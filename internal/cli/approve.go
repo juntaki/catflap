@@ -92,7 +92,7 @@ func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequ
 			}
 			approved, matched := parseApprovalAnswer(line, token)
 			if !matched {
-				_, _ = fmt.Fprintf(a.out, "(ignoring unrelated input; reply exactly: %s y  or  %s n)\n", token, token)
+				_, _ = fmt.Fprintf(a.out, "(ignoring unrelated input; type %s to approve, anything else to deny)\n", token)
 				continue
 			}
 			return approved, nil
@@ -105,24 +105,27 @@ func (a *TerminalApprover) Approve(ctx context.Context, req gateway.ApprovalRequ
 // "1" must not match a line for token "12") and, if so, whether it
 // approves. A line whose first field isn't exactly token is never
 // treated as an answer at all — matched is false and the caller keeps
-// waiting.
+// waiting; this is what makes a blank Enter (or any other unrelated
+// input, including a stale answer for a prompt that already died) safe
+// to ignore rather than accidentally denying the current prompt.
+//
+// The token ALONE approves — that's the whole point of binding a
+// single-token reply to the prompt: an operator "approves #7" by typing
+// 7. Anything else attached to a matching token (a trailing word, "n",
+// garbage) denies, so there's still an explicit, low-effort way to
+// reject a specific prompt rather than just leaving it hanging.
 func parseApprovalAnswer(line, token string) (approved, matched bool) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 || fields[0] != token {
 		return false, false
 	}
-	if len(fields) >= 2 {
-		switch strings.ToLower(fields[1]) {
-		case "y", "yes":
-			return true, true
-		}
-	}
-	return false, true
+	return len(fields) == 1, true
 }
 
 func formatApprovalPrompt(req gateway.ApprovalRequest, token string) string {
 	return fmt.Sprintf(
-		"\n--- approval required ---\ntask:    %s\ntool:    %s\n%s\n%s\napprove? reply exactly: %s y   (anything else, including plain y/n, denies)\n> ",
+		"\n--- approval required (#%s) ---\ntask:    %s\ntool:    %s\n%s\n%s\ntype %s to approve, anything else to deny\n> ",
+		token,
 		sanitizeForTerminal(req.TaskID),
 		sanitizeForTerminal(req.Tool),
 		sanitizeForTerminal(req.Summary),

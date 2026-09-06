@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/juntaki/catflap/internal/pair"
+	"github.com/juntaki/catflap/internal/policy"
 )
 
 // Share runs the same gateway as Serve, but instead of printing a
@@ -70,7 +73,7 @@ func Share(args []string) int {
 		Transport: *transportFlag, AuditDir: *auditDir, StatePath: *statePath,
 		AdminAddr: *adminAddr, Verbose: *verbose, MaxTasks: *maxTasks,
 		TaskName: *name, Policy: pol,
-	}, shareAnnounce(rdv, pairingTTL, pol.Name, pol.TTL, os.Stdout))
+	}, shareAnnounce(rdv, pairingTTL, pol, os.Stdout))
 }
 
 // shareAnnounce builds the announce callback RunGateway calls once the
@@ -80,7 +83,7 @@ func Share(args []string) int {
 // wrap key, per package pair's design). Returning an error here is what
 // makes "publish failed" the same as "share failed, task torn back
 // down" — see RunGateway.
-func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, policyName string, taskTTL time.Duration, out io.Writer) func(Announce) error {
+func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
 	return func(a Announce) error {
 		id, key, code, merr := pair.Mint()
 		if merr != nil {
@@ -100,10 +103,50 @@ func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, policyName st
 			return fmt.Errorf("publish to rendezvous: %w", perr)
 		}
 		_, _ = fmt.Fprintf(out,
-			"Catflap access ready.\n\nPairing code:\n  %s\n\nMachine:\n  %s\n\nAccess:\n  %s\n\nExpires:\n  %s\n\n(The pairing code is claimable for %s; the access itself lasts %s.)\n",
-			code, a.Task.Name, policyName, a.Task.ExpiresAt.Format(time.RFC3339),
-			pairingTTL.Round(time.Second), taskTTL.Round(time.Second),
+			"Sharing %s for %s\n\nAccess\n%s\nPairing code (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nExpires: %s\n",
+			a.Task.Name, pol.TTL.Round(time.Second), formatEffectiveAccess(pol),
+			pairingTTL.Round(time.Second), code, code, a.Task.ExpiresAt.Format(time.RFC3339),
 		)
 		return nil
 	}
+}
+
+// formatEffectiveAccess renders what a policy actually grants — read
+// roots, write roots, and allowed exec commands — instead of just its
+// name, so the operator sees exactly what they're handing over without
+// having to go read the policy YAML themselves.
+func formatEffectiveAccess(pol *policy.Policy) string {
+	read := "none"
+	if pol.Tools.File != nil && len(pol.Tools.File.Read) > 0 {
+		read = strings.Join(pol.Tools.File.Read, ", ")
+	}
+	write := "none"
+	if pol.Tools.File != nil && pol.Tools.File.Write.Enabled() {
+		write = strings.Join(pol.Tools.File.Write.Roots, ", ")
+		if pol.Tools.File.Write.Approval.RequiresApproval() {
+			write += " (approval required)"
+		}
+	}
+	run := "none"
+	if pol.Tools.Exec != nil && len(pol.Tools.Exec.Allow) > 0 {
+		seen := map[string]bool{}
+		var cmds []string
+		for _, rule := range pol.Tools.Exec.Allow {
+			label := rule.Command
+			if rule.Approval.RequiresApproval() {
+				label += "*"
+			}
+			if !seen[label] {
+				seen[label] = true
+				cmds = append(cmds, label)
+			}
+		}
+		sort.Strings(cmds)
+		run = strings.Join(cmds, ", ")
+	}
+	suffix := ""
+	if run != "none" && strings.Contains(run, "*") {
+		suffix = "\n  (* requires operator approval)"
+	}
+	return fmt.Sprintf("  Read   %s\n  Write  %s\n  Run    %s%s\n", read, write, run, suffix)
 }

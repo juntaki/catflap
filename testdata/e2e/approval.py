@@ -103,7 +103,7 @@ def call_async(m, name, args):
     return wait, done
 
 
-TOKEN_RE = re.compile(r"reply exactly:\s*(\S+)\s+y")
+TOKEN_RE = re.compile(r"type\s+(\S+)\s+to approve")
 
 
 class Approver:
@@ -148,7 +148,9 @@ class Approver:
         return None
 
     def answer(self, token, yes):
-        os.write(self.master_fd, (token + (" y\n" if yes else " n\n")).encode())
+        # The token ALONE approves; the token plus anything else denies
+        # (see internal/cli/approve.go's parseApprovalAnswer).
+        os.write(self.master_fd, (token + ("\n" if yes else " n\n")).encode())
 
     def approve_next(self, timeout=10):
         tok = self.wait_for_token(timeout)

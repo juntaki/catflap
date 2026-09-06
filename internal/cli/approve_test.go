@@ -50,12 +50,16 @@ func TestSanitizeForTerminalCannotForgeApprovalLine(t *testing.T) {
 // line actually tagged for token "12". parseApprovalAnswer must compare
 // the first whitespace-delimited field for exact equality instead.
 func TestParseApprovalAnswerRequiresExactToken(t *testing.T) {
-	if _, matched := parseApprovalAnswer("12 y", "1"); matched {
+	if _, matched := parseApprovalAnswer("12", "1"); matched {
 		t.Fatal(`token "1" must not match a line tagged for token "12"`)
 	}
-	approved, matched := parseApprovalAnswer("12 y", "12")
+	approved, matched := parseApprovalAnswer("12", "12")
 	if !matched || !approved {
-		t.Fatalf("exact token match failed: approved=%v matched=%v", approved, matched)
+		t.Fatalf("bare exact token must approve: approved=%v matched=%v", approved, matched)
+	}
+	approved, matched = parseApprovalAnswer("12 n", "12")
+	if !matched || approved {
+		t.Fatalf("token plus anything else must deny: approved=%v matched=%v", approved, matched)
 	}
 }
 
@@ -79,15 +83,15 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
-// waitForToken polls out for a NEW prompt's token (the "reply exactly:
-// <token> y" line) appearing strictly after byte offset since — so a
+// waitForToken polls out for a NEW prompt's token (the "type <token> to
+// approve" line) appearing strictly after byte offset since — so a
 // second call, after a previous prompt already printed the same marker
 // text, cannot return stale data: it waits for output that wasn't there
 // yet. Returns the token and the buffer length to pass as `since` to the
 // next call.
 func waitForToken(t *testing.T, out *syncBuf, since int) (token string, newSince int) {
 	t.Helper()
-	const marker = "reply exactly: "
+	const marker = "type "
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		s := out.String()
@@ -123,7 +127,7 @@ func TestTerminalApproverApprovesOnMatchingToken(t *testing.T) {
 	}()
 
 	token, _ := waitForToken(t, out, 0)
-	if _, err := pw.Write([]byte(token + " y\n")); err != nil {
+	if _, err := pw.Write([]byte(token + "\n")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -133,7 +137,7 @@ func TestTerminalApproverApprovesOnMatchingToken(t *testing.T) {
 			t.Fatalf("Approve() = %v, %v; want true, nil", r.ok, r.err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Approve() did not return after a matching-token yes")
+		t.Fatal("Approve() did not return after a bare matching token")
 	}
 	if !strings.Contains(out.String(), "approval required") {
 		t.Errorf("prompt must be printed, got %q", out.String())
@@ -196,8 +200,8 @@ func TestTerminalApproverIgnoresUntaggedInput(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// The real, correctly tagged answer still resolves it.
-	if _, err := pw.Write([]byte(token + " y\n")); err != nil {
+	// The real, correctly tagged (bare) answer still resolves it.
+	if _, err := pw.Write([]byte(token + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	select {

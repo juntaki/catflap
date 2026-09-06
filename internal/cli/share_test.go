@@ -14,6 +14,7 @@ import (
 	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/gateway"
 	"github.com/juntaki/catflap/internal/pair"
+	"github.com/juntaki/catflap/internal/policy"
 )
 
 // TestShareAnnouncePublishesAndPrintsOnlyTheCode covers share's core
@@ -32,7 +33,7 @@ func TestShareAnnouncePublishesAndPrintsOnlyTheCode(t *testing.T) {
 	task := &gateway.Task{ID: cap.TaskID, Name: cap.Name, ExpiresAt: cap.ExpiresAt}
 
 	var out bytes.Buffer
-	announce := shareAnnounce(rsrv.URL, time.Minute, "readonly-debug", 15*time.Minute, &out)
+	announce := shareAnnounce(rsrv.URL, time.Minute, policy.Default(), &out)
 	if err := announce(Announce{Cap: cap, Task: task, Transport: "local"}); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestShareAnnouncePublishesAndPrintsOnlyTheCode(t *testing.T) {
 	if strings.Contains(printed, cap.TaskSecret) {
 		t.Error("announce output must never contain the task secret")
 	}
-	if !strings.Contains(printed, "Pairing code:") || !strings.Contains(printed, "CAT-") {
+	if !strings.Contains(printed, "Pairing code") || !strings.Contains(printed, "CAT-") {
 		t.Errorf("announce output must contain a pairing code, got:\n%s", printed)
 	}
 
@@ -81,7 +82,7 @@ func TestShareAnnouncePublishFailureNeverPrints(t *testing.T) {
 
 	var out bytes.Buffer
 	// Nothing listening: Publish fails fast (connection refused).
-	announce := shareAnnounce("http://127.0.0.1:1", time.Minute, "readonly-debug", 15*time.Minute, &out)
+	announce := shareAnnounce("http://127.0.0.1:1", time.Minute, policy.Default(), &out)
 	err := announce(Announce{Cap: cap, Task: task, Transport: "local"})
 	if err == nil {
 		t.Fatal("announce must return an error when publish fails")
@@ -110,18 +111,17 @@ func TestShareRevokesTaskOnPublishFailure(t *testing.T) {
 }
 
 // extractCode pulls the pairing code out of shareAnnounce's printed
-// output ("Pairing code:\n  CAT-...\n").
+// output (the line reading "  CAT-...").
 func extractCode(t *testing.T, printed string) string {
 	t.Helper()
-	const marker = "Pairing code:\n  "
-	i := strings.Index(printed, marker)
+	i := strings.Index(printed, "CAT-")
 	if i < 0 {
-		t.Fatalf("no pairing code marker found in:\n%s", printed)
+		t.Fatalf("no pairing code found in:\n%s", printed)
 	}
-	rest := printed[i+len(marker):]
-	end := strings.IndexByte(rest, '\n')
+	rest := printed[i:]
+	end := strings.IndexAny(rest, "\n ")
 	if end < 0 {
-		t.Fatalf("malformed pairing code line in:\n%s", printed)
+		end = len(rest)
 	}
 	return strings.TrimSpace(rest[:end])
 }
