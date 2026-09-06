@@ -258,17 +258,33 @@ func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 		_, codeB := liveTaskAndCode(t)
 		go taskA.Stop("revoked")
 
-		deadline := time.Now().Add(3 * time.Second)
-		var pairedB bool
-		for time.Now().Before(deadline) {
-			res, _ := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: codeB}))
-			if !res.IsError {
-				pairedB = true
+		// Wait for the auto-unpair via `status`, not by retrying
+		// handlePair(codeB) itself: codeB's pair server is one-shot,
+		// so a retry loop that calls handlePair repeatedly would burn
+		// it on the first attempt that reaches past tryClaimPairing —
+		// permanently dooming every later retry if that one attempt
+		// hit any transient failure (slow CI, a busy runner). Poll the
+		// cheap, non-consuming status check instead, then pair exactly
+		// once.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			statusRes, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
+			var status struct {
+				Paired bool `json:"paired"`
+			}
+			_ = json.Unmarshal([]byte(resultText(t, statusRes)), &status)
+			if !status.Paired {
 				break
 			}
+			if time.Now().After(deadline) {
+				t.Fatalf("iteration %d: A never auto-unpaired within 10s", i)
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		if !pairedB {
-			t.Fatalf("iteration %d: never managed to pair B after A's auto-unpair", i)
+
+		res, err = s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: codeB}))
+		if err != nil || res.IsError {
+			t.Fatalf("iteration %d: pair B after A's auto-unpair: err=%v res=%v", i, err, res)
 		}
 
 		// Tool-state consistency: pairing B just reported success, so
