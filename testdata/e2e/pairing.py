@@ -1,11 +1,12 @@
-"""Pairing golden + adversarial E2E (Phase 4): real `share`/`rendezvous`/
-`mcp` binaries over subprocess + stdio JSON-RPC + a real rendezvous HTTP
-server. Complements the unit tests in internal/pair and internal/mcp,
-which cover the crypto/logic edge cases in isolation — this script
-exercises the same paths across real process boundaries, the way an
-actual agent and operator would.
+"""Pairing golden + adversarial E2E (Phase 4): real `share`/`mcp`
+binaries over subprocess + stdio JSON-RPC, pairing directly over a
+temporary Tailcat/local pair server — no HTTP rendezvous of any kind.
+Complements the unit tests in internal/pair and internal/mcp, which
+cover the crypto/logic edge cases in isolation — this script exercises
+the same paths across real process boundaries, the way an actual agent
+and operator would.
 
-Starts its own rendezvous + share, so it must run alone:
+Starts its own `share`, so it must run alone:
   python3 testdata/e2e/pairing.py
 Exits non-zero on any failure. All artifacts stay under ./testdata/e2e/.
 """
@@ -22,8 +23,6 @@ BIN = "./bin/catflap"
 WORK = "./testdata/e2e/pairing-work"
 STATE = "./testdata/e2e/pairing-state.json"
 AUDIT = "./testdata/e2e/pairing-audit"
-RENDEZVOUS_ADDR = "127.0.0.1:18571"
-RENDEZVOUS_URL = "http://" + RENDEZVOUS_ADDR
 
 failures = []
 
@@ -36,8 +35,7 @@ def check(name, cond, detail=""):
 
 class Mcp:
     """One `catflap mcp` process (unpaired by default), speaking stdio
-    JSON-RPC. rendezvous_url overrides CATFLAP_RENDEZVOUS so the pair
-    tool talks to our throwaway rendezvous instead of the public one.
+    JSON-RPC.
 
     A dedicated reader thread demuxes stdout by JSON-RPC id, so that:
       - a notification (no "id" — e.g. notifications/tools/list_changed,
@@ -48,9 +46,8 @@ class Mcp:
         holding a lock across the whole write+read).
     """
 
-    def __init__(self, rendezvous_url=RENDEZVOUS_URL, extra_env=None):
+    def __init__(self, extra_env=None):
         env = dict(os.environ)
-        env["CATFLAP_RENDEZVOUS"] = rendezvous_url
         if extra_env:
             env.update(extra_env)
         self.p = subprocess.Popen(
@@ -161,23 +158,10 @@ def tool_names(resp):
         return []
 
 
-def start_rendezvous():
-    p = subprocess.Popen(
-        [BIN, "rendezvous", "--listen", RENDEZVOUS_ADDR,
-         "--publish-per-min", "1000", "--fetch-per-min", "1000"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for _ in range(50):
-        line = p.stdout.readline()
-        if "listening on" in line:
-            return p
-    raise RuntimeError("rendezvous never reported listening")
-
-
-def start_share(rendezvous_url=RENDEZVOUS_URL, ttl="10m", pairing_ttl=None, extra_args=None):
+def start_share(ttl="10m", pairing_ttl=None, extra_args=None):
     """Starts `catflap share`, returns (process, pairing_code, machine_name)."""
     args = [BIN, "share", "--transport", "local", "--admin", "127.0.0.1:0",
-            "--audit", AUDIT, "--state", STATE, "--rendezvous", rendezvous_url,
-            "--ttl", ttl]
+            "--audit", AUDIT, "--state", STATE, "--ttl", ttl]
     if pairing_ttl:
         args += ["--pairing-ttl", pairing_ttl]
     if extra_args:
@@ -219,7 +203,6 @@ def main():
             os.remove(f)
     subprocess.run(["rm", "-rf", AUDIT], check=False)
 
-    rdv = start_rendezvous()
     try:
         # ============================= GOLDEN PATH =============================
         share, code, machine = start_share()
@@ -294,7 +277,7 @@ def main():
 
         # =========================== ADVERSARIAL ===========================
 
-        # --- wrong checksum: must fail locally, no rendezvous fetch at all ---
+        # --- wrong checksum: must fail locally, no dial attempt at all ---
         m = Mcp()
         r = m.call("pair", {"code": "CAT-0000-0000-0000-0000-0000-0000-0000-0000-0000-XXX"})
         check("adv: garbage/checksum-bad code rejected", is_error(r), json.dumps(r)[:160])
@@ -337,7 +320,9 @@ def main():
         finally:
             stop(share4)
 
-        # --- pair against an already-revoked task ---
+        # --- pair against an already-revoked task: revoke tears the pair
+        # server down along with the task, so the still-unclaimed code
+        # must fail too, not just the (already-gone) task itself ---
         share5, code5, machine5 = start_share()
         try:
             rv = subprocess.run([BIN, "revoke", "--state", STATE, machine5],
@@ -350,42 +335,44 @@ def main():
         finally:
             stop(share5)
 
-        # --- expired pairing code (envelope TTL, not task TTL) ---
+        # --- expired pairing code (pair server TTL, not task TTL) ---
         share6, code6, _ = start_share(pairing_ttl="1s")
         try:
             time.sleep(2)
             m = Mcp()
             r = m.call("pair", {"code": code6})
-            check("adv: expired pairing code (envelope TTL) is rejected", is_error(r), json.dumps(r)[:160])
+            check("adv: expired pairing code (pair server TTL) is rejected", is_error(r), json.dumps(r)[:160])
             m.close()
         finally:
             stop(share6)
 
-        # --- consumed pairing code: fetched once already ---
+        # --- consumed pairing code: claimed once already ---
         share7, code7, _ = start_share()
         try:
             m1 = Mcp()
             r1 = m1.call("pair", {"code": code7})
-            check("adv setup: first fetch of the code succeeds", not is_error(r1), json.dumps(r1)[:160])
+            check("adv setup: first claim of the code succeeds", not is_error(r1), json.dumps(r1)[:160])
             m2 = Mcp()
             r2 = m2.call("pair", {"code": code7})
-            check("adv: a second server can't re-fetch an already-consumed code",
+            check("adv: a second server can't re-claim an already-consumed code",
                   is_error(r2), json.dumps(r2)[:160])
             m1.close()
             m2.close()
         finally:
             stop(share7)
 
-        # --- rendezvous unavailable: nothing listening at all ---
+        # --- pair server gone before any claim: killing share tears the
+        # pair server down along with the task, so pairing against a
+        # code whose share process already died must fail cleanly (no
+        # hang, no crash), not hang waiting for a dial that will never
+        # complete ---
         share8, code8, _ = start_share()
-        try:
-            m = Mcp(rendezvous_url="http://127.0.0.1:1")
-            r = m.call("pair", {"code": code8})
-            check("adv: rendezvous completely unavailable fails cleanly (no hang, no crash)",
-                  is_error(r), json.dumps(r)[:160])
-            m.close()
-        finally:
-            stop(share8)
+        stop(share8)
+        m = Mcp()
+        r = m.call("pair", {"code": code8})
+        check("adv: pair server gone before any claim fails cleanly (no hang, no crash)",
+              is_error(r), json.dumps(r)[:160])
+        m.close()
 
         # --- disconnect target unreachable: task's process is gone ---
         share9, code9, _ = start_share()
@@ -403,7 +390,6 @@ def main():
         m.close()
 
     finally:
-        stop(rdv)
         for f in (STATE,):
             if os.path.exists(f):
                 os.remove(f)
