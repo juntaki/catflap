@@ -13,6 +13,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/juntaki/catflap/internal/buildinfo"
 	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/rpc"
@@ -95,7 +96,7 @@ func ServeUnpaired(rendezvousURL string, verbose bool) error {
 
 func newServer(verbose bool) *Server {
 	s := &Server{verbose: verbose}
-	s.sdk = mcpsdk.NewServer(&mcpsdk.Implementation{Name: "catflap", Version: "0.2.0"}, nil)
+	s.sdk = mcpsdk.NewServer(&mcpsdk.Implementation{Name: "catflap", Version: buildinfo.Version}, nil)
 	s.sdk.AddTool(&mcpsdk.Tool{
 		Name:        "pair",
 		Description: "Pair with a Catflap task using a pairing code (looks like \"CAT-XXXX-...\"). Fetches and verifies the task's capability, then confirms the task is actually reachable before this tool exposes any of its granted tools.",

@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/tailscale/tailcat v0.6.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
@@ -50,7 +51,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb // indirect
-	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect

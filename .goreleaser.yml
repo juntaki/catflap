@@ -1,0 +1,82 @@
+version: 2
+
+project_name: catflap
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: catflap
+    main: ./cmd/catflap
+    binary: catflap
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - arm64
+      - amd64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w -X github.com/juntaki/catflap/internal/buildinfo.Version={{.Version}}
+
+archives:
+  - id: catflap
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+sboms:
+  - id: catflap-sbom
+    artifacts: archive
+
+signs:
+  - id: cosign-checksums
+    cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - --yes
+      - --output-signature=${signature}
+      - --output-certificate=${certificate}
+      - ${artifact}
+    artifacts: checksum
+
+release:
+  github:
+    owner: juntaki
+    name: catflap
+  prerelease: auto
+  mode: replace
+
+brews:
+  - name: catflap
+    repository:
+      owner: juntaki
+      name: homebrew-catflap
+      branch: main
+    directory: Formula
+    homepage: "https://github.com/juntaki/catflap"
+    description: "Ephemeral capability gateway for AI agents: lend a machine, not a credential."
+    license: "MIT"
+    test: |
+      system "#{bin}/catflap", "version"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"

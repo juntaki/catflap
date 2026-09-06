@@ -8,10 +8,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/juntaki/catflap/internal/buildinfo"
 	"github.com/juntaki/catflap/internal/cli"
 )
-
-const version = "0.2.0"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -42,7 +41,7 @@ func run(args []string) int {
 	case "rendezvous":
 		return cli.Rendezvous(args[1:])
 	case "version", "--version", "-V":
-		fmt.Printf("catflap %s\n", version)
+		fmt.Printf("catflap %s\n", buildinfo.Version)
 		return 0
 	case "help", "--help", "-h":
 		usage()
@@ -71,5 +70,5 @@ Advanced:
 
 Give an AI agent access to a machine, not a credential.
 The access dies with the task.
-`, version)
+`, buildinfo.Version)
 }
