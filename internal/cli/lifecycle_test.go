@@ -363,13 +363,21 @@ func TestShutdownCancelsAllTasksBeforeAnyTeardownWaits(t *testing.T) {
 
 	// The slow task's teardown is now blocked mid-flight. If shutdown
 	// still serialized stop-then-wait per task, the fast task would
-	// still be ACTIVE right now, uncancelled, since its turn hasn't
-	// come up yet.
-	if fastTask.Context().Err() == nil {
-		t.Error("fast task's context must already be cancelled while the slow task's teardown is still in flight")
-	}
-	if fastTask.StateOf() == gateway.StateActive {
-		t.Error("fast task must have left ACTIVE while the slow task's teardown is still in flight")
+	// stay ACTIVE, uncancelled, for as long as unblockSlow is held —
+	// i.e. forever, until this deadline fires. Polling (rather than
+	// asserting the instant slowStarted closes) tolerates the shutdown
+	// goroutine simply not having reached its next loop iteration yet;
+	// it does not tolerate the bug, which would never let fast's stop
+	// happen while slow's teardown is still blocked.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if fastTask.Context().Err() != nil && fastTask.StateOf() != gateway.StateActive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fast task must leave ACTIVE and have its context cancelled while the slow task's teardown is still in flight")
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	close(unblockSlow)

@@ -11,7 +11,11 @@ permissions:
   attestations: write
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
   release:
+    needs: checks
     runs-on: ubuntu-latest
 
     steps:
