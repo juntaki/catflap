@@ -12,22 +12,28 @@ copy-paste.
 operator                                            agent side
 --------                                             ----------
 catflap share --policy p.yaml                        catflap setup claude
-  → mints task, seals capability                       (registers unpaired MCP server)
-  → prints one-time code: CAT-XXXX-XXXX               claude
-                                                        → MCP `pair` tool + code
-        rendezvous server (sealed envelope only,          → fetches + unseals capability
-         no plaintext, no task traffic)                   → tools/list_changed: remote_* appear
-                    │
-                    └──────────── Tailcat/WireGuard (userspace, no account, no root) ─────┐
-                                                                                            ▼
-                                                                                    task's own server
-                                                                                    policy snapshot
-                                                                                    expires → Close
+  → mints task, its own Tailcat server                 (registers unpaired MCP server)
+  → starts a temporary PAIR server                    claude
+    (own Tailcat identity, open to                      → MCP `pair` tool + code
+     any client, claims one connection)                 → dials the pair server DIRECTLY
+  → prints one-time code: CAT-XXXX-XXXX                   over Tailcat/WireGuard
+                    │                                    → fetches capability, pair server dies
+                    └── Tailcat/WireGuard ────────────────┐  → tools/list_changed: remote_* appear
+                        (userspace, no account, no root)  │
+                                                            ▼
+                                                    task's own server
+                                                    policy snapshot
+                                                    expires → Close
 ```
 
-One task = one ephemeral network identity + one policy snapshot + one audit
-chain. Expiry closes the task's own server, so the WireGuard identity, the
-PSK, the address, and the RPC authorization all die together.
+No rendezvous, no hosted infrastructure of any kind: the agent connects
+straight to a throwaway pair server over the same encrypted Tailcat tunnel
+the task itself uses, fetches the capability once, and the pair server
+destroys itself immediately after — whether or not that delivery even
+succeeded. One task = one ephemeral network identity + one policy snapshot
++ one audit chain. Expiry closes the task's own server (and any still-open
+pair server for it), so the WireGuard identity, the PSK, the address, and
+the RPC authorization all die together.
 
 ## Why not "SSH over MCP"?
 
@@ -91,21 +97,22 @@ claude
 ```
 
 Paste the `Tell Claude:` line from `share`'s output into the `claude` session.
-Nothing is copy-pasted by hand except that one pairing code: it's a one-time,
-short-lived locator plus a local wrap key — the rendezvous server only ever
-stores and relays a sealed envelope, never the capability itself, and never
-any task traffic. Once paired, the SDK advertises the granted `remote_*`
-tools via `tools/list_changed` — no reconnect needed. Pairing codes are
-single-use (a replay is a 404) and default to a public rendezvous at
-`pair.catflap.dev`; run your own with `catflap rendezvous` and point both
-sides at it with `--rendezvous` / `CATFLAP_RENDEZVOUS`.
+Nothing is copy-pasted by hand except that one pairing code: it encodes only
+the address of a temporary pair server — a throwaway Tailcat (or local, for
+tests) identity that accepts one connection, hands over the capability, and
+destroys itself right after. No rendezvous, no third party ever sees the
+capability or any task traffic — the agent dials the pair server directly
+over the same encrypted tunnel the task itself uses. Once paired, the SDK
+advertises the granted `remote_*` tools via `tools/list_changed` — no
+reconnect needed. Pairing codes are single-use (a second claim gets nothing)
+and their TTL is always clamped to the task's own remaining TTL.
 
 ```bash
 catflap tasks                    # list live tasks on the running share/serve
 catflap share-code <task|name>   # Claude restarted and the old code is used up?
                                   # reissue a fresh code for the SAME still-live task
 catflap revoke <task|name>       # destroy a task early: same teardown as expiry
-catflap doctor                   # Claude Code / MCP registration / rendezvous / audit — all in one check
+catflap doctor                   # Claude Code / MCP registration / audit — all in one check
 ```
 
 Once paired, the agent sees `disconnect` (revoke its own access) alongside
@@ -122,8 +129,8 @@ go build -o bin/catflap ./cmd/catflap
 ```
 
 Before pairing, catflap issued a capability blob directly. This path still
-works — for scripting, tests, or when there is no rendezvous reachable —
-but is no longer the default:
+works — for scripting, tests, or headless automation — but is no longer the
+default:
 
 ```bash
 ./bin/catflap serve --policy ./examples/policies/readonly-debug.yaml --ttl 15m --out ./task.cap
@@ -361,9 +368,16 @@ running `share`/`serve` is trusted**, and enforces:
   block, and it binds to the exact resolved argv/path/content that executes.
 - Every decision (allow/deny/expired/approved/denied/error) is
   hash-chained to JSONL.
-- Pairing codes are one-time, short-lived, brute-force resistant, and
-  typo-safe (CRC-16 checked locally before any network round trip); the
-  rendezvous server sees only a sealed envelope, never a capability or task
+- Pairing codes are one-time, short-lived, and typo-safe (CRC-16 checked
+  locally before any network round trip). They carry only a pair server's
+  own transport+address — nothing else needs encrypting on top, since a
+  Tailcat address already embeds a random WireGuard pre-shared key: knowing
+  it is what lets a client complete the handshake at all. The pair server
+  is its own Tailcat identity, separate from the task's, claims exactly one
+  connection, and self-destructs immediately after (whether or not delivery
+  succeeded) or after its own TTL — always clamped to the task's remaining
+  TTL, so a code can never outlive its task. No rendezvous, no third party,
+  no hosted infrastructure of any kind sees the capability or any task
   traffic. The legacy manual flow's bearer token is best carried via
   `--out` / `--cap-file` (0600 files); it also accepts `--cap` or an env
   var, both discouraged (`--cap` visibly leaks the token into argv/shell
@@ -386,14 +400,14 @@ internal/
     tailcat/            ONLY package that imports github.com/tailscale/tailcat
     local/              loopback transport (tests/demos)
   capability/           agc1_… bearer tokens (task, endpoint, client key, secret, expiry)
-  pair/                 pairing codes + sealed-envelope rendezvous protocol
+  pair/                 pairing codes (encode/decode only, no crypto) + the one-shot pair server/client
   policy/               structured argv policy + file grants + approval modes (schema v1)
   safefs/               dedicated filesystem layer (dirfd walk, openat2)
   gateway/              per-task auth, TTL, approval engine, enforcement (no shell), Stop/GC
   rpc/                  JSONL request/response frames (2MiB bound, enforced incrementally)
   audit/                hash-chained JSONL logger (v1 records, verify, anchors)
   mcp/                  MCP adapter on the official Go SDK (spec 2026-07-28 baseline, older clients negotiated)
-  cli/                  share/serve (per-task servers+admin API) / grant / mcp / setup / rendezvous / audit / tasks / revoke wiring
+  cli/                  share/serve (per-task servers+admin API) / grant / mcp / setup / audit / tasks / revoke wiring
 examples/policies/      readonly-debug, lab-gpu
 testdata/               e2e drivers (local + live-Tailcat probes) + adversarial + pairing + approval tests
 ```
@@ -414,6 +428,7 @@ v0.3-A pairing: rendezvous server, sealed envelopes, `share`/`setup claude`/pair
 v0.3-B human approval engine: never/once/always, hash-bound, fail-closed, terminal UX ✓
 v0.3   release hardening: cross-platform CI, signed releases, README/golden-path parity ✓
 v0.3.1 UX pass: effective-permissions share output, share-code re-pair, catflap doctor ✓
+v0.3.2 pairing rewrite: direct Tailcat pair servers, no HTTP rendezvous, no hosted infra ✓
 v0.4   network egress policy, specialized adapters
 ```
 
