@@ -71,9 +71,21 @@ type Task struct {
 	// BEFORE the terminal event, not race it.
 	wg       sync.WaitGroup
 	stopOnce sync.Once
-	stopDone chan struct{}
+	// stoppingCh closes the instant Stop begins — before the bounded
+	// drain, before the terminal audit event, before Done. A caller
+	// that only needs to know "is this task still the one live claim
+	// worth handing out" (the pair server's stillLive check) must not
+	// wait for drain to finish first: drain can take up to
+	// drainTimeout, and a pair server still advertising a task that's
+	// already mid-teardown would hand out a code for something already
+	// gone.
+	stoppingCh chan struct{}
+	stopDone   chan struct{}
 	// onStop releases task-external resources (the task's transport
-	// server). Set by the caller before the task starts serving.
+	// server). Set by the caller before the task starts serving; a
+	// caller that sets it AFTER Stop has already begun gets it invoked
+	// immediately instead of silently missing the one call it would
+	// otherwise never get — see OnStopFunc.
 	onStop func()
 }
 
@@ -134,7 +146,7 @@ func NewTask(parent context.Context, id string, ttl time.Duration, alog *audit.L
 	t := &Task{
 		ID: id, ExpiresAt: time.Now().Add(ttl), Audit: alog,
 		hostSigner: signer, ctx: ctx, cancel: cancel,
-		stopDone: make(chan struct{}),
+		stoppingCh: make(chan struct{}), stopDone: make(chan struct{}),
 	}
 	t.sshSrv = &ssh.Server{
 		HostSigners: []ssh.Signer{t.hostSigner},
@@ -177,20 +189,53 @@ func (t *Task) getAllowedKey() gossh.PublicKey {
 }
 
 // OnStopFunc sets the external-release hook (closes the task's
-// transport server). Must be set before the task starts serving.
-func (t *Task) OnStopFunc(f func()) { t.onStop = f }
+// transport server). Ordinarily set once, before the task starts
+// serving. If Stop has already begun by the time this is called — a
+// narrow window that only matters for a pathologically short TTL —
+// f runs immediately instead of being silently stored somewhere Stop
+// already finished reading from: a hook registered "too late" must
+// still fire exactly once, not get lost.
+func (t *Task) OnStopFunc(f func()) {
+	t.mu.Lock()
+	if t.stopping {
+		t.mu.Unlock()
+		f()
+		return
+	}
+	t.onStop = f
+	t.mu.Unlock()
+}
 
-// Stop tears the task down: cancels every in-flight command, closes
-// the transport server via onStop, and closes the audit sink. Safe to
-// call more than once and from multiple goroutines; only the first
-// call has effect.
+// Stop tears the task down in the order the "endpoint, route, and
+// credential all die together" contract needs: signal first (anything
+// only waiting to know the task is no longer a live claim, like the
+// pair server, must not wait for the slow parts), then the actual
+// teardown, then the bounded drain, then the audit trail is sealed
+// last of all. Safe to call more than once and from multiple
+// goroutines; only the first call has effect.
 func (t *Task) Stop(reason string) {
 	t.stopOnce.Do(func() {
 		t.mu.Lock()
 		t.stopping = true
+		onStop := t.onStop
 		t.mu.Unlock()
-		// Cancelling first is what actually kills a running command's
-		// whole process tree: startDetached wires t.ctx's cancellation
+		// Closes before anything else runs: a pair server's stillLive
+		// check (see internal/cli's runSSHShare) must see this task as
+		// already gone the instant teardown starts, not up to
+		// drainTimeout later — handing out a fresh pairing code for a
+		// task that's mid-teardown would be handing out a code for
+		// something already dead.
+		close(t.stoppingCh)
+		// Release the transport server (Tailcat/local listener) before
+		// the bounded drain below, not after: the network ROUTE dying
+		// is part of "access dies with the task", not a cleanup detail
+		// that can wait behind up to drainTimeout of in-flight
+		// commands finishing.
+		if onStop != nil {
+			onStop()
+		}
+		// Cancelling is what actually kills a running command's whole
+		// process tree: startDetached wires t.ctx's cancellation
 		// straight to cmd.Cancel, which SIGKILLs the process GROUP, not
 		// just the shell exec.CommandContext started — a command that
 		// spawned children (a build, a test runner) must not survive
@@ -216,18 +261,21 @@ func (t *Task) Stop(reason string) {
 		}
 		if t.Audit != nil {
 			t.Audit.LogTerminal(reason)
-		}
-		if t.onStop != nil {
-			t.onStop()
-		}
-		if t.Audit != nil {
 			_ = t.Audit.Close()
 		}
 		close(t.stopDone)
 	})
 }
 
-// Done reports when the task has been stopped.
+// Stopping reports when Stop has begun — closes immediately, well
+// before Done (which waits for the full drain and audit seal). Use
+// this for "is this task still a live claim worth acting on" checks
+// that must not block behind drainTimeout; use Done for "has teardown
+// fully finished".
+func (t *Task) Stopping() <-chan struct{} { return t.stoppingCh }
+
+// Done reports when the task has been fully stopped: drain finished,
+// terminal audit event written, audit sink closed.
 func (t *Task) Done() <-chan struct{} { return t.stopDone }
 
 // Handler returns the transport.Handler for this task: one gliderssh

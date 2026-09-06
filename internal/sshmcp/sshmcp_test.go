@@ -230,6 +230,64 @@ func TestUnpairsAutomaticallyOnTaskDeath(t *testing.T) {
 	}
 }
 
+// TestConcurrentPairingTransitionsKeepToolStateConsistent guards a
+// logical (not data-race-detectable — verified by hand, not by this
+// test flipping red pre-fix under natural scheduling: the window is a
+// handful of pointer writes wide and this harness never managed to
+// hit it even at 1000 iterations) ordering bug: commitPaired used to
+// spawn its auto-unpair watcher goroutine BEFORE calling AddTool for
+// exec/disconnect, so a connection that died the instant it was
+// committed could have its watcher call RemoveTools before the
+// AddTool calls for a DIFFERENT, newer connection ran, or vice versa —
+// leaving the tool set out of sync with "paired" state either way.
+// transitionMu now serializes commitPaired and clearIfCurrent as one
+// atomic transition. This exercises the realistic user-facing version
+// of the scenario (revoke, then immediately re-pair) many times and
+// asserts the invariant it must never violate: whenever pairing
+// reports success, exec is actually callable.
+func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
+	s := newServer(false)
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		taskA, codeA := liveTaskAndCode(t)
+		res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: codeA}))
+		if err != nil || res.IsError {
+			t.Fatalf("iteration %d: pair A: err=%v res=%v", i, err, res)
+		}
+
+		_, codeB := liveTaskAndCode(t)
+		go taskA.Stop("revoked")
+
+		deadline := time.Now().Add(3 * time.Second)
+		var pairedB bool
+		for time.Now().Before(deadline) {
+			res, _ := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: codeB}))
+			if !res.IsError {
+				pairedB = true
+				break
+			}
+		}
+		if !pairedB {
+			t.Fatalf("iteration %d: never managed to pair B after A's auto-unpair", i)
+		}
+
+		// Tool-state consistency: pairing B just reported success, so
+		// exec must actually be registered and usable — never left
+		// desynced from a race between A's auto-clear and B's commit.
+		execRes, eerr := s.handleExec(context.Background(), callToolRequest(t, execArgs{Command: "echo b"}))
+		if eerr != nil {
+			t.Fatalf("iteration %d: handleExec: %v", i, eerr)
+		}
+		if execRes.IsError {
+			t.Fatalf("iteration %d: exec must work right after a successful pair, got: %s", i, resultText(t, execRes))
+		}
+
+		if _, derr := s.handleDisconnect(context.Background(), callToolRequest(t, struct{}{})); derr != nil {
+			t.Fatalf("iteration %d: cleanup disconnect: %v", i, derr)
+		}
+	}
+}
+
 // TestAdapterRejectsWrongHostKey proves the adapter refuses to pair if
 // the SSH endpoint's actual host key doesn't match what the pairing
 // exchange offered — the defense against a network-level impersonator

@@ -40,6 +40,19 @@ type Server struct {
 	sdk     *mcpsdk.Server
 	verbose bool
 
+	// transitionMu serializes every pairing state transition
+	// (commitPaired, clearIfCurrent) together with the MCP tool-set
+	// change that must be atomic with it. Without this, two
+	// transitions for different connections (an old connection's
+	// auto-unpair racing a brand new commitPaired, or a connection
+	// dying the instant it's committed) can interleave their
+	// mu-protected state writes with their AddTool/RemoveTools calls,
+	// leaving tool exposure out of sync with pairing state — "paired"
+	// with exec missing, or unpaired with exec still callable. mu alone
+	// only makes each individual field read/write atomic, not the
+	// multi-step transition around it.
+	transitionMu sync.Mutex
+
 	mu      sync.Mutex
 	client  transport.Client // transport-level client; Close destroys any ephemeral network identity
 	ssh     *gossh.Client
@@ -92,22 +105,14 @@ func (s *Server) tryClaimPairing() bool {
 }
 
 func (s *Server) commitPaired(client transport.Client, sshClient *gossh.Client, taskID string) {
+	s.transitionMu.Lock()
+	defer s.transitionMu.Unlock()
 	s.mu.Lock()
 	s.client = client
 	s.ssh = sshClient
 	s.taskID = taskID
 	s.pairing = false
 	s.mu.Unlock()
-	// The task can die (TTL, revoke) without this adapter ever calling
-	// disconnect itself — Wait blocks until the underlying SSH
-	// connection actually closes, at which point pairing state must be
-	// forgotten automatically so a fresh pairing code can be used on
-	// this same running adapter instead of it staying stuck reporting
-	// "already paired" against a connection that no longer exists.
-	go func() {
-		_ = sshClient.Wait()
-		s.clearIfCurrent(sshClient)
-	}()
 	s.sdk.AddTool(&mcpsdk.Tool{
 		Name:        "disconnect",
 		Description: "Disconnect from the currently paired SSH share and forget local pairing state. This only ends THIS adapter's connection — it does not revoke the task itself; the operator's own `catflap ssh-share` process (Ctrl-C, or its TTL) is what ends access for good.",
@@ -124,6 +129,16 @@ func (s *Server) commitPaired(client transport.Client, sshClient *gossh.Client, 
 			"required": []string{"command"},
 		},
 	}, s.handleExec)
+	// Only started once state AND tools are fully published — under
+	// the same transitionMu this holds — so this connection's own
+	// eventual clearIfCurrent (whenever Wait returns, even near-
+	// instantly for an already-dead connection) can never run before
+	// the AddTool calls above, and can never interleave with a
+	// different transition for a different connection.
+	go func() {
+		_ = sshClient.Wait()
+		s.clearIfCurrent(sshClient)
+	}()
 }
 
 // clearIfCurrent forgets pairing state and removes exec/disconnect, but
@@ -131,9 +146,15 @@ func (s *Server) commitPaired(client transport.Client, sshClient *gossh.Client, 
 // auto-unpair goroutine (commitPaired) and an explicit disconnect call
 // can both race to clear the same dead connection, and a disconnect
 // racing a NEWER pairing (already replaced by the time this runs) must
-// never clobber that newer pairing's state. Returns whether it actually
-// cleared anything.
+// never clobber that newer pairing's state. transitionMu serializes
+// this against commitPaired — see that method's own comment — so a
+// state check here that finds itself still current is guaranteed to
+// finish clearing and calling RemoveTools before any other transition
+// (a fresh commitPaired for a different connection) can proceed.
+// Returns whether it actually cleared anything.
 func (s *Server) clearIfCurrent(sshClient *gossh.Client) bool {
+	s.transitionMu.Lock()
+	defer s.transitionMu.Unlock()
 	s.mu.Lock()
 	if s.ssh != sshClient {
 		s.mu.Unlock()

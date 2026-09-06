@@ -39,8 +39,9 @@ catflap share
 
 TTL / Ctrl-C / SIGTERM
   → SSH server closes (severs any already-open session, not just future ones)
+  → every ordinary in-flight command's process GROUP is killed
   → Tailcat identity dies
-  → the one allowed key stops meaning anything — nothing to revoke, nothing left standing
+  → the one allowed key stops meaning anything — network route and credential are both gone
 ```
 
 No Catflap-operated rendezvous, no Catflap-hosted service of any kind: the
@@ -215,8 +216,17 @@ enforces:
 - **Revoke actually severs live sessions.** The embedded SSH server is one
   shared instance per task, not one per connection — closing it (TTL,
   Ctrl-C, SIGTERM) closes every currently-open connection, not just future
-  ones. An in-flight command dies with its task's context; an idle
-  interactive session gets disconnected outright.
+  ones. An idle interactive session gets disconnected outright.
+- **Ordinary in-flight commands are killed as a process group, not just
+  their direct shell.** Catflap terminates the process group of an
+  ordinary in-flight SSH command on task death — a build's worker
+  processes, a test runner's children, all die with it. This is
+  lifecycle cleanup, not containment: code running with the OS account's
+  own privileges can deliberately detach a process (`setsid`, a
+  cron/launchd/systemd unit it installs) to survive outside that process
+  group on purpose. A task-scoped SSH login and a sandbox that can roll
+  back every side effect an untrusted process makes on the host are two
+  different products; catflap is the former.
 - **Pairing codes are one-time, short-lived, and typo-safe** (CRC-16
   checked locally before any network round trip). They carry only a pair
   server's own transport+address — nothing else needs encrypting on top.

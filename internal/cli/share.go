@@ -130,7 +130,7 @@ func runSSHShare(ctx context.Context, task *sshhost.Task, endpoint string, pairi
 	}
 	stillLive := func() bool {
 		select {
-		case <-task.Done():
+		case <-task.Stopping():
 			return false
 		default:
 			return true
@@ -148,10 +148,14 @@ func runSSHShare(ctx context.Context, task *sshhost.Task, endpoint string, pairi
 	if err != nil {
 		return fmt.Errorf("start pair server: %w", err)
 	}
-	// A pair server must never outlive its task.
+	// A pair server must never outlive its task. Stopping, not Done:
+	// the pair server must die the instant teardown BEGINS, not after
+	// the (up to drainTimeout) bounded drain finishes — a fresh code
+	// handed out while a task is mid-teardown would be a code for
+	// something already gone.
 	go func() {
 		select {
-		case <-task.Done():
+		case <-task.Stopping():
 			pairSrv.Close()
 		case <-ctx.Done():
 			pairSrv.Close()
