@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/juntaki/catflap/internal/capability"
+	"github.com/juntaki/catflap/internal/transport/local"
 )
 
 func testCap() *capability.Capability {
@@ -289,5 +290,48 @@ func TestServeRejectsNonPositiveTTL(t *testing.T) {
 	}
 	if _, err := Serve("local", testCap(), -time.Second, false, nil); err == nil {
 		t.Error("Serve with a negative ttl must fail")
+	}
+}
+
+// TestHandleConnClientDisconnectsDuringDelivery is a lifecycle
+// failure-injection case: a client that connects (burning the one-shot
+// claim) and then disconnects before reading the capability frame —
+// simulating a network drop or a killed agent process mid-delivery.
+// The pair server must not hang or panic, must still tear itself down
+// promptly (no ack will ever arrive), and — since the claim is already
+// burned — a second, well-behaved client must get nothing.
+func TestHandleConnClientDisconnectsDuringDelivery(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, time.Minute, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	addr := srv.Addr()
+
+	client := local.Dialer(addr)
+	conn, derr := client.Dial(context.Background())
+	if derr != nil {
+		t.Fatalf("dial: %v", derr)
+	}
+	_ = conn.Close() // disconnect immediately, before reading anything
+
+	done := make(chan struct{})
+	go func() {
+		// Poll rather than sleep a fixed amount: the server should
+		// tear itself down quickly once the write to the now-closed
+		// connection fails (no ack will ever arrive to wait for).
+		for i := 0; i < 100; i++ {
+			if _, err := Fetch(context.Background(), "local", addr, false); err != nil {
+				close(done)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pair server never became unreachable after its one client disconnected mid-delivery")
 	}
 }
