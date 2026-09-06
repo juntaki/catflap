@@ -101,7 +101,6 @@ func Doctor(args []string) int {
 func checkClaudeRegistration(claudePath string) (bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	//nolint:gosec // reason: fixed argv against the operator's PATH-resolved claude binary; no agent input.
 	out, err := exec.CommandContext(ctx, claudePath, "mcp", "list").CombinedOutput()
 	if err != nil {
 		return false, "`claude mcp list` failed: " + err.Error()

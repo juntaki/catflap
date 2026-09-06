@@ -30,9 +30,11 @@ func TestCheckWritableEmptyDirIsNotAFailure(t *testing.T) {
 
 func TestCheckWritableFailsOnUnwritableParent(t *testing.T) {
 	base := t.TempDir()
+	//nolint:gosec // reason: test-owned t.TempDir() path, deliberately made unwritable to exercise the failure path.
 	if err := os.Chmod(base, 0o500); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // reason: restoring the test-owned t.TempDir() path so cleanup can remove it.
 	defer func() { _ = os.Chmod(base, 0o700) }()
 	if err := checkWritable(filepath.Join(base, "audit")); err == nil {
 		t.Error("checkWritable must fail when the parent directory isn't writable")
