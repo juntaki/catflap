@@ -224,15 +224,20 @@ func (t *Task) auditExec(rawCommand string, pty bool, start time.Time, exitCode 
 // sessions.
 func (t *Task) handleSession(s ssh.Session) {
 	start := time.Now()
-	cmdline := s.Command()
+	shell := loginShell()
 	var cmd *exec.Cmd
-	if len(cmdline) == 0 {
-		shell := loginShell()
-		//nolint:gosec // reason: no shell metacharacter interpretation here — this launches the user's own login shell with no untrusted argv; the client's raw command text (if any) is never passed to sh -c.
-		cmd = exec.CommandContext(t.ctx, shell, "-l")
+	if raw := s.RawCommand(); raw != "" {
+		// Match real sshd: an exec request runs "$SHELL -c <raw command
+		// text>", not an argv Catflap parses and execs directly. Catflap
+		// has no command allowlist to protect by avoiding a shell here —
+		// the OS account is the boundary now — and the caller (an agent
+		// driving builds/tests, or a human's own ssh client) expects
+		// ordinary shell semantics: pipes, &&, redirection, quoting.
+		//nolint:gosec // reason: this IS the SSH exec primitive; running the client's command text through the login shell is standard sshd behavior, not a shell-injection surface — there is no separate trusted argv this could be smuggled past.
+		cmd = exec.CommandContext(t.ctx, shell, "-c", raw)
 	} else {
-		//nolint:gosec // reason: this IS the SSH exec primitive — argv comes straight from the client's own session request, run directly (no shell), exactly like sshd running an authenticated user's command.
-		cmd = exec.CommandContext(t.ctx, cmdline[0], cmdline[1:]...)
+		//nolint:gosec // reason: no untrusted argv here — this launches the user's own login shell for an interactive session, matching sshd with no command in the exec/session request.
+		cmd = exec.CommandContext(t.ctx, shell, "-l")
 	}
 
 	ptyReq, winCh, isPty := s.Pty()

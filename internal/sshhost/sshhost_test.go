@@ -63,6 +63,29 @@ func dialTask(t *testing.T, ttl time.Duration) (*sshhost.Task, *gossh.Client, fu
 	return task, client, func() { _ = client.Close(); task.Stop("shutdown") }
 }
 
+// TestExecRunsThroughShell proves exec requests get real shell
+// semantics (pipes, &&, quoting) — matching real sshd, and required
+// now that there is no argv allowlist steering callers toward plain
+// commands.
+func TestExecRunsThroughShell(t *testing.T) {
+	_, client, cleanup := dialTask(t, time.Hour)
+	defer cleanup()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	out, err := sess.Output("echo one && echo two | tr a-z A-Z")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := "one\nTWO\n"; string(out) != want {
+		t.Fatalf("output = %q, want %q", out, want)
+	}
+}
+
 // TestRevokeKillsInFlightExec proves Stop cancels a currently-running
 // remote command, not just future connection attempts — the same
 // "access dies with the task, including anything it started" guarantee

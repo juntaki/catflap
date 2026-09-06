@@ -26,6 +26,8 @@ func run(args []string) int {
 		return cli.Share(args[1:])
 	case "ssh-share":
 		return cli.SSHShare(args[1:])
+	case "ssh-mcp":
+		return cli.SSHMCP(args[1:])
 	case "share-code":
 		return cli.ShareCode(args[1:])
 	case "doctor":
