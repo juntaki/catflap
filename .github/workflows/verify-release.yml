@@ -15,11 +15,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to verify (e.g. v0.7.0). Defaults to the tag that triggered the most recent release run."
-        required: false
+        description: "Release tag to re-verify, e.g. v0.7.0."
+        required: true
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   resolve-tag:
@@ -40,14 +41,13 @@ jobs:
           fi
           # tag is used later as a git ref (actions/checkout) and in
           # shell commands — constrain it to catflap's actual release
-          # tag shape before it goes anywhere near either.
-          case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "refusing to verify malformed tag: $tag"
-              exit 1
-              ;;
-          esac
+          # tag shape before it goes anywhere near either. A bash glob
+          # (case) can't anchor "digits only" the way a regex can, so
+          # use [[ =~ ]] instead.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "refusing to verify malformed tag: $tag"
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   verify:
