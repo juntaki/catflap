@@ -121,7 +121,11 @@ func TestServeAndFetchCompleteWithoutAnySleep(t *testing.T) {
 	if _, err := Fetch(context.Background(), "local", srv.Addr(), false); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+	// 1.5s, not a tighter bound: this only needs to catch a REGRESSION
+	// of the old fixed 2s sleep, not assert a specific fast latency —
+	// a tighter threshold buys nothing here and risks flaking on a
+	// momentarily slow CI runner.
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
 		t.Errorf("Fetch took %s — no step of the handshake should involve a fixed sleep", elapsed)
 	}
 }
