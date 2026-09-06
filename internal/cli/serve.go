@@ -33,9 +33,37 @@ import (
 // server = 1 WireGuard identity + 1 PSK + 1 address. Expiry closes the
 // server, so reachability itself dies with the task — not just the RPC auth.
 type liveTask struct {
-	task  *gateway.Task
-	srv   transport.Server
+	task *gateway.Task
+	srv  transport.Server
+	// cap is the capability minted for this task, retained so
+	// `share-code` can reissue a fresh one-time pairing code for a
+	// still-live task without minting a new one — set once, right
+	// after mkTask builds it (see setCapability), and read only
+	// through getCapability.
+	cap   *capability.Capability
 	timer *time.Timer
+}
+
+// setCapability records the capability minted for taskID, if the task
+// is still live. A no-op if the task already died between commit and
+// this call (e.g. an immediate revoke racing mkTask's return).
+func (s *server) setCapability(taskID string, cap *capability.Capability) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if lt, ok := s.live[taskID]; ok {
+		lt.cap = cap
+	}
+}
+
+// getCapability returns the retained capability for a still-live task.
+func (s *server) getCapability(taskID string) (*capability.Capability, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lt, ok := s.live[taskID]
+	if !ok || lt.cap == nil {
+		return nil, false
+	}
+	return lt.cap, true
 }
 
 type server struct {
@@ -290,6 +318,30 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		}
 		_ = json.NewEncoder(w).Encode(RevokeResponse{Task: rreq.Task, Status: status})
 	})
+	mux.HandleFunc("/capability", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if "Bearer "+adminToken != strings.TrimSpace(r.Header.Get("Authorization")) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var creq CapabilityRequest
+		if err := decodeAdminBody(w, r, &creq); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		cap, ok := s.getCapability(strings.TrimSpace(creq.Task))
+		if !ok {
+			http.Error(w, "unknown or not-yet-live task", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(CapabilityResponse{
+			Task: cap.TaskID, Capability: cap.Encode(),
+			ExpiresAt: cap.ExpiresAt.Format(time.RFC3339), Policy: cap.Policy,
+		})
+	})
 	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
 		if "Bearer "+adminToken != strings.TrimSpace(r.Header.Get("Authorization")) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -494,6 +546,7 @@ func (s *server) mkTask(ctx context.Context, p *policy.Policy, name string) (*ca
 		Tools:      toolsForPolicy(p),
 		MaxExecMs:  p.EffectiveLimits().MaxExecDuration.Milliseconds(),
 	}
+	s.setCapability(taskID, cap)
 	return cap, t, nil
 }
 

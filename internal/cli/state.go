@@ -151,6 +151,55 @@ func PostGrant(adminAddr, token string, req GrantRequest) (*GrantResponse, error
 	return &out, nil
 }
 
+// CapabilityRequest asks the running server for a still-live task's
+// original capability, so a fresh pairing code can be issued for it
+// without minting a new task (see `catflap share-code`).
+type CapabilityRequest struct {
+	Task string `json:"task"`
+}
+
+// CapabilityResponse carries the task's retained capability.
+type CapabilityResponse struct {
+	Task       string `json:"task"`
+	Capability string `json:"capability"`
+	ExpiresAt  string `json:"expires_at"`
+	Policy     string `json:"policy"`
+}
+
+// PostCapability calls the admin API to fetch a still-live task's
+// original capability.
+func PostCapability(adminAddr, token, taskID string) (*CapabilityResponse, error) {
+	body, merr := json.Marshal(CapabilityRequest{Task: taskID})
+	if merr != nil {
+		return nil, fmt.Errorf("encode capability request: %w", merr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "http://"+adminAddr+"/capability", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("capability request: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("capability failed (%d): %s", res.StatusCode, string(raw))
+	}
+	var out CapabilityResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parse capability response: %w", err)
+	}
+	if _, err := capability.Decode(out.Capability); err != nil {
+		return nil, fmt.Errorf("server returned invalid capability: %w", err)
+	}
+	return &out, nil
+}
+
 // PostRevoke calls the admin API to destroy one task. Unknown tasks are
 // idempotent success (status "unknown"), not errors.
 func PostRevoke(adminAddr, token, taskID string) (*RevokeResponse, error) {

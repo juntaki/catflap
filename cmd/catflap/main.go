@@ -24,6 +24,10 @@ func run(args []string) int {
 	switch args[0] {
 	case "share":
 		return cli.Share(args[1:])
+	case "share-code":
+		return cli.ShareCode(args[1:])
+	case "doctor":
+		return cli.Doctor(args[1:])
 	case "serve":
 		return cli.Serve(args[1:])
 	case "grant":
@@ -60,7 +64,9 @@ Usage:
   catflap share [--policy p.yaml] [--ttl 15m]   grant access and print a pairing code
   catflap setup claude          register the (unpaired) Catflap MCP server with Claude Code
   catflap tasks                 list live tasks on the running serve/share
+  catflap share-code <task>     reissue a fresh pairing code for a still-live task
   catflap revoke <task|name>    destroy a task
+  catflap doctor                check that setup/rendezvous/audit are all healthy
   catflap rendezvous            run a pairing rendezvous (the default is a public one)
 
 Advanced:

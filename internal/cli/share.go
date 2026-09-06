@@ -85,22 +85,9 @@ func Share(args []string) int {
 // down" — see RunGateway.
 func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
 	return func(a Announce) error {
-		id, key, code, merr := pair.Mint()
-		if merr != nil {
-			return fmt.Errorf("mint pairing code: %w", merr)
-		}
-		payload, jerr := json.Marshal(a.Cap)
-		if jerr != nil {
-			return fmt.Errorf("encode capability: %w", jerr)
-		}
-		env, serr := pair.Seal(id, payload, key)
-		if serr != nil {
-			return fmt.Errorf("seal envelope: %w", serr)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if perr := pair.Publish(ctx, rendezvousURL, env, pairingTTL); perr != nil {
-			return fmt.Errorf("publish to rendezvous: %w", perr)
+		code, err := mintAndPublishPairingCode(rendezvousURL, pairingTTL, a.Cap)
+		if err != nil {
+			return err
 		}
 		_, _ = fmt.Fprintf(out,
 			"Sharing %s for %s\n\nAccess\n%s\nPairing code (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nExpires: %s\n",
@@ -109,6 +96,32 @@ func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.P
 		)
 		return nil
 	}
+}
+
+// mintAndPublishPairingCode mints a fresh one-time pairing code, seals
+// cap behind it, and publishes the sealed envelope to rendezvousURL —
+// the same sequence `share` uses for a brand-new task, reused by
+// `share-code` to reissue a new code for an already-live one. Never
+// returns the capability itself, only the pairing code.
+func mintAndPublishPairingCode(rendezvousURL string, pairingTTL time.Duration, cap any) (string, error) {
+	id, key, code, merr := pair.Mint()
+	if merr != nil {
+		return "", fmt.Errorf("mint pairing code: %w", merr)
+	}
+	payload, jerr := json.Marshal(cap)
+	if jerr != nil {
+		return "", fmt.Errorf("encode capability: %w", jerr)
+	}
+	env, serr := pair.Seal(id, payload, key)
+	if serr != nil {
+		return "", fmt.Errorf("seal envelope: %w", serr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if perr := pair.Publish(ctx, rendezvousURL, env, pairingTTL); perr != nil {
+		return "", fmt.Errorf("publish to rendezvous: %w", perr)
+	}
+	return code, nil
 }
 
 // formatEffectiveAccess renders what a policy actually grants — read
