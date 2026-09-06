@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 func dirOf(p string) string {
@@ -16,12 +15,6 @@ func dirOf(p string) string {
 	}
 	return d
 }
-
-// stringSliceFlag collects repeatable string flags.
-type stringSliceFlag []string
-
-func (s *stringSliceFlag) String() string     { return strings.Join(*s, ",") }
-func (s *stringSliceFlag) Set(v string) error { *s = append(*s, v); return nil }
 
 // openAnchorLog opens an anchor log for appending: created 0600, never
 // following a symlink, never truncating.

@@ -151,31 +151,39 @@ func PostGrant(adminAddr, token string, req GrantRequest) (*GrantResponse, error
 	return &out, nil
 }
 
-// CapabilityRequest asks the running server for a still-live task's
-// original capability, so a fresh pairing code can be issued for it
-// without minting a new task (see `catflap share-code`).
-type CapabilityRequest struct {
+// PairRequest asks the running server to start a fresh temporary pair
+// server for a still-live task and return a pairing code for it — used
+// by `catflap share-code` to reissue a code without minting a new task.
+type PairRequest struct {
 	Task string `json:"task"`
+	// TTLOverrideMs, if positive, requests this pairing-code TTL
+	// instead of pair.DefaultCodeTTL. The server still clamps it to
+	// the task's own remaining TTL — see issuePairCode.
+	TTLOverrideMs int64 `json:"ttl_override_ms,omitempty"`
 }
 
-// CapabilityResponse carries the task's retained capability.
-type CapabilityResponse struct {
-	Task       string `json:"task"`
-	Capability string `json:"capability"`
-	ExpiresAt  string `json:"expires_at"`
-	Policy     string `json:"policy"`
+// PairResponse carries the pairing code and the TTL actually used
+// (possibly shorter than requested, if the task's remaining TTL was
+// the binding constraint).
+type PairResponse struct {
+	Code  string `json:"code"`
+	TTLMs int64  `json:"ttl_ms"`
 }
 
-// PostCapability calls the admin API to fetch a still-live task's
-// original capability.
-func PostCapability(adminAddr, token, taskID string) (*CapabilityResponse, error) {
-	body, merr := json.Marshal(CapabilityRequest{Task: taskID})
-	if merr != nil {
-		return nil, fmt.Errorf("encode capability request: %w", merr)
+// PostPair calls the admin API to start a fresh temporary pair server
+// for a still-live task and return a pairing code for it.
+func PostPair(adminAddr, token, taskID string, ttlOverride time.Duration) (*PairResponse, error) {
+	req := PairRequest{Task: taskID}
+	if ttlOverride > 0 {
+		req.TTLOverrideMs = ttlOverride.Milliseconds()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	body, merr := json.Marshal(req)
+	if merr != nil {
+		return nil, fmt.Errorf("encode pair request: %w", merr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", "http://"+adminAddr+"/capability", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "http://"+adminAddr+"/pair", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -183,19 +191,19 @@ func PostCapability(adminAddr, token, taskID string) (*CapabilityResponse, error
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	res, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("capability request: %w", err)
+		return nil, fmt.Errorf("pair request: %w", err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("capability failed (%d): %s", res.StatusCode, string(raw))
+		return nil, fmt.Errorf("pair failed (%d): %s", res.StatusCode, string(raw))
 	}
-	var out CapabilityResponse
+	var out PairResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("parse capability response: %w", err)
+		return nil, fmt.Errorf("parse pair response: %w", err)
 	}
-	if _, err := capability.Decode(out.Capability); err != nil {
-		return nil, fmt.Errorf("server returned invalid capability: %w", err)
+	if out.Code == "" {
+		return nil, fmt.Errorf("server returned an empty pairing code")
 	}
 	return &out, nil
 }

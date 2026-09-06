@@ -29,7 +29,6 @@ func Setup(args []string) int {
 
 func setupClaude(args []string) int {
 	fs := flag.NewFlagSet("setup claude", flag.ContinueOnError)
-	rendezvous := fs.String("rendezvous", "", "rendezvous URL to persist (default: resolved chain)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -38,14 +37,9 @@ func setupClaude(args []string) int {
 		fmt.Fprintf(os.Stderr, "setup: cannot locate catflap binary: %v\n", err)
 		return 1
 	}
-	rdv, rerr := ResolveRendezvous(*rendezvous)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "setup: rendezvous: %v\n", rerr)
-		return 1
-	}
 	claude, lookErr := exec.LookPath("claude")
 	if lookErr != nil {
-		fmt.Fprintf(os.Stderr, "setup: `claude` CLI not found in PATH.\n\nRegister manually:\n%s\n", mcpManualJSON(self, rdv))
+		fmt.Fprintf(os.Stderr, "setup: `claude` CLI not found in PATH.\n\nRegister manually:\n%s\n", mcpManualJSON(self))
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -63,40 +57,34 @@ func setupClaude(args []string) int {
 	//nolint:gosec // reason: fixed argv against the operator's PATH-resolved claude binary; no agent input.
 	_ = exec.CommandContext(ctx, claude, "mcp", "remove", "--scope", "user", "catflap").Run()
 
-	// Every flag/env pair goes before the positional server name and its
-	// launch command: `claude mcp add` takes exactly one repeatable --env
-	// per KEY=value and stops parsing flags at the first positional
-	// argument, so a flag placed after "catflap" is read as another
-	// KEY=value pair (or rejected) instead of a flag.
+	// Every flag goes before the positional server name and its launch
+	// command: `claude mcp add` stops parsing flags at the first
+	// positional argument, so a flag placed after "catflap" is read as
+	// another positional (or rejected) instead of a flag.
 	argv := []string{
 		"mcp", "add",
 		"--scope", "user",
-		"--env", "CATFLAP_RENDEZVOUS=" + rdv,
 		"--transport", "stdio",
 		"catflap", "--", self, "mcp",
 	}
-	//nolint:gosec // reason: fixed subcommand with the operator's own binary path and resolved rendezvous URL; no agent input.
+	//nolint:gosec // reason: fixed subcommand with the operator's own binary path; no agent input.
 	cmd := exec.CommandContext(ctx, claude, argv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "setup: `claude mcp add` failed:\n%s\nRegister manually:\n%s\n", out, mcpManualJSON(self, rdv))
+		fmt.Fprintf(os.Stderr, "setup: `claude mcp add` failed:\n%s\nRegister manually:\n%s\n", out, mcpManualJSON(self))
 		return 1
 	}
 	fmt.Printf("✓ Claude Code found\n✓ Catflap MCP registered (user scope)\n\nSetup complete.\n\nFrom now on, start Claude normally:\n\n  claude\n")
 	return 0
 }
 
-func mcpManualJSON(self, rendezvous string) string {
-	env := ""
-	if rendezvous != "" {
-		env = fmt.Sprintf(",\n      \"env\": { \"CATFLAP_RENDEZVOUS\": %q }", rendezvous)
-	}
+func mcpManualJSON(self string) string {
 	return fmt.Sprintf(`{
   "mcpServers": {
     "catflap": {
       "command": %q,
-      "args": ["mcp"]%s
+      "args": ["mcp"]
     }
   }
-}`, self, env)
+}`, self)
 }

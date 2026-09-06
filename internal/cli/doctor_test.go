@@ -2,8 +2,6 @@ package cli
 
 import (
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,10 +13,6 @@ import (
 // Claude Code was actually working.
 func TestDoctorFailsWhenClaudeCLIMissing(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // guaranteed no "claude" binary anywhere on it
-
-	rsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer rsrv.Close()
-	t.Setenv("CATFLAP_RENDEZVOUS", rsrv.URL)
 	t.Setenv("CATFLAP_AUDIT", filepath.Join(t.TempDir(), "audit"))
 
 	old := os.Stdout

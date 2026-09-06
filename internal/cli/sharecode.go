@@ -7,28 +7,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/pair"
 )
 
 // ShareCode reissues a fresh one-time pairing code for a task that is
 // still live on a running `share`/`serve`, without minting a new task.
 //
-// The gap this closes: a pairing code is single-use (pair.Fetch
-// consumes it) and an MCP server's pairing state lives only in that
-// process's memory (ServeUnpaired always starts unpaired) — so if the
-// agent-side process restarts (Claude quits and reopens, the machine
-// sleeps, whatever) after the original code was already claimed, there
-// is no way back in even though the target task itself may still have
-// minutes left on its TTL. `share-code` re-publishes the SAME
-// capability behind a brand new code, so the still-alive task can be
-// paired again without the operator re-running `share` (which would
-// tear down the old task and mint an unrelated new one).
+// The gap this closes: a pairing code is single-use (its pair server
+// claims exactly one connection and self-destructs) and an MCP server's
+// pairing state lives only in that process's memory (ServeUnpaired
+// always starts unpaired) — so if the agent-side process restarts
+// (Claude quits and reopens, the machine sleeps, whatever) after the
+// original code was already claimed, there is no way back in even
+// though the target task itself may still have minutes left on its
+// TTL. `share-code` asks the running server to start a brand new,
+// temporary pair server for the SAME task (over the admin API's /pair
+// endpoint), so the still-alive task can be paired again without the
+// operator re-running `share` (which would tear down the old task and
+// mint an unrelated new one).
 func ShareCode(args []string) int {
 	fs := flag.NewFlagSet("share-code", flag.ContinueOnError)
 	statePath := fs.String("state", DefaultStatePath(), "state file written by `share`/`serve`")
-	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultEnvelopeTTL.String(), "how long the new pairing code stays claimable, e.g. 5m (max 10m)")
-	rendezvous := fs.String("rendezvous", "", "rendezvous URL (default: resolved chain)")
+	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the new pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -39,11 +39,6 @@ func ShareCode(args []string) int {
 	pairingTTL, err := time.ParseDuration(*pairingTTLFlag)
 	if err != nil || pairingTTL <= 0 {
 		fmt.Fprintf(os.Stderr, "invalid --pairing-ttl %q\n", *pairingTTLFlag)
-		return 1
-	}
-	rdv, rerr := ResolveRendezvous(*rendezvous)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "rendezvous: %v\n", rerr)
 		return 1
 	}
 
@@ -57,30 +52,14 @@ func ShareCode(args []string) int {
 		fmt.Fprintf(os.Stderr, "share-code: %v\n", err)
 		return 1
 	}
-	capRes, err := PostCapability(st.AdminAddr, st.AdminToken, taskID)
+	res, err := PostPair(st.AdminAddr, st.AdminToken, taskID, pairingTTL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "share-code: %v\n", err)
 		return 1
 	}
-	// PostCapability already round-tripped this through capability.Decode
-	// once (to validate it), but returns the encoded bearer string —
-	// decode it back into the struct pair.Seal's payload must be built
-	// from (see mintAndPublishPairingCode / the original shareAnnounce
-	// flow this mirrors: the envelope carries the Capability's raw JSON,
-	// not its "agc1_..." bearer-string encoding).
-	cap, derr := capability.Decode(capRes.Capability)
-	if derr != nil {
-		fmt.Fprintf(os.Stderr, "share-code: decode capability: %v\n", derr)
-		return 1
-	}
-	code, actualTTL, perr := mintAndPublishPairingCode(rdv, pairingTTL, cap)
-	if perr != nil {
-		fmt.Fprintf(os.Stderr, "share-code: %v\n", perr)
-		return 1
-	}
 	fmt.Printf(
-		"New pairing code for %s (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n\nTask still expires: %s\n",
-		taskID, actualTTL.Round(time.Second), code, code, capRes.ExpiresAt,
+		"New pairing code for %s (valid %s):\n  %s\n\nTell Claude:\n  Connect to Catflap using %s\n",
+		taskID, (time.Duration(res.TTLMs) * time.Millisecond).Round(time.Second), res.Code, res.Code,
 	)
 	return 0
 }

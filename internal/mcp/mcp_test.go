@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -154,41 +153,35 @@ func liveLocalTaskWithServer(t *testing.T, tools []string) (*capability.Capabili
 	return cp, task, srv
 }
 
-// publishPairingCode seals cp behind a fresh pairing code on a throwaway
-// rendezvous server and returns the code and the rendezvous URL.
-func publishPairingCode(t *testing.T, cp *capability.Capability) (code, rendezvousURL string) {
+// mintPairingCode starts a fresh temporary pair server for cp (over the
+// local transport, for tests) and returns a pairing code for it —
+// mirroring what `share`'s IssuePairCode/`share-code` does in the real
+// CLI, so these tests exercise the same pair.Decode -> pair.Fetch path
+// handlePair does.
+func mintPairingCode(t *testing.T, cp *capability.Capability) string {
 	t.Helper()
-	payload, err := json.Marshal(cp)
+	ps, err := pair.Serve("local", cp, time.Minute, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, key, code, err := pair.Mint()
+	t.Cleanup(ps.Close)
+	code, err := pair.Encode("local", ps.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := pair.Seal(id, payload, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsrv := httptest.NewServer(pair.NewServer(100, 1000, 1000).Handler())
-	t.Cleanup(rsrv.Close)
-	if err := pair.Publish(context.Background(), rsrv.URL, env, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	return code, rsrv.URL
+	return code
 }
 
-// TestPairEndToEnd exercises the full pair tool path: ParseCode -> Fetch
-// (burns the envelope) -> Open -> decode capability -> dial -> ping ->
-// commit. Only after a genuine live task answers ping should pairing
-// succeed and its granted tools appear.
+// TestPairEndToEnd exercises the full pair tool path: Decode -> Fetch
+// (dials the pair server directly, burns its one claim) -> dial the
+// task -> ping -> commit. Only after a genuine live task answers ping
+// should pairing succeed and its granted tools appear.
 func TestPairEndToEnd(t *testing.T) {
 	cp, stop := liveLocalTask(t, []string{rpc.ToolRead, rpc.ToolStat})
 	defer stop()
-	code, rendezvousURL := publishPairingCode(t, cp)
+	code := mintPairingCode(t, cp)
 
 	s := newServer(false)
-	s.rendezvousURL = rendezvousURL
 
 	if _, cl := s.snapshot(); cl != nil {
 		t.Fatal("must start unpaired")
@@ -231,8 +224,7 @@ func TestPairEndToEnd(t *testing.T) {
 
 	// A second pair attempt, even with a fresh valid code, must be
 	// refused: already paired.
-	code2, rdv2 := publishPairingCode(t, cp)
-	s.rendezvousURL = rdv2
+	code2 := mintPairingCode(t, cp)
 	res2, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code2}))
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +239,6 @@ func TestPairEndToEnd(t *testing.T) {
 // could burn a real envelope.
 func TestPairBadCodeNeverFetches(t *testing.T) {
 	s := newServer(false)
-	s.rendezvousURL = "http://127.0.0.1:1" // nothing listening; a Fetch here would error, not just fail-fast
 	res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: "CAT-not-a-real-code"}))
 	if err != nil {
 		t.Fatal(err)
@@ -267,10 +258,9 @@ func TestPairBadCodeNeverFetches(t *testing.T) {
 func TestPairUnreachableTaskDoesNotCommit(t *testing.T) {
 	cp, stop := liveLocalTask(t, []string{rpc.ToolRead})
 	stop() // revoke the task before pairing ever reaches it
-	code, rendezvousURL := publishPairingCode(t, cp)
+	code := mintPairingCode(t, cp)
 
 	s := newServer(false)
-	s.rendezvousURL = rendezvousURL
 	res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code}))
 	if err != nil {
 		t.Fatal(err)
@@ -308,15 +298,14 @@ func TestServeUsesUnpairedToolsUntilCapGiven(t *testing.T) {
 }
 
 // pairServer builds a Server already paired against a live local task,
-// via the real pair flow (Mint/Seal/Publish/Fetch/pair tool) — not by
-// poking s.cap directly — so these tests exercise the same commit path
-// TestPairEndToEnd does.
+// via the real pair flow (pair server start/Decode/Fetch/pair tool) —
+// not by poking s.cap directly — so these tests exercise the same
+// commit path TestPairEndToEnd does.
 func pairServer(t *testing.T, tools []string) (*Server, *capability.Capability) {
 	t.Helper()
 	cp, _ := liveLocalTask(t, tools)
-	code, rendezvousURL := publishPairingCode(t, cp)
+	code := mintPairingCode(t, cp)
 	s := newServer(false)
-	s.rendezvousURL = rendezvousURL
 	res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code}))
 	if err != nil {
 		t.Fatal(err)
@@ -362,8 +351,7 @@ func TestDisconnectConfirmedRevokeClearsState(t *testing.T) {
 
 	// A fresh pair must be possible again.
 	cp2, _ := liveLocalTask(t, []string{rpc.ToolStat})
-	code2, rendezvousURL2 := publishPairingCode(t, cp2)
-	s.rendezvousURL = rendezvousURL2
+	code2 := mintPairingCode(t, cp2)
 	res2, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code2}))
 	if err != nil {
 		t.Fatal(err)
@@ -383,9 +371,8 @@ func TestDisconnectConfirmedRevokeClearsState(t *testing.T) {
 func TestDisconnectAlreadyGoneClearsState(t *testing.T) {
 	cp, task, srv := liveLocalTaskWithServer(t, []string{rpc.ToolRead})
 	defer func() { _ = srv.Close() }()
-	code, rendezvousURL := publishPairingCode(t, cp)
+	code := mintPairingCode(t, cp)
 	s := newServer(false)
-	s.rendezvousURL = rendezvousURL
 	if res, err := s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: code})); err != nil {
 		t.Fatal(err)
 	} else if res.IsError {

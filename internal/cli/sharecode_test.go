@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -13,11 +11,11 @@ import (
 	"github.com/juntaki/catflap/internal/policy"
 )
 
-// TestGetCapabilityReturnsMintedCapability covers share-code's core
-// dependency: a task's capability is retained after mkTask returns, so
-// it can be re-published behind a brand new pairing code without
-// minting a new task.
-func TestGetCapabilityReturnsMintedCapability(t *testing.T) {
+// TestIssuePairCodeForMintedTask covers share-code's core dependency: a
+// task's capability is retained after mkTask returns, so issuePairCode
+// can start a pair server for it and hand out a code without minting a
+// new task — and Fetch against that code recovers the exact capability.
+func TestIssuePairCodeForMintedTask(t *testing.T) {
 	s := &server{
 		transport: "local",
 		auditDir:  t.TempDir(),
@@ -33,19 +31,31 @@ func TestGetCapabilityReturnsMintedCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, ok := s.getCapability(task.ID)
-	if !ok {
-		t.Fatal("getCapability must find the just-minted task's capability")
+	code, actualTTL, err := s.issuePairCode(task.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("issuePairCode: %v", err)
+	}
+	if actualTTL != time.Minute {
+		t.Errorf("actualTTL = %v, want the requested %v (task has an hour left)", actualTTL, time.Minute)
+	}
+
+	transportName, addr, err := pair.Decode(code)
+	if err != nil {
+		t.Fatalf("decode code: %v", err)
+	}
+	got, err := pair.Fetch(context.Background(), transportName, addr, false)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
 	}
 	if got.TaskID != cap.TaskID || got.TaskSecret != cap.TaskSecret {
-		t.Errorf("getCapability returned %+v, want it to match the minted capability", got)
+		t.Errorf("fetched capability = %+v, want it to match the minted one", got)
 	}
 }
 
-// TestGetCapabilityGoneAfterTaskStops covers the flip side: once a task
-// is torn down, its capability must no longer be servable — a dead
-// task must never be re-pairable via `share-code`.
-func TestGetCapabilityGoneAfterTaskStops(t *testing.T) {
+// TestIssuePairCodeFailsAfterTaskStops covers the flip side: once a
+// task is torn down, it must no longer be re-pairable via
+// `share-code`.
+func TestIssuePairCodeFailsAfterTaskStops(t *testing.T) {
 	s := &server{
 		transport: "local",
 		auditDir:  t.TempDir(),
@@ -62,61 +72,56 @@ func TestGetCapabilityGoneAfterTaskStops(t *testing.T) {
 	}
 	task.Stop("revoked")
 
-	if _, ok := s.getCapability(task.ID); ok {
-		t.Fatal("getCapability must not return a capability for a stopped task")
+	if _, _, err := s.issuePairCode(task.ID, time.Minute); err == nil {
+		t.Fatal("issuePairCode must fail for a stopped task")
 	}
 }
 
-// TestMintAndPublishPairingCodeRoundTrips covers the shared helper
-// share-code reuses from shareAnnounce: the published envelope must
-// unseal back into the exact capability handed in.
-func TestMintAndPublishPairingCodeRoundTrips(t *testing.T) {
-	rsrv := httptest.NewServer(pair.NewServer(100, 1000, 1000).Handler())
-	defer rsrv.Close()
+// TestIssuePairCodeReplacesPreviousPairServer covers "at most one
+// claimable code per task at a time": issuing a second code for the
+// same still-live task must close the first pair server, so an old,
+// unused code can never be claimed after a newer one was issued.
+func TestIssuePairCodeReplacesPreviousPairServer(t *testing.T) {
+	s := &server{
+		transport: "local",
+		auditDir:  t.TempDir(),
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  4,
+	}
+	p := policy.Default()
+	p.TTL = time.Hour
 
-	cap := &capability.Capability{
-		Version: 1, TaskID: "agt_test", Name: "calm-panda",
-		Transport: "local", Endpoint: "127.0.0.1:1", TaskSecret: "s3cr3t",
-		ExpiresAt: time.Now().Add(15 * time.Minute), Policy: "readonly-debug",
+	_, task, err := s.mkTask(context.Background(), p, "")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	code, actualTTL, err := mintAndPublishPairingCode(rsrv.URL, time.Minute, cap)
+	firstCode, _, err := s.issuePairCode(task.ID, time.Minute)
 	if err != nil {
-		t.Fatalf("mintAndPublishPairingCode: %v", err)
+		t.Fatalf("first issuePairCode: %v", err)
 	}
-	if actualTTL != time.Minute {
-		t.Errorf("actualTTL = %v, want the requested %v (task has 15m left)", actualTTL, time.Minute)
+	if _, _, secondErr := s.issuePairCode(task.ID, time.Minute); secondErr != nil {
+		t.Fatalf("second issuePairCode: %v", secondErr)
 	}
 
-	id, key, err := pair.ParseCode(code)
+	transportName, addr, err := pair.Decode(firstCode)
 	if err != nil {
-		t.Fatalf("parse code: %v", err)
+		t.Fatal(err)
 	}
-	env, err := pair.Fetch(context.Background(), rsrv.URL, id)
-	if err != nil {
-		t.Fatalf("fetch: %v", err)
-	}
-	pt, err := pair.Open(env, key)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	var got capability.Capability
-	if err := json.Unmarshal(pt, &got); err != nil {
-		t.Fatalf("decode published capability: %v", err)
-	}
-	if got.TaskID != cap.TaskID || got.TaskSecret != cap.TaskSecret {
-		t.Errorf("published capability = %+v, want it to match the original", got)
+	if _, err := pair.Fetch(context.Background(), transportName, addr, false); err == nil {
+		t.Error("the first pair server must have been closed once a second code was issued for the same task")
 	}
 }
 
-// TestGetCapabilityRejectsStoppingTask covers a real bug: audit
+// TestIssuePairCodeRejectsStoppingTask covers a real bug: audit
 // fail-closed (and every other termination path) flips a task's state
 // to STOPPING synchronously, but only removes it from s.live later,
 // asynchronously, after up to a 10s drain — so a share-code call
 // landing in that window would see the task still "present" in s.live
 // and hand out a capability for a task that is already on its way out.
-// getCapability must check StateOf(), not just s.live membership.
-func TestGetCapabilityRejectsStoppingTask(t *testing.T) {
+// issuePairCode must check StateOf(), not just s.live membership.
+func TestIssuePairCodeRejectsStoppingTask(t *testing.T) {
 	task := &gateway.Task{ID: "agt_stopping", Policy: policy.Default(), ExpiresAt: time.Now().Add(time.Hour)}
 	task.InitContext(context.Background())
 	task.TryActivate()
@@ -128,7 +133,7 @@ func TestGetCapabilityRejectsStoppingTask(t *testing.T) {
 		<-unblock // teardown (and thus removal from s.live) stalls here
 	})
 
-	s := &server{live: map[string]*liveTask{
+	s := &server{transport: "local", live: map[string]*liveTask{
 		"agt_stopping": {task: task, cap: &capability.Capability{TaskID: "agt_stopping"}},
 	}}
 
@@ -141,53 +146,59 @@ func TestGetCapabilityRejectsStoppingTask(t *testing.T) {
 
 	// Task is STOPPING and still sitting in s.live right now — this is
 	// exactly the window the fix must close.
-	if _, ok := s.getCapability("agt_stopping"); ok {
-		t.Fatal("getCapability must reject a task that is STOPPING, even while still present in s.live")
+	if _, _, err := s.issuePairCode("agt_stopping", time.Minute); err == nil {
+		t.Fatal("issuePairCode must reject a task that is STOPPING, even while still present in s.live")
 	}
 
 	close(unblock)
 }
 
-// TestMintAndPublishPairingCodeClampsToRemainingTaskTTL covers a real
-// bug: a pairing code published with a TTL longer than the task's own
-// remaining TTL would still be "claimable" on the rendezvous server
-// after the task itself already expired — pair.Fetch would succeed,
-// but the capability behind it would immediately fail as expired. The
-// published envelope TTL must never exceed the task's remaining life.
-func TestMintAndPublishPairingCodeClampsToRemainingTaskTTL(t *testing.T) {
-	rsrv := httptest.NewServer(pair.NewServer(100, 1000, 1000).Handler())
-	defer rsrv.Close()
-
-	cap := &capability.Capability{
-		Version: 1, TaskID: "agt_test", Name: "calm-panda",
-		Transport: "local", Endpoint: "127.0.0.1:1", TaskSecret: "s3cr3t",
-		ExpiresAt: time.Now().Add(2 * time.Second), Policy: "readonly-debug",
+// TestIssuePairCodeClampsToRemainingTaskTTL covers a real bug: a
+// pairing code issued with a TTL longer than the task's own remaining
+// TTL would let its pair server stay claimable after the task itself
+// already expired — Fetch would succeed, but the capability behind it
+// would immediately fail as expired. The pair server's TTL must never
+// exceed the task's remaining life.
+func TestIssuePairCodeClampsToRemainingTaskTTL(t *testing.T) {
+	s := &server{
+		transport: "local",
+		auditDir:  t.TempDir(),
+		store:     &gateway.Store{},
+		live:      map[string]*liveTask{},
+		maxTasks:  4,
 	}
+	p := policy.Default()
+	p.TTL = 2 * time.Second
 
-	_, actualTTL, err := mintAndPublishPairingCode(rsrv.URL, 5*time.Minute, cap)
+	_, task, err := s.mkTask(context.Background(), p, "")
 	if err != nil {
-		t.Fatalf("mintAndPublishPairingCode: %v", err)
+		t.Fatal(err)
+	}
+	defer task.Stop("revoked")
+
+	_, actualTTL, err := s.issuePairCode(task.ID, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("issuePairCode: %v", err)
 	}
 	if actualTTL > 2*time.Second {
 		t.Errorf("actualTTL = %v, want it clamped to ~2s (the task's remaining TTL), not the requested 5m", actualTTL)
 	}
 }
 
-// TestMintAndPublishPairingCodeRejectsAlreadyExpiredTask covers the
-// edge of the same fix: a task with no time left must fail upfront,
-// never publish a code for it.
-func TestMintAndPublishPairingCodeRejectsAlreadyExpiredTask(t *testing.T) {
-	rsrv := httptest.NewServer(pair.NewServer(100, 1000, 1000).Handler())
-	defer rsrv.Close()
+// TestIssuePairCodeRejectsAlreadyExpiredTask covers the edge of the
+// same fix: a task with no time left must fail upfront, never issue a
+// code for it.
+func TestIssuePairCodeRejectsAlreadyExpiredTask(t *testing.T) {
+	task := &gateway.Task{ID: "agt_expired", Policy: policy.Default(), ExpiresAt: time.Now().Add(-time.Second)}
+	task.InitContext(context.Background())
+	task.TryActivate()
 
-	cap := &capability.Capability{
-		Version: 1, TaskID: "agt_test", Name: "calm-panda",
-		Transport: "local", Endpoint: "127.0.0.1:1", TaskSecret: "s3cr3t",
-		ExpiresAt: time.Now().Add(-time.Second), Policy: "readonly-debug",
-	}
+	s := &server{transport: "local", live: map[string]*liveTask{
+		"agt_expired": {task: task, cap: &capability.Capability{TaskID: "agt_expired"}},
+	}}
 
-	if _, _, err := mintAndPublishPairingCode(rsrv.URL, time.Minute, cap); err == nil {
-		t.Fatal("mintAndPublishPairingCode must reject an already-expired task")
+	if _, _, err := s.issuePairCode("agt_expired", time.Minute); err == nil {
+		t.Fatal("issuePairCode must reject an already-expired task")
 	}
 }
 

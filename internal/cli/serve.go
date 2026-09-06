@@ -23,6 +23,7 @@ import (
 	"github.com/juntaki/catflap/internal/audit"
 	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/gateway"
+	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/policy"
 	"github.com/juntaki/catflap/internal/transport"
 	"github.com/juntaki/catflap/internal/transport/local"
@@ -36,12 +37,18 @@ type liveTask struct {
 	task *gateway.Task
 	srv  transport.Server
 	// cap is the capability minted for this task, retained so
-	// `share-code` can reissue a fresh one-time pairing code for a
-	// still-live task without minting a new one — set once, right
-	// after mkTask builds it (see setCapability), and read only
-	// through getCapability.
-	cap   *capability.Capability
-	timer *time.Timer
+	// `share-code` (via issuePairCode) can reissue a fresh one-time
+	// pairing code for a still-live task without minting a new one —
+	// set once, right after mkTask builds it (see setCapability).
+	cap *capability.Capability
+	// pairSrv is this task's current temporary pair server, if a
+	// pairing code has been issued and not yet claimed/expired. At
+	// most one is ever live per task: issuePairCode closes the
+	// previous one (if any) before starting a new one, and the task's
+	// own teardown (see commit's OnStopFunc) closes it too — a pair
+	// server must never outlive the task it delivers a capability for.
+	pairSrv *pair.Server
+	timer   *time.Timer
 }
 
 // setCapability records the capability minted for taskID, if the task
@@ -55,27 +62,67 @@ func (s *server) setCapability(taskID string, cap *capability.Capability) {
 	}
 }
 
-// getCapability returns the retained capability for a still-live task.
-// getCapability returns the retained capability only for a task that
-// is still genuinely live: present in s.live, ACTIVE (not STOPPING —
-// audit-fail-closed and other paths flip state synchronously before
-// the async teardown that removes it from s.live actually runs, so
-// s.live alone lags reality briefly), and not yet past its own TTL.
-// share-code's whole contract is "reissue for a still-live task" — it
-// must never hand out a capability for one that is already on its way
-// out, even if the capability struct itself is still sitting in
-// memory for a few more moments.
-func (s *server) getCapability(taskID string) (*capability.Capability, bool) {
+// issuePairCode starts a fresh temporary pair server for taskID's
+// retained capability and returns the pairing code for it — this is
+// the ONE mechanism behind both the initial `share` announce and
+// `share-code`'s reissue, so both get the same liveness/TTL-clamping
+// guarantees automatically.
+//
+// taskID must be genuinely live: present in s.live, ACTIVE (not
+// STOPPING — audit-fail-closed and other paths flip state
+// synchronously before the async teardown that removes it from
+// s.live actually runs, so s.live alone lags reality briefly), and not
+// yet past its own TTL. requestedTTL is clamped to the task's own
+// remaining TTL: a pairing code must never outlive the task it
+// delivers a capability for. Any previous still-open pair server for
+// this task is closed before the new one starts — at most one
+// claimable code per task at a time.
+func (s *server) issuePairCode(taskID string, requestedTTL time.Duration) (code string, actualTTL time.Duration, err error) {
 	s.mu.Lock()
 	lt, ok := s.live[taskID]
 	s.mu.Unlock()
 	if !ok || lt.cap == nil {
-		return nil, false
+		return "", 0, fmt.Errorf("unknown or not-yet-live task")
 	}
 	if lt.task.StateOf() != gateway.StateActive || lt.task.Expired(time.Now()) {
-		return nil, false
+		return "", 0, fmt.Errorf("task is not active")
 	}
-	return lt.cap, true
+	remaining := time.Until(lt.task.ExpiresAt)
+	if remaining <= 0 {
+		return "", 0, fmt.Errorf("task already expired at %s", lt.task.ExpiresAt.Format(time.RFC3339))
+	}
+	ttl := requestedTTL
+	if remaining < ttl {
+		ttl = remaining
+	}
+	ps, serr := pair.Serve(s.transport, lt.cap, ttl, s.verbose)
+	if serr != nil {
+		return "", 0, fmt.Errorf("start pair server: %w", serr)
+	}
+	code, eerr := pair.Encode(s.transport, ps.Addr())
+	if eerr != nil {
+		ps.Close()
+		return "", 0, fmt.Errorf("encode pairing code: %w", eerr)
+	}
+
+	s.mu.Lock()
+	lt, ok = s.live[taskID]
+	var old *pair.Server
+	if ok {
+		old, lt.pairSrv = lt.pairSrv, ps
+	}
+	s.mu.Unlock()
+	if !ok {
+		// The task died in the window between the liveness check above
+		// and here (e.g. a concurrent revoke) — never hand out a code
+		// for it.
+		ps.Close()
+		return "", 0, fmt.Errorf("task is no longer live")
+	}
+	if old != nil {
+		old.Close()
+	}
+	return code, ttl, nil
 }
 
 type server struct {
@@ -126,6 +173,11 @@ type Announce struct {
 	Cap       *capability.Capability
 	Task      *gateway.Task
 	Transport string
+	// IssuePairCode starts a fresh temporary pair server for THIS task
+	// and returns a pairing code for it — the same mechanism
+	// `share-code` uses later, bound to this specific task so callers
+	// (share's announce) don't need to reach back into the server.
+	IssuePairCode func(requestedTTL time.Duration) (code string, actualTTL time.Duration, err error)
 }
 
 // Serve runs the target gateway. Each task (the initial one and every
@@ -330,7 +382,7 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		}
 		_ = json.NewEncoder(w).Encode(RevokeResponse{Task: rreq.Task, Status: status})
 	})
-	mux.HandleFunc("/capability", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/pair", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -339,20 +391,22 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		var creq CapabilityRequest
-		if err := decodeAdminBody(w, r, &creq); err != nil {
+		var preq PairRequest
+		if err := decodeAdminBody(w, r, &preq); err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		cap, ok := s.getCapability(strings.TrimSpace(creq.Task))
-		if !ok {
-			http.Error(w, "unknown or not-yet-live task", http.StatusNotFound)
+		ttl := pair.DefaultCodeTTL
+		if preq.TTLOverrideMs > 0 {
+			ttl = time.Duration(preq.TTLOverrideMs) * time.Millisecond
+		}
+		//nolint:contextcheck // reason: the pair server issuePairCode starts is governed by its own TTL timer and the task's teardown (see commit's OnStopFunc), never by this HTTP request's context — the request returns as soon as the code is issued, long before the pair server itself should close.
+		code, actualTTL, perr := s.issuePairCode(strings.TrimSpace(preq.Task), ttl)
+		if perr != nil {
+			http.Error(w, perr.Error(), http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(CapabilityResponse{
-			Task: cap.TaskID, Capability: cap.Encode(),
-			ExpiresAt: cap.ExpiresAt.Format(time.RFC3339), Policy: cap.Policy,
-		})
+		_ = json.NewEncoder(w).Encode(PairResponse{Code: code, TTLMs: actualTTL.Milliseconds()})
 	})
 	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
 		if "Bearer "+adminToken != strings.TrimSpace(r.Header.Get("Authorization")) {
@@ -394,7 +448,11 @@ func RunGateway(opts GatewayOptions, announce func(Announce) error) int {
 		return 1
 	}
 
-	if err := announce(Announce{State: st, Cap: firstCap, Task: firstTask, Transport: opts.Transport}); err != nil {
+	announceArg := Announce{State: st, Cap: firstCap, Task: firstTask, Transport: opts.Transport}
+	announceArg.IssuePairCode = func(requestedTTL time.Duration) (string, time.Duration, error) {
+		return s.issuePairCode(firstTask.ID, requestedTTL)
+	}
+	if err := announce(announceArg); err != nil {
 		fmt.Fprintf(os.Stderr, "announce: %v\n", err)
 		removeOwnState(opts.StatePath, st)
 		s.shutdown()
@@ -592,9 +650,16 @@ func (s *server) commit(taskID, name string, t *gateway.Task, srv transport.Serv
 		if cur, ok := s.live[taskID]; ok && cur == lt {
 			delete(s.live, taskID)
 		}
+		pairSrv := lt.pairSrv
 		s.mu.Unlock()
 		if lt.timer != nil {
 			lt.timer.Stop()
+		}
+		// A pair server must never outlive the task it delivers a
+		// capability for — revoke/expiry/shutdown kills any still-open
+		// one right along with the task itself.
+		if pairSrv != nil {
+			pairSrv.Close()
 		}
 		s.store.Delete(taskID)
 		reportDegraded(lt)

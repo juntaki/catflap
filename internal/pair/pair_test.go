@@ -2,448 +2,178 @@ package pair
 
 import (
 	"context"
-	"errors"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/juntaki/catflap/internal/capability"
 )
 
-func TestCodeRoundTrip(t *testing.T) {
-	id, key, code, err := Mint()
-	if err != nil {
-		t.Fatal(err)
+func testCap() *capability.Capability {
+	return &capability.Capability{
+		Version: 1, TaskID: "agt_test", Name: "calm-panda",
+		Transport: "local", Endpoint: "127.0.0.1:1", TaskSecret: "s3cr3t",
+		ExpiresAt: time.Now().Add(15 * time.Minute), Policy: "readonly-debug",
 	}
-	if !strings.HasPrefix(code, CodePrefix) {
-		t.Errorf("code missing prefix: %s", code)
-	}
-	id2, key2, err := ParseCode(strings.ToLower(strings.ReplaceAll(code, "-", " ")))
-	if err != nil {
-		t.Fatalf("code with spaces/lowercase must parse: %v", err)
-	}
-	if id2 != id || string(key2) != string(key) {
-		t.Error("code round trip mismatch")
-	}
-	for _, bad := range []string{"", "agc1_xxx", "CAT-!!!!", "CAT-ABCD", "DOG-" + code[4:]} {
-		if _, _, err := ParseCode(bad); err == nil {
-			t.Errorf("bad code accepted: %q", bad)
+}
+
+func TestEncodeDecodeRoundTrips(t *testing.T) {
+	for _, tc := range []struct{ transportName, addr string }{
+		{"local", "127.0.0.1:54321"},
+		{"tailcat", "tcomFwWC1234567890abcdef"},
+	} {
+		code, err := Encode(tc.transportName, tc.addr)
+		if err != nil {
+			t.Fatalf("Encode(%q, %q): %v", tc.transportName, tc.addr, err)
+		}
+		if code[:len(CodePrefix)] != CodePrefix {
+			t.Errorf("code %q missing prefix %q", code, CodePrefix)
+		}
+		gotTransport, gotAddr, err := Decode(code)
+		if err != nil {
+			t.Fatalf("Decode(%q): %v", code, err)
+		}
+		if gotTransport != tc.transportName || gotAddr != tc.addr {
+			t.Errorf("Decode(%q) = (%q, %q), want (%q, %q)", code, gotTransport, gotAddr, tc.transportName, tc.addr)
 		}
 	}
 }
 
-func TestCodeChecksumCatchesTypo(t *testing.T) {
-	_, _, code, err := Mint()
+func TestDecodeToleratesFormatting(t *testing.T) {
+	code, err := Encode("local", "127.0.0.1:9")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Mutate one payload character (keep prefix): must fail locally,
-	// before any fetch could burn the real envelope.
-	compact := strings.ReplaceAll(strings.TrimPrefix(code, CodePrefix), "-", "")
-	chars := []byte(compact)
-	if chars[5] == 'A' {
-		chars[5] = 'B'
-	} else {
-		chars[5] = 'A'
+	messy := " " + code + " "
+	gotTransport, gotAddr, err := Decode(messy)
+	if err != nil {
+		t.Fatalf("Decode with surrounding whitespace: %v", err)
 	}
-	mutated := CodePrefix + string(chars)
-	if _, _, err := ParseCode(mutated); err == nil {
-		t.Error("single-char typo must fail the checksum")
-	}
-	if _, _, err := ParseCode(code); err != nil {
-		t.Errorf("valid code rejected: %v", err)
+	if gotTransport != "local" || gotAddr != "127.0.0.1:9" {
+		t.Errorf("Decode(%q) = (%q, %q)", messy, gotTransport, gotAddr)
 	}
 }
 
-func TestCRC16Vector(t *testing.T) {
-	if got := crc16CCITT([]byte("123456789")); got != 0x29B1 {
-		t.Errorf("crc16 = %#x, want 0x29b1", got)
-	}
-}
-
-func TestSealOpen(t *testing.T) {
-	id, key, _, err := Mint()
+func TestDecodeRejectsChecksumMismatch(t *testing.T) {
+	code, err := Encode("local", "127.0.0.1:9")
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := Seal(id, []byte(`{"task":"agt_1"}`), key)
+	// Flip the last character so the CRC no longer matches.
+	mangled := code[:len(code)-1] + flip(code[len(code)-1])
+	if _, _, err := Decode(mangled); err == nil {
+		t.Error("Decode must reject a code with a mismatched checksum")
+	}
+}
+
+func flip(c byte) string {
+	if c == 'A' {
+		return "B"
+	}
+	return "A"
+}
+
+func TestDecodeRejectsGarbage(t *testing.T) {
+	for _, bad := range []string{"", "not a code", "CAT-", "CAT-@@@@"} {
+		if _, _, err := Decode(bad); err == nil {
+			t.Errorf("Decode(%q) must fail", bad)
+		}
+	}
+}
+
+// TestServeDeliversCapabilityOnce covers the core one-shot contract:
+// the first Fetch gets the exact capability handed to Serve.
+func TestServeDeliversCapabilityOnce(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, time.Minute, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	env.ExpiresAt = time.Now().Add(time.Minute)
-	pt, err := Open(env, key)
-	if err != nil || string(pt) != `{"task":"agt_1"}` {
-		t.Errorf("open failed: %v %q", err, pt)
-	}
-	if _, err := Open(env, []byte("0123456789abcdef")); err == nil {
-		t.Error("wrong key must fail")
-	}
-	env2 := *env
-	ct := env2.Ciphertext
-	if len(ct) > 4 {
-		env2.Ciphertext = ct[:len(ct)-4] + "AAAA"
-	}
-	if _, err := Open(&env2, key); err == nil {
-		t.Error("tampered envelope must fail")
-	}
-	env3 := *env
-	env3.ID = "deadbeefcafe"
-	if _, err := Open(&env3, key); err == nil {
-		t.Error("rebound envelope must fail")
-	}
-}
-
-func testServer() *httptest.Server {
-	return httptest.NewServer(NewServer(100, 1000, 1000).Handler())
-}
-
-func TestPublishFetchBurn(t *testing.T) {
-	srv := testServer()
 	defer srv.Close()
-	ctx := context.Background()
-	id, key, _, err := Mint()
+
+	got, err := Fetch(context.Background(), "local", srv.Addr(), false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Fetch: %v", err)
 	}
-	env, err := Seal(id, []byte("secret-payload"), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perr := Publish(ctx, srv.URL, env, time.Minute); perr != nil {
-		t.Fatalf("publish: %v", perr)
-	}
-	got, err := Fetch(ctx, srv.URL, id)
-	if err != nil {
-		t.Fatalf("fetch: %v", err)
-	}
-	pt, err := Open(got, key)
-	if err != nil || string(pt) != "secret-payload" {
-		t.Errorf("open fetched: %v %q", err, pt)
-	}
-	if _, err := Fetch(ctx, srv.URL, id); err == nil {
-		t.Error("second fetch must fail (burned)")
+	if got.TaskID != cap.TaskID || got.TaskSecret != cap.TaskSecret {
+		t.Errorf("Fetch() = %+v, want it to match the served capability", got)
 	}
 }
 
-// TestConcurrentFetchExactlyOnce proves, under -race, the one-time-fetch
-// claim in the package doc comment: many goroutines racing to fetch the
-// same id must see exactly one success, everyone else 404 — not two
-// successes from a check-then-delete race.
-func TestConcurrentFetchExactlyOnce(t *testing.T) {
-	srv := testServer()
+// TestServeSecondFetchGetsNothing covers "replays get nothing": once
+// claimed, the pair server has already destroyed itself, so a second
+// Fetch — even against the exact same address — must fail.
+func TestServeSecondFetchGetsNothing(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, time.Minute, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer srv.Close()
-	ctx := context.Background()
-	id, key, _, err := Mint()
-	if err != nil {
-		t.Fatal(err)
-	}
-	env, err := Seal(id, []byte("only-once"), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Publish(ctx, srv.URL, env, time.Minute); err != nil {
-		t.Fatal(err)
-	}
+	addr := srv.Addr()
 
-	const n = 32
+	if _, err := Fetch(context.Background(), "local", addr, false); err != nil {
+		t.Fatalf("first Fetch: %v", err)
+	}
+	if _, err := Fetch(context.Background(), "local", addr, false); err == nil {
+		t.Error("second Fetch against an already-claimed pair server must fail")
+	}
+}
+
+// TestServeConcurrentFetchesExactlyOneWinner covers the atomic-claim
+// property under real concurrency, not just sequential calls.
+func TestServeConcurrentFetchesExactlyOneWinner(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, time.Minute, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	addr := srv.Addr()
+
+	const n = 8
 	results := make(chan error, n)
-	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			_, ferr := Fetch(ctx, srv.URL, id)
+			_, ferr := Fetch(context.Background(), "local", addr, false)
 			results <- ferr
 		}()
 	}
-	wg.Wait()
-	close(results)
-
-	successes := 0
-	for ferr := range results {
-		if ferr == nil {
-			successes++
+	wins := 0
+	for i := 0; i < n; i++ {
+		if err := <-results; err == nil {
+			wins++
 		}
 	}
-	if successes != 1 {
-		t.Errorf("got %d successful fetches out of %d concurrent callers, want exactly 1", successes, n)
+	if wins != 1 {
+		t.Errorf("concurrent Fetch: %d winners, want exactly 1", wins)
 	}
 }
 
-// TestPublishRejectsUnackedOrMismatchedSuccess covers the P1 the final
-// merge-gate review caught: a bare HTTP 200 was treated as proof the
-// envelope was stored, with the response body never checked. A
-// misbehaving or malicious rendezvous (a custom --rendezvous URL is
-// operator-configurable — not necessarily our own pair.Server) could
-// answer 200 with an empty or wrong-id body while never persisting
-// anything, and share would still print a pairing code for an envelope
-// nobody could ever fetch, instead of erroring (which is what makes
-// RunGateway tear the just-minted task back down).
-func TestPublishRejectsUnackedOrMismatchedSuccess(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-	}{
-		{"empty body", ""},
-		{"empty JSON object", "{}"},
-		{"wrong id", `{"id":"deadbeefcafe"}`},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(c.body))
-			}))
-			defer srv.Close()
-			id, key, _, err := Mint()
-			if err != nil {
-				t.Fatal(err)
-			}
-			env, err := Seal(id, []byte("x"), key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := Publish(context.Background(), srv.URL, env, time.Minute); err == nil {
-				t.Errorf("Publish must not treat a bare 200 with %s as success", c.name)
-			}
-		})
-	}
-}
-
-func TestPublishConflict(t *testing.T) {
-	srv := testServer()
-	defer srv.Close()
-	ctx := context.Background()
-	id, key, _, _ := Mint()
-	env, _ := Seal(id, []byte("first"), key)
-	if err := Publish(ctx, srv.URL, env, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	// Same live id again: conflict, never silent overwrite.
-	env2, _ := Seal(id, []byte("second"), key)
-	if err := Publish(ctx, srv.URL, env2, time.Minute); err == nil {
-		t.Fatal("duplicate live id must conflict")
-	} else if !strings.Contains(err.Error(), "409") {
-		t.Errorf("expected 409, got %v", err)
-	}
-	// The original envelope is intact.
-	got, err := Fetch(ctx, srv.URL, id)
+// TestServeClosesAfterTTL covers "short-lived": nobody ever connects,
+// but the pair server must still stop accepting once its TTL elapses.
+func TestServeClosesAfterTTL(t *testing.T) {
+	cap := testCap()
+	srv, err := Serve("local", cap, 100*time.Millisecond, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pt, _ := Open(got, key)
-	if string(pt) != "first" {
-		t.Errorf("original envelope replaced: %q", pt)
-	}
-}
-
-func TestFetchMissingAndExpired(t *testing.T) {
-	srv := testServer()
 	defer srv.Close()
-	ctx := context.Background()
-	if _, err := Fetch(ctx, srv.URL, "deadbeefcafe"); !errors.Is(err, ErrPairingNotFound) {
-		t.Errorf("missing id must be ErrPairingNotFound, got %v", err)
-	}
-	id, key, _, _ := Mint()
-	env, _ := Seal(id, []byte("x"), key)
-	if err := Publish(ctx, srv.URL, env, time.Second); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(1100 * time.Millisecond)
-	if _, err := Fetch(ctx, srv.URL, id); !errors.Is(err, ErrPairingNotFound) {
-		t.Errorf("expired envelope must be ErrPairingNotFound, got %v", err)
+	addr := srv.Addr()
+
+	time.Sleep(300 * time.Millisecond)
+	if _, err := Fetch(context.Background(), "local", addr, false); err == nil {
+		t.Error("Fetch must fail once the pair server's TTL has elapsed")
 	}
 }
 
-func TestServerExpiryStampedByServer(t *testing.T) {
-	srv := testServer()
-	defer srv.Close()
-	ctx := context.Background()
-	id, key, _, _ := Mint()
-	env, _ := Seal(id, []byte("x"), key)
-	env.ExpiresAt = time.Now().Add(100 * time.Hour)
-	before := time.Now()
-	if err := Publish(ctx, srv.URL, env, time.Minute); err != nil {
-		t.Fatal(err)
+// TestServeRejectsNonPositiveTTL covers a construction-time guard: a
+// caller forgetting to clamp TTL to something positive must fail
+// loudly, not silently start a pair server that's already "expired".
+func TestServeRejectsNonPositiveTTL(t *testing.T) {
+	if _, err := Serve("local", testCap(), 0, false); err == nil {
+		t.Error("Serve with ttl=0 must fail")
 	}
-	got, err := Fetch(ctx, srv.URL, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ExpiresAt.Sub(before) > 2*time.Minute {
-		t.Errorf("server must stamp its own expiry, got %s", got.ExpiresAt.Sub(before))
-	}
-}
-
-func TestRateLimit(t *testing.T) {
-	srv := httptest.NewServer(NewServer(100, 2, 1000).Handler())
-	defer srv.Close()
-	ctx := context.Background()
-	publish := func() error {
-		id, key, _, _ := Mint()
-		env, _ := Seal(id, []byte("x"), key)
-		return Publish(ctx, srv.URL, env, time.Minute)
-	}
-	if err := publish(); err != nil {
-		t.Fatal(err)
-	}
-	if err := publish(); err != nil {
-		t.Fatal(err)
-	}
-	if err := publish(); err == nil {
-		t.Error("third publish in a 2/min budget must 429")
-	} else if !strings.Contains(err.Error(), "429") {
-		t.Errorf("expected 429, got %v", err)
-	}
-}
-
-// TestFetchRateLimitedDistinctFromNotFound covers the P2 fix: a 429 means
-// "the envelope was NOT burned, retry later", which a caller must not
-// confuse with 404's "this code is dead" — collapsing every non-200 into
-// one message told the pairing UX to give up on a code it should retry.
-func TestFetchRateLimitedDistinctFromNotFound(t *testing.T) {
-	srv := httptest.NewServer(NewServer(100, 1000, 1).Handler())
-	defer srv.Close()
-	ctx := context.Background()
-	if _, err := Fetch(ctx, srv.URL, "deadbeefcafe"); !errors.Is(err, ErrPairingNotFound) {
-		t.Fatalf("first fetch (within budget) must be ErrPairingNotFound, got %v", err)
-	}
-	if _, err := Fetch(ctx, srv.URL, "deadbeefcafe"); !errors.Is(err, ErrRendezvousRateLimited) {
-		t.Errorf("second fetch (over budget) must be ErrRendezvousRateLimited, got %v", err)
-	}
-}
-
-func TestTrustedProxy(t *testing.T) {
-	ps := NewServer(100, 1, 1000)
-	if err := ps.SetTrustedProxies([]string{"127.0.0.1/32"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := ps.SetTrustedProxies([]string{"bogus"}); err == nil {
-		t.Error("bad CIDR must fail")
-	}
-	srv := httptest.NewServer(ps.Handler())
-	defer srv.Close()
-	publishAs := func(xff string) int {
-		id, key, _, _ := Mint()
-		env, _ := Seal(id, []byte("x"), key)
-		env.ExpiresAt = time.Now().Add(time.Minute)
-		body, _ := EncodeEnvelope(env)
-		req, _ := http.NewRequestWithContext(context.Background(), "POST",
-			srv.URL+"/v1/envelopes?ttl_seconds=60", strings.NewReader(string(body)))
-		if xff != "" {
-			req.Header.Set("X-Forwarded-For", xff)
-		}
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = res.Body.Close() }()
-		return res.StatusCode
-	}
-	if code := publishAs("10.0.0.1"); code != 200 {
-		t.Fatalf("first publish as 10.0.0.1: %d", code)
-	}
-	if code := publishAs("10.0.0.1"); code != 429 {
-		t.Errorf("second publish as 10.0.0.1 must 429, got %d", code)
-	}
-	if code := publishAs("10.0.0.2"); code != 200 {
-		t.Errorf("distinct XFF identity must have own budget, got %d", code)
-	}
-}
-
-// TestTrustedProxySpoofedPrependRejected covers the P1 fix: a proxy
-// appends the address it observed, it never overwrites what's already in
-// X-Forwarded-For, so a client behind a trusted proxy can prepend an
-// arbitrary fake entry to the LEFT of whatever the proxy appends. Taking
-// the leftmost entry (the old behavior) trusted exactly what the client
-// wrote; the real client address is the rightmost entry that is not
-// itself one of the trusted proxies.
-func TestTrustedProxySpoofedPrependRejected(t *testing.T) {
-	ps := NewServer(100, 1, 1000)
-	if err := ps.SetTrustedProxies([]string{"127.0.0.1/32"}); err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(ps.Handler())
-	defer srv.Close()
-	publishAs := func(xff string) int {
-		id, key, _, _ := Mint()
-		env, _ := Seal(id, []byte("x"), key)
-		env.ExpiresAt = time.Now().Add(time.Minute)
-		body, _ := EncodeEnvelope(env)
-		req, _ := http.NewRequestWithContext(context.Background(), "POST",
-			srv.URL+"/v1/envelopes?ttl_seconds=60", strings.NewReader(string(body)))
-		req.Header.Set("X-Forwarded-For", xff)
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = res.Body.Close() }()
-		return res.StatusCode
-	}
-	// The trusted proxy appended the real client (10.0.0.9); the client
-	// prepended a fake first hop that changes on every request.
-	if code := publishAs("1.1.1.1, 10.0.0.9"); code != 200 {
-		t.Fatalf("first publish: %d", code)
-	}
-	if code := publishAs("2.2.2.2, 10.0.0.9"); code != 429 {
-		t.Errorf("changing the spoofable prefix must not evade the real client's budget, got %d", code)
-	}
-	// A genuinely different real client (as seen by the trusted proxy)
-	// still gets its own budget.
-	if code := publishAs("1.1.1.1, 10.0.0.10"); code != 200 {
-		t.Errorf("distinct real client (rightmost hop) must have its own budget, got %d", code)
-	}
-}
-
-func TestUntrustedProxyIgnoresXFF(t *testing.T) {
-	ps := NewServer(100, 1, 1000) // no trusted proxies
-	srv := httptest.NewServer(ps.Handler())
-	defer srv.Close()
-	publishAs := func(xff string) int {
-		id, key, _, _ := Mint()
-		env, _ := Seal(id, []byte("x"), key)
-		env.ExpiresAt = time.Now().Add(time.Minute)
-		body, _ := EncodeEnvelope(env)
-		req, _ := http.NewRequestWithContext(context.Background(), "POST",
-			srv.URL+"/v1/envelopes?ttl_seconds=60", strings.NewReader(string(body)))
-		req.Header.Set("X-Forwarded-For", xff)
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = res.Body.Close() }()
-		return res.StatusCode
-	}
-	if code := publishAs("10.9.9.9"); code != 200 {
-		t.Fatalf("first publish: %d", code)
-	}
-	// Spoofed XFF must not mint a fresh budget: still the loopback peer.
-	if code := publishAs("10.9.9.10"); code != 429 {
-		t.Errorf("untrusted XFF must not bypass rate limit, got %d", code)
-	}
-}
-
-func TestOversizeRejected(t *testing.T) {
-	env := &Envelope{V: 1, ID: "abc", Nonce: "x", Ciphertext: strings.Repeat("A", MaxEnvelopeBytes)}
-	if _, err := EncodeEnvelope(env); err == nil {
-		t.Error("oversize envelope must be rejected client-side")
-	}
-}
-
-func TestBadIDPath(t *testing.T) {
-	srv := testServer()
-	defer srv.Close()
-	req, err := http.NewRequestWithContext(context.Background(), "GET", srv.URL+"/v1/envelopes/ZZZ!!!", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode != http.StatusNotFound {
-		t.Errorf("bad id must 404, got %d", res.StatusCode)
+	if _, err := Serve("local", testCap(), -time.Second, false); err == nil {
+		t.Error("Serve with a negative ttl must fail")
 	}
 }

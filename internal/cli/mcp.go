@@ -23,7 +23,6 @@ func MCP(args []string) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	capFlag := fs.String("cap", "", "capability token (discouraged: visible in argv/history)")
 	capFile := fs.String("cap-file", "", "read the capability token from this file")
-	rendezvous := fs.String("rendezvous", "", "rendezvous URL for the pair tool (default: resolved chain)")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -54,12 +53,7 @@ func MCP(args []string) int {
 		capStr = strings.TrimSpace(os.Getenv("AGENTGATE_CAP"))
 	}
 	if capStr == "" {
-		rdv, rerr := ResolveRendezvous(*rendezvous)
-		if rerr != nil {
-			fmt.Fprintf(os.Stderr, "mcp: rendezvous: %v\n", rerr)
-			return 1
-		}
-		if err := mcp.ServeUnpaired(rdv, *verbose); err != nil {
+		if err := mcp.ServeUnpaired(*verbose); err != nil {
 			fmt.Fprintf(os.Stderr, "catflap mcp: %v\n", err)
 			return 1
 		}

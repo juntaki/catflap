@@ -3,7 +3,6 @@ package mcp
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,10 +48,6 @@ type Server struct {
 	cap     *capability.Capability // nil until paired
 	client  transport.Client       // nil until paired
 	pairing bool                   // claimed by one in-flight pair call
-
-	// rendezvousURL is where the pair tool fetches envelopes from.
-	// Unused once paired (only pair itself needs it).
-	rendezvousURL string
 }
 
 // Serve runs the MCP stdio loop, already paired with capStr, until stdin
@@ -88,9 +83,8 @@ func Serve(capStr string, verbose bool) error {
 // pair/status are exposed until the pair tool succeeds, at which point
 // the capability's granted remote_* tools are added and advertised via
 // tools/list_changed — no reconnect needed on the client side.
-func ServeUnpaired(rendezvousURL string, verbose bool) error {
+func ServeUnpaired(verbose bool) error {
 	s := newServer(verbose)
-	s.rendezvousURL = rendezvousURL
 	return s.run()
 }
 
@@ -259,14 +253,14 @@ type pairArgs struct {
 	Code string `json:"code"`
 }
 
-// handlePair implements the pair tool: ParseCode (local checksum, so a
-// typo can never burn the real envelope) -> Fetch (one-time; burns it
-// regardless of what follows) -> Open (AEAD; wrong key/tampered envelope
-// fail here) -> decode the capability -> dial -> ping. Only once ping
-// actually succeeds does this commit pair state and expose the
-// capability's tools — Fetch+Open alone only prove the envelope was
-// valid, not that its target task is still alive and reachable right
-// now.
+// handlePair implements the pair tool: Decode (local checksum, so a
+// typo can never waste the pair server's one claim) -> Fetch (dials the
+// pair server directly over Tailcat/local; one-time, burns the claim
+// regardless of what follows) -> dial the actual task -> ping. Only
+// once ping actually succeeds does this commit pair state and expose
+// the capability's tools — Fetch alone only proves a pair server
+// delivered SOME capability, not that its target task is still alive
+// and reachable right now.
 func (s *Server) handlePair(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 	if !s.tryClaimPairing() {
 		return toolError("already paired, or a pair attempt is already in flight"), nil
@@ -284,25 +278,13 @@ func (s *Server) handlePair(ctx context.Context, req *mcpsdk.CallToolRequest) (*
 	if err := unmarshalArgs(req, &args); err != nil {
 		return toolError(fmt.Sprintf("bad arguments: %v", err)), nil
 	}
-	id, key, err := pair.ParseCode(args.Code)
+	transportName, addr, err := pair.Decode(args.Code)
 	if err != nil {
 		return toolError(err.Error()), nil
 	}
-	env, err := pair.Fetch(ctx, s.rendezvousURL, id)
+	cp, err := pair.Fetch(ctx, transportName, addr, s.verbose)
 	if err != nil {
 		return toolError(err.Error()), nil
-	}
-	pt, err := pair.Open(env, key)
-	if err != nil {
-		return toolError(fmt.Sprintf("could not open envelope: %v", err)), nil
-	}
-	// The envelope's plaintext is exactly the bytes capability.Decode
-	// expects after base64-decoding its "agc1_" form, so re-wrap and
-	// reuse Decode's existing v1 strict validation rather than
-	// duplicating it.
-	cp, err := capability.Decode(capability.Prefix + base64.RawURLEncoding.EncodeToString(pt))
-	if err != nil {
-		return toolError(fmt.Sprintf("bad capability: %v", err)), nil
 	}
 	if cp.Expired(time.Now()) {
 		return toolError("capability already expired"), nil

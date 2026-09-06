@@ -42,8 +42,6 @@ func run(args []string) int {
 		return cli.Setup(args[1:])
 	case "tasks":
 		return cli.Tasks(args[1:])
-	case "rendezvous":
-		return cli.Rendezvous(args[1:])
 	case "version", "--version", "-V":
 		fmt.Printf("catflap %s\n", buildinfo.Version)
 		return 0
@@ -66,8 +64,7 @@ Usage:
   catflap tasks                 list live tasks on the running serve/share
   catflap share-code <task>     reissue a fresh pairing code for a still-live task
   catflap revoke <task|name>    destroy a task
-  catflap doctor                check that setup/rendezvous/audit are all healthy
-  catflap rendezvous            run a pairing rendezvous (the default is a public one)
+  catflap doctor                check that setup/audit are all healthy
 
 Advanced:
   catflap serve [--policy p.yaml] [--ttl 15m] [--transport tailcat|local]

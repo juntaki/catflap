@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,11 +14,11 @@ import (
 
 // Doctor runs a handful of cheap diagnostic checks across the moving
 // parts a working Catflap setup depends on (Claude Code registration,
-// rendezvous reachability, audit directory writability, an active
-// target) and prints one aligned ✓/✗ line per check. It mutates nothing
-// the operator cares about — the audit-directory check does create the
-// directory and write+remove a small probe file (the same way a real
-// task's audit.Open would), but leaves no trace behind.
+// audit directory writability, an active target) and prints one
+// aligned ✓/✗ line per check. It mutates nothing the operator cares
+// about — the audit-directory check does create the directory and
+// write+remove a small probe file (the same way a real task's
+// audit.Open would), but leaves no trace behind.
 func Doctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	statePath := fs.String("state", DefaultStatePath(), "state file to check for an active target")
@@ -50,17 +49,6 @@ func Doctor(args []string) int {
 		ok = false
 		line("Claude Code", "✗", "not found in PATH")
 		line("Claude MCP registration", "✗", "n/a (no claude CLI)")
-	}
-
-	rdv, rerr := ResolveRendezvous("")
-	if rerr != nil {
-		ok = false
-		line("Rendezvous", "✗", rerr.Error())
-	} else if reachable, detail := checkRendezvous(rdv); reachable {
-		line("Rendezvous", "✓", rdv)
-	} else {
-		ok = false
-		line("Rendezvous", "✗", rdv+" — "+detail)
 	}
 
 	auditDir := DefaultAuditDir()
@@ -114,25 +102,6 @@ func checkClaudeRegistration(claudePath string) (bool, string) {
 		}
 	}
 	return false, ""
-}
-
-// checkRendezvous makes a short-timeout GET against the rendezvous
-// base URL. Any HTTP response (even a 404 from an unmatched root path)
-// means the host is reachable; only a network-level failure counts as
-// unreachable — pair's server exposes no dedicated health endpoint.
-func checkRendezvous(url string) (bool, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return false, err.Error()
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false, err.Error()
-	}
-	_ = res.Body.Close()
-	return true, ""
 }
 
 // checkWritable reports whether dir exists (creating it if missing,

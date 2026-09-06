@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,36 +9,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juntaki/catflap/internal/capability"
 	"github.com/juntaki/catflap/internal/pair"
 	"github.com/juntaki/catflap/internal/policy"
 )
 
 // Share runs the same gateway as Serve, but instead of printing a
-// capability to copy by hand, it mints a one-time pairing code, seals
-// the initial task's capability behind it, and publishes the sealed
-// envelope to a rendezvous server. The other end pairs with `catflap
-// setup claude` + the MCP `pair` tool + the printed code — no capability
-// blob ever needs to be copy-pasted.
+// capability to copy by hand, it starts a temporary pair server for the
+// initial task and prints a pairing code for it. The other end pairs
+// with `catflap setup claude` + the MCP `pair` tool + the printed code
+// — no capability blob ever needs to be copy-pasted, and no hosted
+// rendezvous infrastructure of any kind is involved: the agent connects
+// DIRECTLY to the pair server over the same transport (Tailcat, or
+// local for tests) the task itself uses.
 //
-// Publish failure is share failure: announce returning an error is
-// RunGateway's existing contract for "tear the just-minted task back
-// down" (see RunGateway/mkTask) — share relies on that rather than
-// duplicating a revoke call, so a capability that could never be
-// fetched is never left live, and never falls back to printing itself
-// to stdout as a plaintext blob.
+// A pair server failing to start is share failure: announce returning
+// an error is RunGateway's existing contract for "tear the just-minted
+// task back down" (see RunGateway/mkTask) — share relies on that rather
+// than duplicating a revoke call.
 func Share(args []string) int {
 	fs := flag.NewFlagSet("share", flag.ContinueOnError)
 	policyPath := fs.String("policy", "", "YAML policy file (default: built-in readonly-debug)")
 	ttlFlag := fs.String("ttl", "", "task TTL, e.g. 15m (default: policy ttl)")
-	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultEnvelopeTTL.String(), "how long the pairing code stays claimable, e.g. 5m (independent of --ttl; max 10m)")
+	pairingTTLFlag := fs.String("pairing-ttl", pair.DefaultCodeTTL.String(), "how long the pairing code stays claimable, e.g. 5m (clamped to the task's own remaining TTL)")
 	name := fs.String("name", "", "preferred human name for the task (default: minted)")
 	transportFlag := fs.String("transport", "tailcat", "transport: tailcat | local")
 	auditDir := fs.String("audit", DefaultAuditDir(), "audit JSONL directory (empty disables file audit)")
-	statePath := fs.String("state", DefaultStatePath(), "state file for `grant` coordination")
+	statePath := fs.String("state", DefaultStatePath(), "state file for `grant`/`share-code` coordination")
 	adminAddr := fs.String("admin", "127.0.0.1:0", "loopback admin API listen address")
 	maxTasks := fs.Int("max-tasks", 16, "maximum live tasks (grants beyond this fail)")
-	rendezvous := fs.String("rendezvous", "", "rendezvous URL (default: resolved chain)")
 	verbose := fs.Bool("verbose", false, "verbose transport logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -64,29 +60,23 @@ func Share(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid --pairing-ttl %q\n", *pairingTTLFlag)
 		return 1
 	}
-	rdv, rerr := ResolveRendezvous(*rendezvous)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "rendezvous: %v\n", rerr)
-		return 1
-	}
 
 	return RunGateway(GatewayOptions{
 		Transport: *transportFlag, AuditDir: *auditDir, StatePath: *statePath,
 		AdminAddr: *adminAddr, Verbose: *verbose, MaxTasks: *maxTasks,
 		TaskName: *name, Policy: pol,
-	}, shareAnnounce(rdv, pairingTTL, pol, os.Stdout))
+	}, shareAnnounce(pairingTTL, pol, os.Stdout))
 }
 
 // shareAnnounce builds the announce callback RunGateway calls once the
-// initial task is live: mint a pairing code, seal the task's capability
-// behind it, publish the envelope, and print the code (never the
-// capability itself — the pairing code only ever encodes a locator +
-// wrap key, per package pair's design). Returning an error here is what
-// makes "publish failed" the same as "share failed, task torn back
-// down" — see RunGateway.
-func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
+// initial task is live: start a temporary pair server for it (via
+// a.IssuePairCode — the same mechanism `share-code` reuses later) and
+// print the code. Returning an error here is what makes "pair server
+// failed to start" the same as "share failed, task torn back down" —
+// see RunGateway.
+func shareAnnounce(pairingTTL time.Duration, pol *policy.Policy, out io.Writer) func(Announce) error {
 	return func(a Announce) error {
-		code, actualTTL, err := mintAndPublishPairingCode(rendezvousURL, pairingTTL, a.Cap)
+		code, actualTTL, err := a.IssuePairCode(pairingTTL)
 		if err != nil {
 			return err
 		}
@@ -97,48 +87,6 @@ func shareAnnounce(rendezvousURL string, pairingTTL time.Duration, pol *policy.P
 		)
 		return nil
 	}
-}
-
-// mintAndPublishPairingCode mints a fresh one-time pairing code, seals
-// cap behind it, and publishes the sealed envelope to rendezvousURL —
-// the same sequence `share` uses for a brand-new task, reused by
-// `share-code` to reissue a new code for an already-live one. Never
-// returns the capability itself, only the pairing code.
-//
-// The published envelope TTL is clamped to the task's own remaining
-// TTL (never the caller's requested pairingTTL alone): a code that
-// outlives its task would sit "claimable" on the rendezvous server
-// after the task itself has already expired, so pair.Fetch would
-// succeed but the capability behind it would immediately fail as
-// expired — a confusing, silent near-miss instead of a clean upfront
-// error. Returns the ACTUAL ttl used (possibly shorter than requested)
-// so callers report what really happened, not what was asked for.
-func mintAndPublishPairingCode(rendezvousURL string, pairingTTL time.Duration, cap *capability.Capability) (string, time.Duration, error) {
-	remaining := time.Until(cap.ExpiresAt)
-	if remaining <= 0 {
-		return "", 0, fmt.Errorf("task already expired at %s", cap.ExpiresAt.Format(time.RFC3339))
-	}
-	if remaining < pairingTTL {
-		pairingTTL = remaining
-	}
-	id, key, code, merr := pair.Mint()
-	if merr != nil {
-		return "", 0, fmt.Errorf("mint pairing code: %w", merr)
-	}
-	payload, jerr := json.Marshal(cap)
-	if jerr != nil {
-		return "", 0, fmt.Errorf("encode capability: %w", jerr)
-	}
-	env, serr := pair.Seal(id, payload, key)
-	if serr != nil {
-		return "", 0, fmt.Errorf("seal envelope: %w", serr)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if perr := pair.Publish(ctx, rendezvousURL, env, pairingTTL); perr != nil {
-		return "", 0, fmt.Errorf("publish to rendezvous: %w", perr)
-	}
-	return code, pairingTTL, nil
 }
 
 // formatEffectiveAccess renders what a policy actually grants — read
