@@ -252,6 +252,29 @@ func TestUnpairsAutomaticallyOnTaskDeath(t *testing.T) {
 // of the scenario (revoke, then immediately re-pair) many times and
 // asserts the invariant it must never violate: whenever pairing
 // reports success, exec is actually callable.
+// waitForUnpair polls handleStatus until the adapter reports unpaired.
+// See TestUnpairsAutomaticallyOnTaskDeath for why this deadline is
+// generous rather than tight (and why 90s, not 30s: 30s itself has
+// been observed to be hit on a loaded macos-latest runner).
+func waitForUnpair(t *testing.T, s *Server, iteration int) {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		statusRes, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
+		var status struct {
+			Paired bool `json:"paired"`
+		}
+		_ = json.Unmarshal([]byte(resultText(t, statusRes)), &status)
+		if !status.Paired {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("iteration %d: A never auto-unpaired within 90s", iteration)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 	s := newServer(false)
 	const iterations = 30
@@ -273,25 +296,7 @@ func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 		// hit any transient failure (slow CI, a busy runner). Poll the
 		// cheap, non-consuming status check instead, then pair exactly
 		// once.
-		// See TestUnpairsAutomaticallyOnTaskDeath for why this deadline
-		// is generous rather than tight (and why 90s, not 30s: 30s
-		// itself has been observed to be hit on a loaded macos-latest
-		// runner).
-		deadline := time.Now().Add(90 * time.Second)
-		for {
-			statusRes, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
-			var status struct {
-				Paired bool `json:"paired"`
-			}
-			_ = json.Unmarshal([]byte(resultText(t, statusRes)), &status)
-			if !status.Paired {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("iteration %d: A never auto-unpaired within 30s", i)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
+		waitForUnpair(t, s, i)
 
 		res, err = s.handlePair(context.Background(), callToolRequest(t, pairArgs{Code: codeB}))
 		if err != nil || res.IsError {

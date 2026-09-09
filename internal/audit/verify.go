@@ -48,9 +48,7 @@ func Verify(path string) (*Report, error) {
 	}
 	defer func() { _ = f.Close() }()
 	rep := &Report{File: path}
-	prev := Genesis
-	var seq int64
-	terminal := false
+	chain := chainState{prev: Genesis}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -60,53 +58,71 @@ func Verify(path string) (*Report, error) {
 		}
 		var e Entry
 		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, fmt.Errorf("line %d: invalid record: %w", seq+1, err)
+			return nil, fmt.Errorf("line %d: invalid record: %w", chain.seq+1, err)
 		}
-		seq++
-		if e.V != AuditVersion {
-			return nil, fmt.Errorf("line %d: unsupported audit version %d", seq, e.V)
+		if err := chain.step(rep, e); err != nil {
+			return nil, err
 		}
-		if e.Task == "" || e.Tool == "" || e.Hash == "" {
-			return nil, fmt.Errorf("line %d: missing required fields", seq)
-		}
-		if rep.Task == "" {
-			rep.Task = e.Task
-		} else if e.Task != rep.Task {
-			return nil, fmt.Errorf("line %d: task id changed (%q was %q)", seq, e.Task, rep.Task)
-		}
-		if e.Seq != seq {
-			return nil, fmt.Errorf("line %d: sequence break (got seq %d)", seq, e.Seq)
-		}
-		if e.Prev != prev {
-			return nil, fmt.Errorf("line %d: prev-link break", seq)
-		}
-		if HashEntry(e) != e.Hash {
-			return nil, fmt.Errorf("line %d: hash mismatch (record tampered)", seq)
-		}
-		if terminal {
-			return nil, fmt.Errorf("line %d: record after terminal event", seq)
-		}
-		if e.Tool == CreateTool && seq == 1 {
-			rep.HasCreate = true
-		}
-		if seq == 1 && e.Tool != CreateTool {
-			return nil, fmt.Errorf("line 1: chain must open with %q, got %q", CreateTool, e.Tool)
-		}
-		if e.Tool == TerminalTool {
-			terminal = true
-			rep.Terminal = e.Decision
-		}
-		prev = e.Hash
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	if seq == 0 {
+	if chain.seq == 0 {
 		return nil, fmt.Errorf("empty audit file")
 	}
-	rep.Entries = seq
-	rep.Head = prev
+	rep.Entries = chain.seq
+	rep.Head = chain.prev
 	return rep, nil
+}
+
+// chainState tracks the running hash-chain position across Verify's
+// line loop, so each record's checks can live in one flat method
+// instead of nesting inside the scanner loop.
+type chainState struct {
+	prev     string
+	seq      int64
+	terminal bool
+}
+
+// step validates one record against the chain built so far, updating
+// rep and the chain position on success.
+func (c *chainState) step(rep *Report, e Entry) error {
+	c.seq++
+	if e.V != AuditVersion {
+		return fmt.Errorf("line %d: unsupported audit version %d", c.seq, e.V)
+	}
+	if e.Task == "" || e.Tool == "" || e.Hash == "" {
+		return fmt.Errorf("line %d: missing required fields", c.seq)
+	}
+	if rep.Task == "" {
+		rep.Task = e.Task
+	} else if e.Task != rep.Task {
+		return fmt.Errorf("line %d: task id changed (%q was %q)", c.seq, e.Task, rep.Task)
+	}
+	if e.Seq != c.seq {
+		return fmt.Errorf("line %d: sequence break (got seq %d)", c.seq, e.Seq)
+	}
+	if e.Prev != c.prev {
+		return fmt.Errorf("line %d: prev-link break", c.seq)
+	}
+	if HashEntry(e) != e.Hash {
+		return fmt.Errorf("line %d: hash mismatch (record tampered)", c.seq)
+	}
+	if c.terminal {
+		return fmt.Errorf("line %d: record after terminal event", c.seq)
+	}
+	if c.seq == 1 {
+		if e.Tool != CreateTool {
+			return fmt.Errorf("line 1: chain must open with %q, got %q", CreateTool, e.Tool)
+		}
+		rep.HasCreate = true
+	}
+	if e.Tool == TerminalTool {
+		c.terminal = true
+		rep.Terminal = e.Decision
+	}
+	c.prev = e.Hash
+	return nil
 }
 
 func bytesTrimSpace(b []byte) []byte {

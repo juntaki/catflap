@@ -26,6 +26,11 @@ import (
 	"github.com/juntaki/catflap/internal/transport"
 )
 
+const (
+	serveErrFmt = "serve: %v"
+	dialErrFmt  = "dial: %v"
+)
+
 // ServeFunc starts a fresh server dispatching connections to handler.
 type ServeFunc func(handler transport.Handler) (transport.Server, error)
 
@@ -54,7 +59,7 @@ func dialConn(t *testing.T, dial DialFunc, addr string) (transport.Client, net.C
 	t.Helper()
 	cl, err := dial(addr)
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf(dialErrFmt, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -69,9 +74,10 @@ func dialConn(t *testing.T, dial DialFunc, addr string) (transport.Client, net.C
 // testServeAddrDial covers the basic contract: Serve produces a
 // non-empty Addr, and dialing it succeeds.
 func testServeAddrDial(t *testing.T, serve ServeFunc, dial DialFunc) {
-	srv, err := serve(func(net.Conn) {})
+	srv, err := serve(func(net.Conn) { // this test only exercises Serve/Dial/Close, not the handler
+	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 	if srv.Addr() == "" {
@@ -101,7 +107,7 @@ func testBidirectional(t *testing.T, serve ServeFunc, dial DialFunc) {
 		_, _ = conn.Write([]byte(serverMsg))
 	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 
@@ -136,7 +142,7 @@ func testMultipleStreams(t *testing.T, serve ServeFunc, dial DialFunc) {
 		_, _ = conn.Write(buf) // echo the one byte back
 	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 
@@ -186,15 +192,16 @@ func testMultipleStreams(t *testing.T, serve ServeFunc, dial DialFunc) {
 // testContextCancellation covers a caller-side cancellation reaching
 // Dial promptly instead of it hanging past the caller's own deadline.
 func testContextCancellation(t *testing.T, serve ServeFunc, dial DialFunc) {
-	srv, err := serve(func(net.Conn) {})
+	srv, err := serve(func(net.Conn) { // this test only exercises Serve/Dial/Close, not the handler
+	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 
 	cl, err := dial(srv.Addr())
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf(dialErrFmt, err)
 	}
 	defer func() { _ = cl.Close() }()
 
@@ -214,14 +221,15 @@ func testContextCancellation(t *testing.T, serve ServeFunc, dial DialFunc) {
 // sites in this codebase defer Close() and may also call it explicitly
 // on an error path — a double Close must never panic.
 func testClientCloseIdempotent(t *testing.T, serve ServeFunc, dial DialFunc) {
-	srv, err := serve(func(net.Conn) {})
+	srv, err := serve(func(net.Conn) { // this test only exercises Serve/Dial/Close, not the handler
+	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 	cl, err := dial(srv.Addr())
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf(dialErrFmt, err)
 	}
 	_ = cl.Close()
 	_ = cl.Close() // must not panic
@@ -232,9 +240,10 @@ func testClientCloseIdempotent(t *testing.T, serve ServeFunc, dial DialFunc) {
 // server's own TTL timer can both race to call Close on the same
 // server.
 func testServerCloseIdempotent(t *testing.T, serve ServeFunc) {
-	srv, err := serve(func(net.Conn) {})
+	srv, err := serve(func(net.Conn) { // this test only exercises Serve/Dial/Close, not the handler
+	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	_ = srv.Close()
 	_ = srv.Close() // must not panic
@@ -244,9 +253,10 @@ func testServerCloseIdempotent(t *testing.T, serve ServeFunc) {
 // task/pair-server teardown depends on: once Close() returns, the
 // address is genuinely dead, not just "about to become dead".
 func testNoDialAfterServerClose(t *testing.T, serve ServeFunc, dial DialFunc) {
-	srv, err := serve(func(net.Conn) {})
+	srv, err := serve(func(net.Conn) { // this test only exercises Serve/Dial/Close, not the handler
+	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	addr := srv.Addr()
 	_ = srv.Close()
@@ -278,7 +288,7 @@ func testHandlerEndsOnConnectionClose(t *testing.T, serve ServeFunc, dial DialFu
 		_, _ = conn.Read(buf) // blocks until the client closes, then returns an error
 	})
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 
@@ -300,7 +310,7 @@ func testHandlerEndsOnConnectionClose(t *testing.T, serve ServeFunc, dial DialFu
 func testConcurrentDial(t *testing.T, serve ServeFunc, dial DialFunc) {
 	srv, err := serve(func(conn net.Conn) { _ = conn.Close() })
 	if err != nil {
-		t.Fatalf("serve: %v", err)
+		t.Fatalf(serveErrFmt, err)
 	}
 	defer func() { _ = srv.Close() }()
 

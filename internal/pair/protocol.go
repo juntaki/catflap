@@ -130,7 +130,7 @@ func Decode(code string) (transportName, addr string, err error) {
 		return "", "", fmt.Errorf("malformed pairing code")
 	}
 	body, want := raw[:len(raw)-2], raw[len(raw)-2:]
-	if crc := crc16CCITT(body); crc != uint16(want[0])<<8|uint16(want[1]) {
+	if crc16CCITT(body) != uint16(want[0])<<8|uint16(want[1]) {
 		return "", "", fmt.Errorf("pairing code checksum mismatch (typo?)")
 	}
 	tag := transportTag(body[0])

@@ -12,6 +12,8 @@ import (
 	"github.com/juntaki/catflap/internal/buildinfo"
 )
 
+const claudeMCPRegistrationCheck = "Claude MCP registration"
+
 // Doctor runs a handful of cheap diagnostic checks across the moving
 // parts a working Catflap setup depends on (Claude Code registration,
 // audit directory writability) and prints one aligned ✓/✗ line per
@@ -39,15 +41,15 @@ func Doctor(args []string) int {
 	if claude, err := exec.LookPath("claude"); err == nil {
 		line("Claude Code", "✓", claude)
 		if registered, detail := checkClaudeRegistration(claude); registered {
-			line("Claude MCP registration", "✓", detail)
+			line(claudeMCPRegistrationCheck, "✓", detail)
 		} else {
 			ok = false
-			line("Claude MCP registration", "✗", "run: catflap setup claude")
+			line(claudeMCPRegistrationCheck, "✗", "run: catflap setup claude")
 		}
 	} else {
 		ok = false
 		line("Claude Code", "✗", "not found in PATH")
-		line("Claude MCP registration", "✗", "n/a (no claude CLI)")
+		line(claudeMCPRegistrationCheck, "✗", "n/a (no claude CLI)")
 	}
 
 	auditDir := DefaultAuditDir()
