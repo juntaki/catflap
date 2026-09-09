@@ -17,20 +17,37 @@ on:
         description: "github.com/tailscale/tailcat version/ref to test against (e.g. v0.7.0, or a commit SHA)"
         required: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   contract:
     runs-on: ubuntu-latest
+    permissions: {}
 
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: validate candidate version shape
+        env:
+          TAILCAT_VERSION: ${{ inputs.tailcat_version }}
+        run: |
+          # Only a semver tag (vX.Y.Z, optionally with a prerelease/build
+          # suffix) or a full 40-character commit SHA is accepted — never
+          # a branch name, "main", or a short SHA. mutating go.mod against
+          # an unpinned, moving ref is exactly the class of supply-chain
+          # risk this workflow otherwise exists to guard against testing.
+          if [[ ! "$TAILCAT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] && \
+             [[ ! "$TAILCAT_VERSION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "refusing candidate version, must be a semver tag or full 40-char commit SHA: $TAILCAT_VERSION"
+            exit 1
+          fi
 
       - name: bump tailcat to the candidate version
         env:

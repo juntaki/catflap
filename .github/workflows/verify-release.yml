@@ -18,14 +18,13 @@ on:
         description: "Release tag to re-verify, e.g. v0.7.0."
         required: true
 
-permissions:
-  contents: read
-  attestations: read
+permissions: {}
 
 jobs:
   resolve-tag:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    permissions: {}
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -52,6 +51,9 @@ jobs:
 
   verify:
     needs: resolve-tag
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:
@@ -75,9 +77,15 @@ jobs:
       TAG: ${{ needs.resolve-tag.outputs.tag }}
       PLATFORM: ${{ matrix.platform }}
     steps:
+      # Deliberately does NOT check out the release tag: this verifier's
+      # own test harness (below) must stay independent of whatever the
+      # tag under verification contains, so a compromised or broken
+      # release commit can't also supply the code that verifies it.
+      # workflow_run always runs the workflow file and repo contents
+      # from the default branch, so an unqualified checkout here gets
+      # the trusted main harness regardless of which tag triggered this
+      # run.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
 
@@ -146,10 +154,11 @@ jobs:
 
       - name: golden pairing E2E against the downloaded binary
         if: matrix.golden_e2e
-        run: python3 testdata/e2e/pairing.py
+        run: python3 testdata/e2e/ssh_share.py
 
   verify-homebrew:
     needs: resolve-tag
+    permissions: {}
     runs-on: macos-latest
     env:
       TAG: ${{ needs.resolve-tag.outputs.tag }}
