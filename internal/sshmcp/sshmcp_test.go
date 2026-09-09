@@ -205,8 +205,10 @@ func TestUnpairsAutomaticallyOnTaskDeath(t *testing.T) {
 	// has been observed to occasionally starve this goroutine for
 	// several seconds under heavy contention from other packages'
 	// tests (particularly the real-Tailcat/DERP suite) running
-	// concurrently in the same `go test ./...` invocation.
-	deadline := time.Now().Add(30 * time.Second)
+	// concurrently in the same `go test ./...` invocation. 30s itself
+	// has been observed to be hit on a loaded macos-latest runner
+	// (build-test job, -race -p 1), so this is wider still.
+	deadline := time.Now().Add(90 * time.Second)
 	for {
 		res, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
 		var status struct {
@@ -272,8 +274,10 @@ func TestConcurrentPairingTransitionsKeepToolStateConsistent(t *testing.T) {
 		// cheap, non-consuming status check instead, then pair exactly
 		// once.
 		// See TestUnpairsAutomaticallyOnTaskDeath for why this deadline
-		// is generous rather than tight.
-		deadline := time.Now().Add(30 * time.Second)
+		// is generous rather than tight (and why 90s, not 30s: 30s
+		// itself has been observed to be hit on a loaded macos-latest
+		// runner).
+		deadline := time.Now().Add(90 * time.Second)
 		for {
 			statusRes, _ := s.handleStatus(context.Background(), callToolRequest(t, struct{}{}))
 			var status struct {
