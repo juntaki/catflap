@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/modelcontextprotocol/go-sdk v1.7.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
 	github.com/tailscale/tailcat v0.6.0
 	golang.org/x/crypto v0.56.0
