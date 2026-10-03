@@ -8,7 +8,7 @@ require (
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
 	github.com/tailscale/tailcat v0.6.0
 	golang.org/x/crypto v0.56.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
 )
 
